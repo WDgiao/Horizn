@@ -1,0 +1,44 @@
+{
+  "apiType": "stageMode",
+  "buildOption": {
+    // 原生（C++）构建配置：让 hvigor 用 CMake 编译 cpp/ 下的源码，
+    // 产物 libsoftplayer.so 会被自动打包进 HAP 并可供 ArkTS import
+    "externalNativeOptions": {
+      "path": "./src/main/cpp/CMakeLists.txt",
+      "arguments": "",
+      "cppFlags": "",
+      // 只构建 arm64：真机与主流设备都是这个架构
+      "abiFilters": [
+        "arm64-v8a"
+      ]
+    },
+    "resOptions": {
+      "copyCodeResource": {
+        "enable": false
+      }
+    }
+  },
+  "buildOptionSet": [
+    {
+      "name": "release",
+      "arkOptions": {
+        "obfuscation": {
+          "ruleOptions": {
+            "enable": false,
+            "files": [
+              "./obfuscation-rules.txt"
+            ]
+          }
+        }
+      }
+    },
+  ],
+  "targets": [
+    {
+      "name": "default"
+    },
+    {
+      "name": "ohosTest",
+    }
+  ]
+}

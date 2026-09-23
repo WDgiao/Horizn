@@ -1,0 +1,13 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "Please describe the basic information.",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {
+    // 原生解码库的 ArkTS 类型声明（实际 .so 由 externalNativeOptions 构建产出）
+    "libsoftplayer.so": "file:./src/main/ets/types/libsoftplayer"
+  }
+}
+

@@ -1,0 +1,64 @@
+# ===========================================================================
+# 换行符与二进制文件规则
+#
+# 为什么必须显式规定 eol=lf：
+#   本仓库的源码（.ets / .cpp / .h / .json5）里含大量中文注释。
+#   如果让 git 按 Windows 默认的 core.autocrlf=true 去转换换行符，
+#   每次 checkout/add 都会重写整个文件 —— 这类"工具悄悄改写源文件"的操作
+#   今天已经造成过一次真实事故（PowerShell 按 GBK 解释 UTF-8，
+#   把 FfmpegCodecApi.cpp 的中文注释全变成乱码）。
+#   钉死 LF 之后 git 不再改动文件内容，构建工具看到的就是我写的那份字节。
+# ===========================================================================
+
+# 默认：文本文件统一 LF 存储与检出
+* text=auto eol=lf
+
+# ---------- 源码与配置（明确为文本，强制 LF）----------
+*.ets   text eol=lf
+*.ts    text eol=lf
+*.cpp   text eol=lf
+*.cc    text eol=lf
+*.h     text eol=lf
+*.hpp   text eol=lf
+*.c     text eol=lf
+*.json5 text eol=lf
+*.json  text eol=lf
+*.d.ts  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.sh    text eol=lf
+*.js    text eol=lf
+*.py    text eol=lf
+
+# ---------- 原生库与媒体素材（二进制，禁止任何转换）----------
+# 这些若被当作文本处理，git 会尝试"规范化"，足以把二进制彻底改坏
+*.so    binary
+*.so.*  binary
+*.a     binary
+*.o     binary
+*.mp4   binary
+*.mkv   binary
+*.webm  binary
+*.wmv   binary
+*.rm    binary
+*.rmvb  binary
+*.ogv   binary
+*.3gp   binary
+*.mpg   binary
+*.m4v   binary
+*.avi   binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.p12   binary
+*.cer   binary
+
+# ---------- Git 自身文件 ----------
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+
+# ---------- 语言统计（让 .so 不污染 GitHub 的语言占比条）----------
+entry/libs/** linguist-vendored
+entry/src/main/cpp/third_party/** linguist-vendored

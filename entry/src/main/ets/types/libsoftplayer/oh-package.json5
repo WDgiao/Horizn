@@ -1,0 +1,6 @@
+{
+  "name": "libsoftplayer.so",
+  "types": "./index.d.ts",
+  "version": "1.0.0",
+  "description": "SoftPlayer 原生音视频解码库"
+}

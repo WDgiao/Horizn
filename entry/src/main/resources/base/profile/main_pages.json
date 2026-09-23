@@ -1,0 +1,11 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/SearchPage",
+    "pages/PlayerPage",
+    "pages/SettingsPage",
+    "pages/FolderCreatePage",
+    "pages/RenamePage",
+    "pages/FileDetailPage"
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "媒体库主模块"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Harmony Player 优雅媒体库"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "媒体库"
+    },
+    {
+      "name": "permission_reason_media_scan",
+      "value": "用于扫描并播放设备中的视频文件"
+    }
+  ]
+}

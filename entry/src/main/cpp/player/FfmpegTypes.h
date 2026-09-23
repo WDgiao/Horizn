@@ -1,0 +1,200 @@
+#ifndef SOFT_PLAYER_FFMPEG_TYPES_H
+#define SOFT_PLAYER_FFMPEG_TYPES_H
+
+#include <cstdint>
+#include <chrono>
+#include <deque>
+#include <mutex>
+#include <condition_variable>
+#include <string>
+#include <vector>
+
+namespace softplayer {
+
+/**
+ * 解码出的一帧画面
+ *
+ * ★ 用 RGB565 而不是 YUV420 —— 这是实测逼出来的结论：
+ *   surface 的 buffer 格式是 NATIVEBUFFER_PIXEL_FMT_RGBX_8888（枚举值 12，
+ *   实为 2 字节/像素的 RGB565：stride 4352 = 1084*4，buffer 2838528 ≈ 1084*650*4）。
+ *   按 NV12 往里写会导致：
+ *     ① 布局完全错 → 画面是彩色噪点或全黑
+ *     ② 尺寸对不上 → Y 平面就吃掉 2654720 字节，色度平面越界 → SIGSEGV
+ *   所以直接在 FFmpeg 侧转成 RGB565，再逐行拷进 buffer。
+ *
+ * 为什么不做 YUV→RGB 的"零拷贝"幻想：
+ *   硬解可以直出 YUV 并交给 GPU 转换，但我们是软解（FFmpeg 出 YUV420），
+ *   而消费端是 RGB 的 surface，中间这次转换省不掉。
+ *   sws_scale 用 SWS_FAST_BILINEAR，1080p 每帧约 2~4ms，可接受。
+ */
+struct VideoFrame {
+    /** 紧凑存放的像素数据（RGB565 打包，行间按 stride 对齐） */
+    std::vector<uint8_t> data;
+    /** 每行字节数（RGB565 时 = 宽度*2，可能有对齐填充） */
+    int stride = 0;
+    /** 画面宽高 */
+    int width = 0;
+    int height = 0;
+    /** 显示时间戳（毫秒） */
+    int64_t ptsMs = 0;
+
+    /** 释放内存，避免大帧在队列里堆积 */
+    void Clear() {
+        data.clear();
+        data.shrink_to_fit();
+        stride = 0;
+        width = 0;
+        height = 0;
+        ptsMs = 0;
+    }
+};
+
+/**
+ * 线程安全的帧队列
+ *
+ * 设计要点：
+ *   - 有上限（maxSize），满了就丢最旧的帧 —— 这是播放器的常规做法：
+ *     宁愿掉帧也不要让解码线程阻塞，否则 seek 和暂停响应会卡住
+ *   - 丢帧时记录丢了多少，便于诊断"卡顿"到底是解码慢还是渲染慢
+ *   - 可中断：Release 时用 Abort 唤醒所有等待者，避免线程卡在 wait 上退不出去
+ */
+class FrameQueue {
+public:
+    explicit FrameQueue(size_t maxSize) : maxSize_(maxSize) {}
+
+    /** 入队；队列满时丢弃最旧的一帧 */
+    void Push(VideoFrame &frame) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (aborted_) {
+            return;
+        }
+        while (queue_.size() >= maxSize_) {
+            queue_.pop_front();
+            dropped_++;
+        }
+        queue_.push_back(std::move(frame));
+        notEmpty_.notify_one();
+    }
+
+    /**
+     * 出队，队列空时最多等 waitMs 毫秒
+     * @return true 取到帧；false 超时或被中断
+     */
+    bool Pop(VideoFrame &out, int waitMs) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (queue_.empty() && !aborted_) {
+            notEmpty_.wait_for(lock, std::chrono::milliseconds(waitMs),
+                               [this] { return !queue_.empty() || aborted_; });
+        }
+        if (aborted_ || queue_.empty()) {
+            return false;
+        }
+        out = std::move(queue_.front());
+        queue_.pop_front();
+        return true;
+    }
+
+    /** 清空队列（seek 时调用） */
+    void Clear() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        queue_.clear();
+    }
+
+    /** 唤醒所有等待者并让后续操作直接返回，用于线程退出 */
+    void Abort() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        aborted_ = true;
+        notEmpty_.notify_all();
+    }
+
+    /** 累计丢帧数 */
+    size_t DroppedCount() const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return dropped_;
+    }
+
+    /** 队列当前长度 */
+    size_t Size() const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable notEmpty_;
+    std::deque<VideoFrame> queue_;
+    size_t maxSize_;
+    size_t dropped_ = 0;
+    bool aborted_ = false;
+};
+
+/**
+ * 可打断的 sleep
+ *
+ * 主循环里要"精确睡到下一帧的时间点"，但 sleep 期间必须能被
+ * pause / seek / release 立刻打断，否则操作要等一整帧才生效。
+ */
+class InterruptibleSleep {
+public:
+    /** 睡 ms 毫秒，期间若被 Wake 则提前返回 */
+    void Sleep(int ms) {
+        if (ms <= 0) {
+            return;
+        }
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait_for(lock, std::chrono::milliseconds(ms), [this] { return woken_; });
+        woken_ = false;
+    }
+
+    /** 立刻唤醒正在 Sleep 的线程 */
+    void Wake() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        woken_ = true;
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool woken_ = false;
+};
+
+/** 音频输出参数 */
+struct AudioSpec {
+    int sampleRate = 0;
+    int channels = 0;
+    /** 每样本字节数（S16LE = 2） */
+    int bytesPerSample = 2;
+};
+
+/**
+ * 解码出的一段 PCM 音频
+ *
+ * 为什么统一成固定的输出格式（48kHz / 立体声 / S16LE）：
+ *   片源里的音频五花八门（RMVB 里 cook 常见 22050Hz 单声道，
+ *   AC3 常见 48kHz 5.1），而音频设备只接受一个固定配置。
+ *   与其在每次播放时按片源重建音频流，不如统一用 swr 重采样到
+ *   最常见的 48kHz 立体声 —— 设备兼容性最好，代码也只有一条路径。
+ *
+ * 为什么音频数据不做 VideoFrame 那样的队列：
+ *   音频不能丢帧（丢了就是断音），所以走环形缓冲而不是"满了丢最旧"的队列。
+ */
+struct AudioChunk {
+    /** 交错存放的 S16LE PCM 数据 */
+    std::vector<uint8_t> data;
+    /** 这段音频对应的起始时间戳（毫秒） */
+    int64_t ptsMs = 0;
+    /** 这段音频的时长（毫秒），用于推进音频时钟 */
+    int64_t durationMs = 0;
+
+    void Clear() {
+        data.clear();
+        data.shrink_to_fit();
+        ptsMs = 0;
+        durationMs = 0;
+    }
+};
+
+}  // namespace softplayer
+
+#endif  // SOFT_PLAYER_FFMPEG_TYPES_H
