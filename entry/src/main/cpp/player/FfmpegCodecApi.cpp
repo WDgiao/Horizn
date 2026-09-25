@@ -616,6 +616,258 @@ int32_t AudioChannels() {
     return kAudioChannels;
 }
 
+/**
+ * 抽一帧画面并存成 JPEG（用于生成缩略图）
+ *
+ * 为什么自己抽帧而不是继续用系统的 AVImageGenerator：
+ *   实测系统对 .rm / .wmv / .ogv 完全无能为力 ——
+ *   日志里一直是 "THUMB FAIL ... 12_rv10.rm :: SYNC@500000 err=5400106"，
+ *   结果这些格式在首页和搜索页永远是灰底占位，用户一眼就能看出缺陷。
+ *   而 FFmpeg 本来就能解这些格式，抽一帧是顺手的事。
+ *
+ * 实现上直接输出 JPEG，不再走 PixelMap：
+ *   原来那条路要"解码出 PixelMap → 编码 JPEG → 再解码回来 → 存文件"，
+ *   中间那次往返是为了摆脱解码器资源（PixelMap 可能依赖已释放的解码器）。
+ *   既然在原生侧解码，直接用 FFmpeg 的 mjpeg 编码器写文件，
+ *   既不依赖任何外部资源，也少一次编解码。
+ *
+ * 几个要点：
+ *   ① 缩放必须保持宽高比，缩略图被拉伸变形很难看
+ *   ② 宽高都要取偶数：mjpeg 编码器对此有硬要求
+ *   ③ 不放大：放大只会更糊更慢
+ *   ④ 解码设上限：坏文件上不能无限循环，否则会把界面卡住
+ */
+int32_t ExtractFrameToJpeg(const std::string &srcPath, const std::string &dstPath,
+                           int64_t atMs, int32_t targetW, std::string &errMsg) {
+    // ---- 打开源文件 ----
+    AVFormatContext *fmt = nullptr;
+    int ret = avformat_open_input(&fmt, srcPath.c_str(), nullptr, nullptr);
+    if (ret < 0) {
+        errMsg = "avformat_open_input: " + AvErr(ret);
+        return kOpenFailed;
+    }
+    ret = avformat_find_stream_info(fmt, nullptr);
+    if (ret < 0) {
+        errMsg = "avformat_find_stream_info: " + AvErr(ret);
+        avformat_close_input(&fmt);
+        return kOpenFailed;
+    }
+
+    const AVCodec *vdec = nullptr;
+    const int vIdx = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &vdec, 0);
+    if (vIdx < 0 || vdec == nullptr) {
+        errMsg = "找不到视频流";
+        avformat_close_input(&fmt);
+        return kNoStream;
+    }
+
+    AVCodecContext *vctx = avcodec_alloc_context3(vdec);
+    if (vctx == nullptr) {
+        errMsg = "avcodec_alloc_context3 失败";
+        avformat_close_input(&fmt);
+        return kDecoderOpenFailed;
+    }
+    ret = avcodec_parameters_to_context(vctx, fmt->streams[vIdx]->codecpar);
+    if (ret < 0) {
+        errMsg = "avcodec_parameters_to_context: " + AvErr(ret);
+        avcodec_free_context(&vctx);
+        avformat_close_input(&fmt);
+        return kDecoderOpenFailed;
+    }
+    ret = avcodec_open2(vctx, vdec, nullptr);
+    if (ret < 0) {
+        errMsg = "avcodec_open2: " + AvErr(ret);
+        avcodec_free_context(&vctx);
+        avformat_close_input(&fmt);
+        return kDecoderOpenFailed;
+    }
+
+    // ---- seek 到目标位置 ----
+    // 往前找关键帧：抽帧不需要精确到那一毫秒，能拿到画面就行
+    if (atMs > 0) {
+        const int64_t ts = av_rescale_q(atMs, AVRational{1, 1000}, fmt->streams[vIdx]->time_base);
+        av_seek_frame(fmt, vIdx, ts, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(vctx);
+    }
+
+    // ---- 解码直到拿到一帧 ----
+    AVFrame *frame = av_frame_alloc();
+    AVPacket *pkt = av_packet_alloc();
+    bool gotFrame = false;
+    if (frame != nullptr && pkt != nullptr) {
+        // 上限 400 个包：足够跨过 seek 之后的一小段，又不会在坏文件上死循环
+        for (int guard = 0; guard < 400 && !gotFrame; guard++) {
+            ret = avcodec_receive_frame(vctx, frame);
+            if (ret == 0) {
+                gotFrame = true;
+                break;
+            }
+            if (ret == AVERROR_EOF) {
+                break;
+            }
+            if (ret != AVERROR(EAGAIN)) {
+                errMsg = "avcodec_receive_frame: " + AvErr(ret);
+                break;
+            }
+            ret = av_read_frame(fmt, pkt);
+            if (ret == AVERROR_EOF) {
+                avcodec_send_packet(vctx, nullptr);
+                continue;
+            }
+            if (ret < 0) {
+                errMsg = "av_read_frame: " + AvErr(ret);
+                break;
+            }
+            if (pkt->stream_index == vIdx) {
+                avcodec_send_packet(vctx, pkt);
+            }
+            av_packet_unref(pkt);
+        }
+    } else {
+        errMsg = "分配 AVFrame/AVPacket 失败";
+    }
+
+    if (!gotFrame) {
+        if (errMsg.empty()) {
+            errMsg = "在目标位置附近没有解出任何画面";
+        }
+        if (pkt != nullptr) { av_packet_free(&pkt); }
+        if (frame != nullptr) { av_frame_free(&frame); }
+        avcodec_free_context(&vctx);
+        avformat_close_input(&fmt);
+        return kDecodeFailed;
+    }
+
+    // ---- 计算缩略图尺寸（保持宽高比，且宽高都取偶数）----
+    int outW = (targetW > 0) ? targetW : frame->width;
+    if (outW > frame->width) {
+        outW = frame->width;   // 不放大
+    }
+    outW = outW & ~1;          // mjpeg 要求偶数
+    if (outW < 2) { outW = 2; }
+    int outH = static_cast<int>(static_cast<int64_t>(frame->height) * outW / frame->width);
+    outH = outH & ~1;
+    if (outH < 2) { outH = 2; }
+
+    // ---- 缩放 ----
+    SwsContext *sws = sws_getContext(frame->width, frame->height,
+                                     static_cast<AVPixelFormat>(frame->format),
+                                     outW, outH, AV_PIX_FMT_YUVJ420P,
+                                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+    AVFrame *scaled = (sws != nullptr) ? av_frame_alloc() : nullptr;
+    bool scaledOk = false;
+    if (sws != nullptr && scaled != nullptr) {
+        scaled->format = AV_PIX_FMT_YUVJ420P;
+        scaled->width = outW;
+        scaled->height = outH;
+        if (av_frame_get_buffer(scaled, 32) >= 0) {
+            sws_scale(sws, frame->data, frame->linesize, 0, frame->height,
+                      scaled->data, scaled->linesize);
+            scaledOk = true;
+        }
+    }
+    if (!scaledOk) {
+        errMsg = "缩略图缩放失败";
+        if (scaled != nullptr) { av_frame_free(&scaled); }
+        if (sws != nullptr) { sws_freeContext(sws); }
+        av_packet_free(&pkt);
+        av_frame_free(&frame);
+        avcodec_free_context(&vctx);
+        avformat_close_input(&fmt);
+        return kDecodeFailed;
+    }
+
+    // ---- 用 image2 + mjpeg 编码写文件 ----
+    // image2 复用器的用途就是"把单张图片写成一个文件"，正好是这个场景
+    int32_t result = kOk;
+    AVFormatContext *outCtx = nullptr;
+    AVCodecContext *jctx = nullptr;
+    AVPacket *jpkt = nullptr;
+    do {
+        if (avformat_alloc_output_context2(&outCtx, nullptr, "image2", dstPath.c_str()) < 0
+            || outCtx == nullptr) {
+            errMsg = "创建 image2 输出上下文失败";
+            result = kOpenFailed;
+            break;
+        }
+        const AVCodec *jenc = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+        if (jenc == nullptr) {
+            errMsg = "找不到 mjpeg 编码器（这份 FFmpeg 构建未启用）";
+            result = kDecoderOpenFailed;
+            break;
+        }
+        AVStream *outStream = avformat_new_stream(outCtx, nullptr);
+        jctx = avcodec_alloc_context3(jenc);
+        jpkt = av_packet_alloc();
+        if (outStream == nullptr || jctx == nullptr || jpkt == nullptr) {
+            errMsg = "分配编码器资源失败";
+            result = kDecoderOpenFailed;
+            break;
+        }
+        jctx->width = outW;
+        jctx->height = outH;
+        jctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
+        jctx->time_base = AVRational{1, 25};
+        // 缩略图不需要最高质量，但也不能太糊；5 是常用的折中值
+        jctx->compression_level = 5;
+        if (avcodec_open2(jctx, jenc, nullptr) < 0
+            || avcodec_parameters_from_context(outStream->codecpar, jctx) < 0) {
+            errMsg = "mjpeg 编码器初始化失败";
+            result = kDecoderOpenFailed;
+            break;
+        }
+        if (avio_open(&outCtx->pb, dstPath.c_str(), AVIO_FLAG_WRITE) < 0) {
+            errMsg = "无法写入 " + dstPath;
+            result = kOpenFailed;
+            break;
+        }
+        if (avformat_write_header(outCtx, nullptr) < 0) {
+            errMsg = "写 JPEG 文件头失败";
+            result = kOpenFailed;
+            break;
+        }
+        scaled->pts = 0;
+        if (avcodec_send_frame(jctx, scaled) < 0
+            || avcodec_receive_packet(jctx, jpkt) < 0) {
+            errMsg = "JPEG 编码失败";
+            result = kDecodeFailed;
+            break;
+        }
+        jpkt->stream_index = outStream->index;
+        if (av_write_frame(outCtx, jpkt) < 0) {
+            errMsg = "写 JPEG 数据失败";
+            result = kDecodeFailed;
+            break;
+        }
+        av_write_trailer(outCtx);
+    } while (false);
+
+    // ---- 清理（无论成败都要走完，否则会泄漏）----
+    if (jpkt != nullptr) { av_packet_free(&jpkt); }
+    if (jctx != nullptr) { avcodec_free_context(&jctx); }
+    if (outCtx != nullptr) {
+        if (outCtx->pb != nullptr) {
+            avio_closep(&outCtx->pb);
+        }
+        avformat_free_context(outCtx);
+    }
+    sws_freeContext(sws);
+    av_frame_free(&scaled);
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+    avcodec_free_context(&vctx);
+    avformat_close_input(&fmt);
+
+    if (result == kOk) {
+        LOGI("抽帧成功: %{public}s @%{public}lldms -> %{public}dx%{public}d JPEG",
+             srcPath.c_str(), static_cast<long long>(atMs), outW, outH);
+    } else {
+        LOGE("抽帧失败: %{public}s @%{public}lldms: %{public}s",
+             srcPath.c_str(), static_cast<long long>(atMs), errMsg.c_str());
+    }
+    return result;
+}
+
 int32_t Seek(Session session, int64_t positionMs, std::string &errMsg) {
     auto *s = static_cast<DecoderSession *>(session);
     if (s == nullptr) {
@@ -750,6 +1002,16 @@ int32_t AudioSampleRate() {
 
 int32_t AudioChannels() {
     return 2;
+}
+
+int32_t ExtractFrameToJpeg(const std::string &srcPath, const std::string &dstPath,
+                           int64_t atMs, int32_t targetW, std::string &errMsg) {
+    (void)srcPath;
+    (void)dstPath;
+    (void)atMs;
+    (void)targetW;
+    errMsg = "未集成 FFmpeg";
+    return kNotIntegrated;
 }
 
 void Close(Session session) {

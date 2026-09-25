@@ -4,11 +4,13 @@ import { showToast } from '../common/Toast';
 import { SoftPlayerController, SoftPlayerSnapshot } from '../model/SoftPlayerController';
 import { SoftPlayerState } from '../model/SoftPlayerTypes';
 import { common } from '@kit.AbilityKit';
+import { fileIo } from '@kit.CoreFileKit';
+import { image } from '@kit.ImageKit';
 // 原生模块的导出必须合并到一条 import ——
 // 分成两条 from 同一个模块，IDE 的 ArkTSCheck 会报
 // "Cannot find module 'libsoftplayer.so'"（它按模块名做解析，
 // 重复导入会让解析走到异常分支）。语法上两条也合法，但没必要。
-import { nativeSoftDecodeProbe } from 'libsoftplayer.so';
+import { nativeSoftDecodeProbe, nativeExtractFrame } from 'libsoftplayer.so';
 
 /** 待完善的设置项 */
 interface SettingItem {
@@ -213,6 +215,66 @@ struct SettingsPage {
       this.appendLog('测试异常：' + JSON.stringify(err));
     } finally {
       this.navTesting = false;
+    }
+  }
+
+  /**
+   * 抽帧自测：对内置的 .rm 素材调用 FFmpeg 抽帧并报告结果
+   *
+   * 为什么需要一个独立的验证入口：
+   *   缩略图的效果只能靠"首页看着有没有图"来判断，成功与失败都靠猜。
+   *   这个自测直接报告错误码、输出文件大小、以及回读出来的尺寸，
+   *   失败时能立刻分辨是"文件没打开""解不出帧"还是"写不出 JPEG"。
+   *   开发环境没有真机，所以把验证手段交给使用者。
+   */
+  private async runThumbProbe(): Promise<void> {
+    this.testLog = '';
+    this.appendLog('抽帧自测开始（针对系统不支持的 .rm）');
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const src: string = ctx.filesDir + '/codec-test/12_rv10.rm';
+      const dst: string = ctx.cacheDir + '/thumb-probe.jpg';
+      this.appendLog('源文件: ' + src);
+
+      // 先确认源文件在不在 —— 否则测的是"文件缺失"而不是抽帧能力
+      if (!fileIo.accessSync(src)) {
+        this.appendLog('✗ 源文件不存在。请先点「出素材」把测试文件解包出来。');
+        return;
+      }
+      this.appendLog('源文件大小: ' + fileIo.statSync(src).size.toString() + ' 字节');
+
+      const t0: number = Date.now();
+      const out: string = nativeExtractFrame(src, dst, 1000, 320);
+      const cost: number = Date.now() - t0;
+      this.appendLog('nativeExtractFrame -> ' + out + '  (' + cost.toString() + ' ms)');
+
+      // 检查产物：存在、非空
+      if (!fileIo.accessSync(dst)) {
+        this.appendLog('✗ 输出文件不存在');
+        return;
+      }
+      const size: number = fileIo.statSync(dst).size;
+      this.appendLog('输出文件大小: ' + size.toString() + ' 字节');
+      if (size <= 0) {
+        this.appendLog('✗ 输出文件为空');
+        return;
+      }
+
+      // 用 ImageKit 读回来验证它确实是一张能用的 JPEG，
+      // 而不只是一个"有字节数的文件"
+      const file: fileIo.File = fileIo.openSync(dst, fileIo.OpenMode.READ_ONLY);
+      try {
+        const source: image.ImageSource = image.createImageSource(file.fd);
+        const info: image.ImageInfo = await source.getImageInfo();
+        this.appendLog('解码验证: ' + info.size.width.toString() + 'x'
+          + info.size.height.toString() + '  格式=' + info.mimeType);
+        await source.release();
+      } finally {
+        fileIo.closeSync(file);
+      }
+      this.appendLog('✅ 抽帧链路完整可用');
+    } catch (err) {
+      this.appendLog('自测异常：' + JSON.stringify(err));
     }
   }
 
@@ -488,6 +550,14 @@ struct SettingsPage {
                 if (!this.navTesting) {
                   this.runNavStress();
                 }
+              })
+
+            Text('抽帧自测')
+              .fontSize(12)
+              .fontColor(Theme.ACCENT)
+              .padding(4)
+              .onClick(() => {
+                this.runThumbProbe();
               })
           }
           .width('100%')

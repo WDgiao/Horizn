@@ -80,3 +80,20 @@ export const nativeBuildInfo: () => string;
  */
 export const nativeSoftDecodeProbe: (surfaceId: string, filePath: string) => string;
 
+/**
+ * 抽一帧画面存成 JPEG —— 用于生成视频缩略图
+ *
+ * 为什么需要它：系统 AVImageGenerator 对 .rm / .wmv / .ogv 完全无能为力
+ * （实测报 5400106），导致这些格式在首页和搜索页永远是灰底占位。
+ * 而 FFmpeg 本来就能解这些格式。
+ *
+ * @param srcPath 源视频绝对路径
+ * @param dstPath 输出 JPEG 路径
+ * @param atMs 取帧位置（毫秒）；实际会跳到该位置之前最近的关键帧
+ * @param targetW 期望宽度（等比缩放；<=0 用原始宽度；不会放大）
+ * @returns 形如 "0 " 表示成功（首段是错误码，0 为成功）；
+ *          失败时首段为负错误码，后面跟可读原因
+ */
+export const nativeExtractFrame: (srcPath: string, dstPath: string,
+                                 atMs: number, targetW: number) => string;
+

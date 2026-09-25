@@ -193,6 +193,55 @@ static napi_value NativeSoftDecodeProbe(napi_env env, napi_callback_info info)
     return result;
 }
 
+/**
+ * 抽一帧画面存成 JPEG —— 供生成缩略图用
+ *
+ * 为什么需要它：
+ *   系统 AVImageGenerator 对 .rm / .wmv / .ogv 完全无能为力
+ *   （实测报 5400106），导致这些格式在首页和搜索页永远是灰底占位。
+ *   而 FFmpeg 本来就能解这些格式，抽一帧是顺手的事。
+ *
+ * 用法：nativeExtractFrame(srcPath, dstPath, atMs, targetW) -> 结果字符串
+ */
+static napi_value NativeExtractFrame(napi_env env, napi_callback_info info)
+{
+    size_t argc = 4;
+    napi_value args[4] = {nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+
+    char srcBuf[1024] = {0};
+    char dstBuf[1024] = {0};
+    int64_t atMs = 0;
+    int32_t targetW = 0;
+    size_t len = 0;
+    if (argc >= 1 && args[0] != nullptr) {
+        napi_get_value_string_utf8(env, args[0], srcBuf, sizeof(srcBuf), &len);
+    }
+    if (argc >= 2 && args[1] != nullptr) {
+        napi_get_value_string_utf8(env, args[1], dstBuf, sizeof(dstBuf), &len);
+    }
+    if (argc >= 3 && args[2] != nullptr) {
+        napi_get_value_int64(env, args[2], &atMs);
+    }
+    if (argc >= 4 && args[3] != nullptr) {
+        napi_get_value_int32(env, args[3], &targetW);
+    }
+
+    std::string err;
+    int32_t code = softplayer::codecapi::kNotIntegrated;
+    if (softplayer::codecapi::IsIntegrated()) {
+        code = softplayer::codecapi::ExtractFrameToJpeg(srcBuf, dstBuf, atMs, targetW, err);
+    } else {
+        err = "未集成 FFmpeg";
+    }
+
+    char buf[320] = {0};
+    snprintf(buf, sizeof(buf), "%d %s", code, err.c_str());
+    napi_value result = nullptr;
+    napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &result);
+    return result;
+}
+
 EXTERN_C_START
 static napi_value Init(napi_env env, napi_value exports)
 {
@@ -200,6 +249,8 @@ static napi_value Init(napi_env env, napi_value exports)
         { "nativeProbe", nullptr, NativeProbe, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "nativeBuildInfo", nullptr, NativeBuildInfo, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "nativeSoftDecodeProbe", nullptr, NativeSoftDecodeProbe, nullptr, nullptr, nullptr,
+          napi_default, nullptr },
+        { "nativeExtractFrame", nullptr, NativeExtractFrame, nullptr, nullptr, nullptr,
           napi_default, nullptr }
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);

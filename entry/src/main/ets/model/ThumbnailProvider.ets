@@ -3,6 +3,8 @@ import { fileIo } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { fileUri } from '@kit.CoreFileKit';
 import { BusinessError } from '@kit.BasicServicesKit';
+// 原生抽帧：系统 AVImageGenerator 解不了的格式（rm/wmv/ogv）走这条路
+import { nativeExtractFrame } from 'libsoftplayer.so';
 
 /** 单次抓帧的超时时间（毫秒），超时即放弃并记失败 */
 const FETCH_TIMEOUT_MS: number = 2500;
@@ -327,6 +329,50 @@ export class ThumbnailProvider {
   }
 
   /**
+   * 用 FFmpeg 抽一帧存成 JPEG（系统抽帧失败时的回退路径）
+   *
+   * 与系统那条路的区别：这里直接产出 JPEG 文件，不需要经过 PixelMap。
+   * 原系统路径之所以要"PixelMap → 编码 JPEG → 再解码回来"，
+   * 是因为 AVImageGenerator 解出的 PixelMap 可能依赖解码器资源，
+   * 一旦 release 生成器位图就可能失效。而 FFmpeg 在原生侧解码，
+   * 编成 JPEG 直接落盘，天然不依赖任何外部资源。
+   *
+   * @param src 源视频绝对路径
+   * @returns 成功返回 file:// URI，失败返回空串
+   */
+  private async extractByFfmpeg(src: string): Promise<string> {
+    try {
+      const target: string = this.thumbPathOf(src);
+      // 取第 1 秒的画面：太靠前常常是黑场或片头，太靠后则可能超出短片时长。
+      // 原生侧实际会跳到该位置之前最近的关键帧，所以拿到的画面可能略早，
+      // 缩略图场景完全可以接受。
+      const atMs: number = 1000;
+      const code: string = nativeExtractFrame(src, target, atMs, THUMB_WIDTH);
+      // nativeExtractFrame 返回 "错误码 原因"，错误码 0 表示成功
+      const codeNum: number = parseInt(code.split(' ')[0], 10);
+      if (codeNum !== 0) {
+        console.warn('[Thumb] FFmpeg 抽帧失败: ' + code);
+        return '';
+      }
+      // 确认文件真的写出来了 —— 抽帧报成功但文件为空的情况也要挡住，
+      // 否则界面会拿到一个指向空文件的 URI，表现为"加载失败"而不是"灰底兜底"
+      if (!fileIo.accessSync(target)) {
+        console.warn('[Thumb] FFmpeg 报告成功但文件不存在: ' + target);
+        return '';
+      }
+      if (fileIo.statSync(target).size <= 0) {
+        console.warn('[Thumb] FFmpeg 生成的 JPEG 为空文件');
+        return '';
+      }
+      return this.toFileUri(target);
+    } catch (err) {
+      const e = err as BusinessError;
+      console.warn('[Thumb] FFmpeg 抽帧异常: ' + e.code + ':' + e.message);
+      return '';
+    }
+  }
+
+  /**
    * 提取视频内置帧作为封面
    * @param src 视频绝对路径
    * @returns 成功返回 PixelMap，失败返回 undefined（调用方走渐变兜底）
@@ -438,6 +484,28 @@ export class ThumbnailProvider {
         fileIo.closeSync(file);
       } catch (err) {
         attempts.push({ timeUs: -1, mode: 'close', ok: false, error: 'close failed' });
+      }
+
+      // ---- 第六步：系统抽帧失败时，用 FFmpeg 回退 ----
+      //
+      // 为什么需要回退：
+      //   实测系统 AVImageGenerator 对 .rm / .wmv / .ogv 完全无能为力
+      //   （日志里一直是 "THUMB FAIL ... 12_rv10.rm :: SYNC@500000 err=5400106"）。
+      //   结果这些格式在首页和搜索页永远是灰底占位 —— 用户一眼就能看出缺陷。
+      //   而 FFmpeg 本来就能解这些格式（这正是内置软解的意义），抽一帧是顺手的事。
+      //
+      // 为什么必须放在 release/close 之后：
+      //   FFmpeg 抽帧要重新打开同一个文件。如果此时系统的生成器还没释放、
+      //   文件句柄还开着，就是两个解码器同时持有同一个文件 ——
+      //   既浪费内存，也可能因句柄争用而失败。先彻底退出再进来，最干净。
+      if (filePath.length === 0) {
+        const ffPath: string = await this.extractByFfmpeg(src);
+        if (ffPath.length > 0) {
+          filePath = ffPath;
+          attempts.push({ timeUs: -1, mode: 'ffmpeg', ok: true, error: '' });
+        } else {
+          attempts.push({ timeUs: -1, mode: 'ffmpeg', ok: false, error: 'ffmpeg-extract-failed' });
+        }
       }
 
       this.lastAttempts = attempts;

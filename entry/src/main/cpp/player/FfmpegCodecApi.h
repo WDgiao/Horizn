@@ -131,6 +131,32 @@ int32_t AudioSampleRate();
 int32_t AudioChannels();
 
 /**
+ * 抽一帧画面并存成 JPEG 文件（用于生成缩略图）
+ *
+ * 为什么自己抽帧而不是继续用系统的 AVImageGenerator：
+ *   实测系统对 .rm / .wmv / .ogv 完全无能为力 ——
+ *   日志里一直是 "THUMB FAIL ... 12_rv10.rm :: SYNC@500000 err=5400106"，
+ *   结果这些格式在首页和搜索页永远是灰底占位，用户一眼就能看出缺陷。
+ *   而 FFmpeg 本来就能解这些格式，抽一帧是顺手的事。
+ *
+ * 实现上直接输出 JPEG，不再走 PixelMap：
+ *   原来那条路要"解码出 PixelMap → 编码成 JPEG → 再解码回来 → 存文件"，
+ *   中间那次往返是为了摆脱解码器资源（PixelMap 可能依赖已释放的解码器）。
+ *   既然在原生侧解码，直接用 FFmpeg 的 mjpeg 编码器写文件，
+ *   既不依赖任何外部资源，也少一次编解码。
+ *
+ * @param srcPath 源视频绝对路径
+ * @param dstPath 输出 JPEG 路径
+ * @param atMs 取帧位置（毫秒）。实际会跳到该位置之前最近的关键帧再解，
+ *             所以拿到的画面可能略早于 atMs —— 缩略图场景可以接受
+ * @param targetW 期望宽度（会等比缩放；<=0 表示用原始宽度）
+ * @param errMsg 失败时填充可读原因
+ * @return kOk 或错误码
+ */
+int32_t ExtractFrameToJpeg(const std::string &srcPath, const std::string &dstPath,
+                           int64_t atMs, int32_t targetW, std::string &errMsg);
+
+/**
  * 注：这里曾经有一个 RemuxLoop（把短片循环拼成长片，用于 seek 压测）。
  * 已删除 —— 实测走不通：这份构建里 matroska 复用器装不了 RV10
  * （报 "Not yet implemented in FFmpeg, patches welcome"），
