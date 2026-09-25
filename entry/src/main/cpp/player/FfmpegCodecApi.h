@@ -52,6 +52,16 @@ struct MediaSummary {
     bool hasAudio = false;
     /** 视频像素格式名，便于诊断（yuv420p / yuv422p10le ...） */
     std::string pixelFormat;
+    /**
+     * 画面旋转角度（0 / 90 / 180 / 270，顺时针）
+     *
+     * 为什么必须取出来：
+     *   手机竖着拍的视频通常以横向存储，靠容器里的旋转矩阵标记"播放时该转 90 度"。
+     *   系统 AVPlayer 会自动照做，但我们自己解码上屏时**必须自己转** ——
+     *   否则画面是歪的（实测日志里见过 rotation_angle=90、video_orientation_type=3
+     *   这类文件）。C++ 侧原先是完全没处理这个的。
+     */
+    int32_t rotationDeg = 0;
 };
 
 /**

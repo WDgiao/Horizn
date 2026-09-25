@@ -29,6 +29,15 @@ struct MediaInfo {
     std::string audioCodec;   // 音频编码名，例如 "cook"
     bool hasVideo = false;
     bool hasAudio = false;
+    /**
+     * 画面旋转角度（0 / 90 / 180 / 270，顺时针）
+     *
+     * 手机竖拍视频常以横向像素存储，靠容器的旋转矩阵标记"播放时转 90 度"。
+     * 系统 AVPlayer 会自动处理，我们自己解码必须自己转 —— 否则画面是歪的。
+     * 注意：width/height 报的是**旋转前**的存储尺寸；
+     * 旋转 90/270 时实际观看尺寸是两者互换。
+     */
+    int32_t rotationDeg = 0;
 };
 
 /** 事件类型，通过回调上报到 JS 侧 */

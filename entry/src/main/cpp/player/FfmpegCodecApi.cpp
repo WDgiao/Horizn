@@ -32,6 +32,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/display.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libswresample/swresample.h>
@@ -39,6 +40,7 @@ extern "C" {
 }
 
 #include <cstring>
+#include <cmath>
 #include <mutex>
 
 #endif  // SOFT_PLAYER_WITH_FFMPEG
@@ -268,12 +270,70 @@ int32_t CopyFrame(DecoderSession *s, const AVFrame *src, VideoFrame &out,
     return kOk;
 }
 
+/**
+ * 把单个平面按 90/180/270 度顺时针旋转
+ *
+ * 单独抽出来是因为 YUV420 有三个平面（Y 全分辨率、U/V 各半分辨率），
+ * 三者的旋转逻辑完全相同，只是宽高不同 —— 写三遍容易改漏其中一个。
+ *
+ * @param src 源平面首地址
+ * @param srcStride 源每行字节数（可能大于宽度，必须按它取行首）
+ * @param dst 目标平面首地址
+ * @param dstStride 目标每行字节数
+ * @param w 源平面宽度（像素）
+ * @param h 源平面高度（像素）
+ * @param deg 旋转角度（90 / 180 / 270）
+ */
+void RotatePlane(const uint8_t *src, int srcStride,
+                 uint8_t *dst, int dstStride,
+                 int w, int h, int deg) {
+    for (int y = 0; y < h; y++) {
+        const uint8_t *srcRow = src + static_cast<size_t>(y) * srcStride;
+        for (int x = 0; x < w; x++) {
+            int dx = 0;
+            int dy = 0;
+            if (deg == 90) {
+                // 顺时针 90：源 (x,y) -> 目标 (h-1-y, x)
+                dx = h - 1 - y;
+                dy = x;
+            } else if (deg == 180) {
+                dx = w - 1 - x;
+                dy = h - 1 - y;
+            } else {  // 270
+                // 顺时针 270（= 逆时针 90）：源 (x,y) -> 目标 (y, w-1-x)
+                dx = y;
+                dy = w - 1 - x;
+            }
+            dst[static_cast<size_t>(dy) * dstStride + dx] = srcRow[x];
+        }
+    }
+}
+
+/**
+ * 按角度旋转整帧 YUV420
+ *
+ * ★ 色度平面要注意用半分辨率：U/V 的宽高都是亮度的一半。
+ *   如果拿全分辨率的宽高去转 U/V，会读到越界内存（比写越界更隐蔽，
+ *   因为不一定立刻崩，而是画面错乱）。
+ */
+void RotateYuv420(const AVFrame *src, AVFrame *dst, int deg) {
+    const int w = src->width;
+    const int h = src->height;
+    RotatePlane(src->data[0], src->linesize[0], dst->data[0], dst->linesize[0], w, h, deg);
+
+    // 色度平面：尺寸各减半。用 (w+1)/2 而不是 w/2，
+    // 是为了在奇数尺寸下也能覆盖到最后一块（YUV420 的色度是向上取整）
+    const int cw = (w + 1) / 2;
+    const int ch = (h + 1) / 2;
+    RotatePlane(src->data[1], src->linesize[1], dst->data[1], dst->linesize[1], cw, ch, deg);
+    RotatePlane(src->data[2], src->linesize[2], dst->data[2], dst->linesize[2], cw, ch, deg);
+}
+
 }  // namespace
 
 std::string VersionString() {
     return std::string(av_version_info());
 }
-
 bool IsIntegrated() {
     return true;
 }
@@ -357,6 +417,41 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
         }
         const char *pf = av_get_pix_fmt_name(vctx->pix_fmt);
         out.pixelFormat = pf != nullptr ? pf : "unknown";
+
+        // ---- 读出画面旋转角度 ----
+        //
+        // 为什么必须读：
+        //   手机竖着拍的视频通常以横向像素存储，只靠容器里的旋转矩阵说明
+        //   "播放时该转 90 度"。系统 AVPlayer 会自动照做，但我们是自己解码上屏，
+        //   不读这个标记画面就是歪的。
+        //
+        // 两个来源都要看，因为不同容器放的位置不同：
+        //   ① 流级 side data（mp4/mov 的 tkhd 矩阵、mkv 的 ProjectionPoseRoll
+        //      被 FFmpeg 归一化到这里）—— 首选
+        //   ② 逐帧 side data —— 少数文件只在帧上带
+        // 这里只处理流级；逐帧的在解码时处理（见 CopyFrame 的说明）。
+        const AVPacketSideData *sd = av_packet_side_data_get(
+            fmt->streams[vIdx]->codecpar->coded_side_data,
+            fmt->streams[vIdx]->codecpar->nb_coded_side_data,
+            AV_PKT_DATA_DISPLAYMATRIX);
+        if (sd != nullptr && sd->size >= 9 * sizeof(int32_t)) {
+            // av_display_rotation_get 返回的是**逆时针**角度（数学约定），
+            // 而我们要的是顺时针，所以取负；再归一化到 [0,360)
+            const double ccw = av_display_rotation_get(
+                reinterpret_cast<const int32_t *>(sd->data));
+            if (!std::isnan(ccw)) {
+                int32_t deg = static_cast<int32_t>(-ccw);
+                deg = ((deg % 360) + 360) % 360;
+                // 只接受 90 的整数倍：非直角旋转需要重采样，播放器通常不支持，
+                // 硬转反而会因插值把画面弄糊
+                if (deg % 90 == 0) {
+                    out.rotationDeg = deg;
+                }
+            }
+        }
+        if (out.rotationDeg != 0) {
+            LOGI("该视频带旋转元数据: %{public}d 度（画面将按此旋转上屏）", out.rotationDeg);
+        }
     }
 
     if (aIdx >= 0) {
@@ -636,6 +731,8 @@ int32_t AudioChannels() {
  *   ② 宽高都要取偶数：mjpeg 编码器对此有硬要求
  *   ③ 不放大：放大只会更糊更慢
  *   ④ 解码设上限：坏文件上不能无限循环，否则会把界面卡住
+ *   ⑤ **必须处理旋转元数据** —— 手机竖拍视频存储是横向的，
+ *      不转的话缩略图是躺着的（手机视频里这类很常见）
  */
 int32_t ExtractFrameToJpeg(const std::string &srcPath, const std::string &dstPath,
                            int64_t atMs, int32_t targetW, std::string &errMsg) {
@@ -738,28 +835,64 @@ int32_t ExtractFrameToJpeg(const std::string &srcPath, const std::string &dstPat
         return kDecodeFailed;
     }
 
+    // ---- 读出旋转角度（见 ExtractFrameToJpeg 注释⑤）----
+    int rotDeg = 0;
+    {
+        const AVPacketSideData *rsd = av_packet_side_data_get(
+            fmt->streams[vIdx]->codecpar->coded_side_data,
+            fmt->streams[vIdx]->codecpar->nb_coded_side_data,
+            AV_PKT_DATA_DISPLAYMATRIX);
+        if (rsd != nullptr && rsd->size >= 9 * sizeof(int32_t)) {
+            const double ccw = av_display_rotation_get(
+                reinterpret_cast<const int32_t *>(rsd->data));
+            if (!std::isnan(ccw)) {
+                int d = static_cast<int32_t>(-ccw);
+                d = ((d % 360) + 360) % 360;
+                if (d % 90 == 0) {
+                    rotDeg = d;
+                }
+            }
+        }
+    }
+
     // ---- 计算缩略图尺寸（保持宽高比，且宽高都取偶数）----
-    int outW = (targetW > 0) ? targetW : frame->width;
-    if (outW > frame->width) {
-        outW = frame->width;   // 不放大
+    //
+    // ★ 旋转 90/270 时"显示宽高"是存储宽高互换，必须按互换后的比例算，
+    //   否则算出来的缩略图比例是错的（竖拍视频会得到又扁又小的图）。
+    const int dispW = (rotDeg == 90 || rotDeg == 270) ? frame->height : frame->width;
+    const int dispH = (rotDeg == 90 || rotDeg == 270) ? frame->width : frame->height;
+
+    int outW = (targetW > 0) ? targetW : dispW;
+    if (outW > dispW) {
+        outW = dispW;   // 不放大
     }
     outW = outW & ~1;          // mjpeg 要求偶数
     if (outW < 2) { outW = 2; }
-    int outH = static_cast<int>(static_cast<int64_t>(frame->height) * outW / frame->width);
+    int outH = static_cast<int>(static_cast<int64_t>(dispH) * outW / dispW);
     outH = outH & ~1;
     if (outH < 2) { outH = 2; }
 
     // ---- 缩放 ----
+    //
+    // 分两步做：① sws_scale 缩放到"旋转前的尺寸" ② 再按角度搬像素。
+    // 为什么不一步到位（直接让 sws 输出旋转后的尺寸）：sws_scale 只能缩放，
+    // 不会旋转 —— 直接按 (outH,outW) 输出只会把画面拉扁，不是旋转。
+    //
+    // 中间尺寸 (midW, midH)：旋转 90/270 时与最终尺寸互换，180 时相同
+    const bool swap = (rotDeg == 90 || rotDeg == 270);
+    const int midW = swap ? outH : outW;
+    const int midH = swap ? outW : outH;
+
     SwsContext *sws = sws_getContext(frame->width, frame->height,
                                      static_cast<AVPixelFormat>(frame->format),
-                                     outW, outH, AV_PIX_FMT_YUVJ420P,
+                                     midW, midH, AV_PIX_FMT_YUVJ420P,
                                      SWS_BILINEAR, nullptr, nullptr, nullptr);
     AVFrame *scaled = (sws != nullptr) ? av_frame_alloc() : nullptr;
     bool scaledOk = false;
     if (sws != nullptr && scaled != nullptr) {
         scaled->format = AV_PIX_FMT_YUVJ420P;
-        scaled->width = outW;
-        scaled->height = outH;
+        scaled->width = midW;
+        scaled->height = midH;
         if (av_frame_get_buffer(scaled, 32) >= 0) {
             sws_scale(sws, frame->data, frame->linesize, 0, frame->height,
                       scaled->data, scaled->linesize);
@@ -775,6 +908,39 @@ int32_t ExtractFrameToJpeg(const std::string &srcPath, const std::string &dstPat
         avcodec_free_context(&vctx);
         avformat_close_input(&fmt);
         return kDecodeFailed;
+    }
+
+    // ---- 按角度旋转到最终尺寸 ----
+    AVFrame *rotated = nullptr;
+    if (rotDeg != 0) {
+        rotated = av_frame_alloc();
+        bool rotOk = false;
+        if (rotated != nullptr) {
+            rotated->format = AV_PIX_FMT_YUVJ420P;
+            rotated->width = outW;
+            rotated->height = outH;
+            if (av_frame_get_buffer(rotated, 32) >= 0) {
+                RotateYuv420(scaled, rotated, rotDeg);
+                rotOk = true;
+            }
+        }
+        if (!rotOk) {
+            // 旋转失败不算致命：交回未旋转的画面，总比什么都没有好。
+            // 但要留下日志，否则"缩略图躺着了"会很难查。
+            LOGW("缩略图旋转失败，回退为未旋转画面（旋转 %{public}d 度）", rotDeg);
+            if (rotated != nullptr) { av_frame_free(&rotated); }
+            rotated = nullptr;
+        }
+    }
+
+    // 后续编码用 effective 指向真正要编码的那一帧
+    const AVFrame *effective = (rotated != nullptr) ? rotated : scaled;
+    const int encW = (rotated != nullptr) ? outW : midW;
+    const int encH = (rotated != nullptr) ? outH : midH;
+    if (rotated == nullptr && rotDeg != 0) {
+        // 旋转失败时尺寸用的是中间尺寸，outW/outH 要跟着改，
+        // 否则后面编码器按错误的宽高配置，出来的图会错位
+        LOGW("尺寸回退为中间尺寸 %{public}dx%{public}d", midW, midH);
     }
 
     // ---- 用 image2 + mjpeg 编码写文件 ----
@@ -804,8 +970,11 @@ int32_t ExtractFrameToJpeg(const std::string &srcPath, const std::string &dstPat
             result = kDecoderOpenFailed;
             break;
         }
-        jctx->width = outW;
-        jctx->height = outH;
+        // 用 encW/encH 而不是 outW/outH：旋转成功时两者相同，
+        // 旋转失败时会退回中间尺寸 —— 编码器必须按实际要编码的那一帧配置，
+        // 否则 mjpeg 会因为尺寸不符而报错或产出错位的图
+        jctx->width = encW;
+        jctx->height = encH;
         jctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
         jctx->time_base = AVRational{1, 25};
         // 缩略图不需要最高质量，但也不能太糊；5 是常用的折中值
@@ -827,7 +996,11 @@ int32_t ExtractFrameToJpeg(const std::string &srcPath, const std::string &dstPat
             break;
         }
         scaled->pts = 0;
-        if (avcodec_send_frame(jctx, scaled) < 0
+        if (effective != scaled) {
+            // 旋转过：编码旋转后的帧。它的尺寸已按需互换/翻转，直接可用。
+            const_cast<AVFrame *>(effective)->pts = 0;
+        }
+        if (avcodec_send_frame(jctx, effective) < 0
             || avcodec_receive_packet(jctx, jpkt) < 0) {
             errMsg = "JPEG 编码失败";
             result = kDecodeFailed;
@@ -852,6 +1025,7 @@ int32_t ExtractFrameToJpeg(const std::string &srcPath, const std::string &dstPat
         avformat_free_context(outCtx);
     }
     sws_freeContext(sws);
+    if (rotated != nullptr) { av_frame_free(&rotated); }
     av_frame_free(&scaled);
     av_packet_free(&pkt);
     av_frame_free(&frame);
@@ -859,8 +1033,8 @@ int32_t ExtractFrameToJpeg(const std::string &srcPath, const std::string &dstPat
     avformat_close_input(&fmt);
 
     if (result == kOk) {
-        LOGI("抽帧成功: %{public}s @%{public}lldms -> %{public}dx%{public}d JPEG",
-             srcPath.c_str(), static_cast<long long>(atMs), outW, outH);
+        LOGI("抽帧成功: %{public}s @%{public}lldms -> %{public}dx%{public}d JPEG（旋转%{public}d度）",
+             srcPath.c_str(), static_cast<long long>(atMs), encW, encH, rotDeg);
     } else {
         LOGE("抽帧失败: %{public}s @%{public}lldms: %{public}s",
              srcPath.c_str(), static_cast<long long>(atMs), errMsg.c_str());

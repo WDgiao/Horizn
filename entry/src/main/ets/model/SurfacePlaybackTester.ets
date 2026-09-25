@@ -40,6 +40,14 @@ const TEST_FILES: string[] = [
 /** 沙箱内解包目录 */
 const UNPACK_DIR: string = 'codec-test';
 
+/**
+ * 补充测试素材在沙箱里的目录名
+ *
+ * 与 codec-test 分开：那边是"每个格式一个"的格式覆盖样本，
+ * 这边是针对具体薄弱点的（长视频压 seek、无音轨验时钟回退）。
+ */
+const TESTSET_DIR: string = '测试素材';
+
 /** 单个文件观察时长（毫秒） */
 const WATCH_MS: number = 2500;
 
@@ -59,6 +67,59 @@ const WATCH_MS: number = 2500;
  * 所以判据是：**画面尺寸非 0** + 进入 playing + 位置推进。
  */
 export class SurfacePlaybackTester {
+
+  /**
+   * 把 rawfile/testset/ 下的补充测试素材解包到沙箱
+   *
+   * 为什么单独一组（不复用上面的 unpackSamples）：
+   *   codec/ 那 12 个是"格式覆盖"用的固定样本（每个格式一个）；
+   *   testset/ 这几个是"针对具体薄弱点"的（长视频压 seek、无音轨验时钟回退），
+   *   性质不同、数量会变，所以分开管理。
+   *
+   * 为什么必须写进沙箱才能用：
+   *   媒体库扫描的是沙箱目录，而 rawfile 是打包在 HAP 里的只读资源，
+   *   不落盘就不会出现在搜索页。而 hdc 无法写入应用沙箱（实测 cp 报
+   *   Permission denied，模拟器与真机都一样），所以只能由应用自己解包。
+   */
+  static async unpackTestset(context: common.UIAbilityContext): Promise<string[]> {
+    const dir: string = context.filesDir + '/' + TESTSET_DIR;
+    if (!fileIo.accessSync(dir)) {
+      fileIo.mkdirSync(dir, true);
+    }
+    // 列目录而不是写死文件名：以后往 rawfile/testset/ 里加素材时不用改代码
+    const names: string[] = await context.resourceManager.getRawFileList('testset');
+    const done: string[] = [];
+    for (let i = 0; i < names.length; i++) {
+      const name: string = names[i];
+      const target: string = dir + '/' + name;
+      let need: boolean = true;
+      try {
+        if (fileIo.accessSync(target) && fileIo.statSync(target).size > 0) {
+          need = false;
+        }
+      } catch (err) {
+        need = true;
+      }
+      if (!need) {
+        done.push(name + '（已存在）');
+        continue;
+      }
+      try {
+        const bytes: Uint8Array = await context.resourceManager.getRawFileContent('testset/' + name);
+        const file = fileIo.openSync(target,
+          fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
+        try {
+          fileIo.writeSync(file.fd, bytes.buffer.slice(0, bytes.length));
+        } finally {
+          fileIo.closeSync(file);
+        }
+        done.push(name + '  ' + (bytes.length / 1024).toFixed(0) + ' KB');
+      } catch (err) {
+        done.push(name + ' 失败: ' + JSON.stringify(err));
+      }
+    }
+    return done;
+  }
 
   /** 解包素材到沙箱（复用上一轮的逻辑，目录已存在则跳过） */
   static async unpackSamples(context: common.UIAbilityContext): Promise<string> {

@@ -219,6 +219,29 @@ struct SettingsPage {
   }
 
   /**
+   * 把补充测试素材（rawfile/testset）解包到沙箱
+   *
+   * 这批素材针对的是已发现的薄弱点，与「出素材」那 12 个格式样本不同：
+   *   - 长视频_rv20_10秒.rm   10 秒长片，用来压 seek（原来 2 秒的没跳转空间）
+   *   - 无音轨_rv20.rm        没有音频轨，验证是否退回单调时钟且不卡住
+   * 解包后去搜索页「重新扫描」就能看到（它们会出现在「测试素材」目录下）。
+   */
+  private async publishTestset(): Promise<void> {
+    this.testLog = '';
+    this.appendLog('解包补充测试素材…');
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const list: string[] = await SurfacePlaybackTester.unpackTestset(ctx);
+      for (let i = 0; i < list.length; i++) {
+        this.appendLog('  ' + list[i]);
+      }
+      this.appendLog('完成。去「文件搜索」页点「重新扫描」即可看到。');
+    } catch (err) {
+      this.appendLog('解包失败：' + JSON.stringify(err));
+    }
+  }
+
+  /**
    * 抽帧自测：对内置的 .rm 素材调用 FFmpeg 抽帧并报告结果
    *
    * 为什么需要一个独立的验证入口：
@@ -558,6 +581,14 @@ struct SettingsPage {
               .padding(4)
               .onClick(() => {
                 this.runThumbProbe();
+              })
+
+            Text('出测试集')
+              .fontSize(12)
+              .fontColor(Theme.ACCENT)
+              .padding(4)
+              .onClick(() => {
+                this.publishTestset();
               })
           }
           .width('100%')

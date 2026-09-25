@@ -150,6 +150,7 @@ int32_t FfmpegEngine::Prepare(const std::string &path) {
     info_.audioCodec = summary.audioCodec;
     info_.hasVideo = summary.hasVideo;
     info_.hasAudio = summary.hasAudio;
+    info_.rotationDeg = summary.rotationDeg;
 
     positionMs_.store(0);
     pendingSeekMs_.store(-1);
@@ -157,12 +158,15 @@ int32_t FfmpegEngine::Prepare(const std::string &path) {
     lastFrameSysMs_ = 0;
 
     Emit(PlayerEvent::DURATION, info_.durationMs, 0, "");
-    Emit(PlayerEvent::VIDEO_SIZE, info_.width, info_.height, "");
+    // VIDEO_SIZE 的 data2 借用来带旋转角度：上层需要知道该不该把宽高互换来计算
+    // 画面比例（竖拍视频存储是 1920x1080、实际观看是 1080x1920，差一个屏幕方向）
+    Emit(PlayerEvent::VIDEO_SIZE, info_.width,
+         info_.height | (static_cast<int64_t>(info_.rotationDeg) << 32), "");
     Emit(PlayerEvent::PREPARED, 0, 0, "");
     SetState(PlayerState::READY);
-    LOGI("Prepare 成功: %{public}s %{public}s/%{public}s %{public}dx%{public}d",
+    LOGI("Prepare 成功: %{public}s %{public}s/%{public}s %{public}dx%{public}d 旋转%{public}d度",
          path_.c_str(), info_.videoCodec.c_str(), info_.audioCodec.c_str(),
-         info_.width, info_.height);
+         info_.width, info_.height, info_.rotationDeg);
     return 0;
 }
 
