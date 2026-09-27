@@ -386,8 +386,18 @@ struct PlayerPage {
       this.preparing = false;
       this.errorMsg = '';
       // 就绪即播：续播起点用 seekTo 处理（软解在 READY 态接受 seek）
+      //
+      // 诊断：这里必须记下"决定要不要 seek"的三个输入。
+      // 「rm 文件无法续播」这个缺陷有几种可能：startMs 没传进来、
+      // 进 READY 时 durationMs 还是 0（于是被 if 拦掉）、或者 seek 发了但没生效。
+      // 只有把这三个值记下来才能区分，否则只能靠猜。
+      this.writeDiag('soft READY: startMs=' + this.startPositionMs.toString()
+        + ' snapDur=' + snap.durationMs.toString()
+        + ' thisDur=' + this.durationMs.toString()
+        + ' 将seek=' + ((this.startPositionMs > 0 && snap.durationMs > 0) ? '是' : '否'));
       if (this.startPositionMs > 0 && snap.durationMs > 0) {
         this.softCtl?.seekTo(this.startPositionMs);
+        this.writeDiag('soft 已发起 seekTo(' + this.startPositionMs.toString() + ')');
       }
       this.softCtl?.play();
     } else if (st === SoftPlayerState.PLAYING) {

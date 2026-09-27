@@ -78,13 +78,23 @@ export const AUDIO_CODECS: string[] = [
 const TIER_PLAYABLE: string[] = ['mp4', 'm4v', 'mov', 'mkv', 'mpeg', 'mpg', 'mpe', 'm1v', 'm2v', '3gp', '3g2'];
 
 /**
- * 实测「解封装就失败」的后缀，必须有软解
+ * 实测「系统解封装就失败」的后缀，必须交给软解
  * 实测证据（DEM_FMT_ERR）：
  *   wmv / asf  → wmav2 音频解不开
  *   rm / rmvb  → ac3 音频解不开
  *   ogv / ogm  → vorbis 解不开
+ *
+ * 后一组（mxf / swf / dv / divx / ape / dts / truehd / mlp）走软解的
+ * 原因不同：**系统根本不认这些容器或编码**，而内嵌 FFmpeg 原先也没编，
+ * 所以它们原先点开必然失败。2026-09-25 已补齐组件，现已归入可走软解。
  */
-const TIER_NEEDS_SOFT: string[] = ['wmv', 'asf', 'rm', 'rmvb', 'ra', 'ogv', 'ogm', 'ogg', 'oga'];
+const TIER_NEEDS_SOFT: string[] = [
+  // 系统解封装失败（有真机实测证据）
+  'wmv', 'asf', 'rm', 'rmvb', 'ra', 'ogv', 'ogm', 'ogg', 'oga',
+  // 系统完全不支持 + 内嵌 FFmpeg 已补齐（见下方 SOFT_ADDED 说明）
+  'mxf', 'swf', 'dv', 'tod', 'mod',
+  'divx', 'ape', 'dts', 'truehd', 'mlp'
+];
 
 /**
  * 音频后缀里实测能播的
@@ -92,8 +102,42 @@ const TIER_NEEDS_SOFT: string[] = ['wmv', 'asf', 'rm', 'rmvb', 'ra', 'ogv', 'ogm
  */
 const AUDIO_PLAYABLE: string[] = ['aac', 'm4a', 'mp3', 'amr', 'flac', 'wav'];
 
+/**
+ * 2026-09-25 为以下后缀补齐了内嵌 FFmpeg 组件（原先一个都没有，点开必然失败）
+ *
+ * 补齐清单与依据：
+ *   解封装器 mxf / swf / dv
+ *       → 覆盖 .mxf（广电）、.swf（Flash）、.dv（DV 摄像机）、
+ *         .tod / .mod（JVC 的 DV 与 MPEG-2 变体，走 dv / mpegps 分支）
+ *   解码器 msmpeg4v1 / v2 / v3
+ *       → 覆盖 .divx（DivX 3 就是 msmpeg4v3；DivX 4/5 是标准 MPEG-4，本来就能解）
+ *       ★ 坑：configure 里不能写 msmpeg4，那样只匹配到同名配置项组，
+ *         三个具体解码器仍为 0。必须写带版本号的名字
+ *   解码器 ape / dca / truehd / mlp + parser dca / mlp
+ *       → 覆盖 .ape（Monkey's Audio）、.dts、.truehd / .mlp
+ *
+ * 体积代价：全部加起来只增加 0.36 MB（7.01 → 7.37 MB），
+ * 远低于预估 —— 解封装器和小众解码器都不大。
+ *
+ * ⚠️ 这些是「组件已编入」，尚未在真机上验证实际解码效果
+ * （没有对应样本，且验证受阻：模拟器是 x86_64 装不上，真机当时不可用）。
+ */
+
 /** 可解码后缀集合：容器白名单 + 音频白名单 */
 export const DECODABLE_EXTENSIONS: string[] = VIDEO_CONTAINERS.concat(AUDIO_CONTAINERS);
+
+/**
+ * 已知无法播放的后缀：白名单里有、但系统与内嵌 FFmpeg 都没有对应组件
+ *
+ * 单独列出来而不是从后缀数组里删掉，是为了保留「这个后缀是媒体格式」的认知
+ * —— 将来某个版本补上组件时，改这里一处即可。
+ *
+ * 目前只有 MIDI 这一项：
+ *   MIDI 不是音频流，而是"乐谱指令"，播放需要音源库（SoundFont）合成，
+ *   与解码一个音频文件是两件事。要支持它得引入合成器，成本远高于收益，
+ *   所以明确列为不支持，而不是让它显示"点击播放"然后失败。
+ */
+const KNOWN_UNSUPPORTED: string[] = ['mid', 'midi'];
 
 /**
  * 判断格式级别
@@ -102,6 +146,10 @@ export const DECODABLE_EXTENSIONS: string[] = VIDEO_CONTAINERS.concat(AUDIO_CONT
 export function mediaTierOf(name: string): MediaTier {
   const ext: string = getExtension(name);
   if (ext.length === 0) {
+    return MediaTier.NOT_MEDIA;
+  }
+  // 明确不支持的要先拦掉：宁可显示"不在白名单"，也不要让用户点开才报错
+  if (KNOWN_UNSUPPORTED.indexOf(ext) >= 0) {
     return MediaTier.NOT_MEDIA;
   }
   if (TIER_PLAYABLE.indexOf(ext) >= 0 || AUDIO_PLAYABLE.indexOf(ext) >= 0) {
