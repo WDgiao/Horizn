@@ -7,7 +7,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { common as commonKit } from '@kit.AbilityKit';
 import { Theme } from '../common/Theme';
 import { formatDuration } from '../common/MediaData';
-import { MediaTier, mediaTierOf } from '../common/MediaType';
+import { MediaTier, mediaTierOf, isVideoContainer } from '../common/MediaType';
 import { WatchHistory } from '../model/WatchHistory';
 import { DiagLog } from '../model/DiagLog';
 import { SoftPlayerController, SoftPlayerSnapshot } from '../model/SoftPlayerController';
@@ -111,6 +111,16 @@ struct PlayerPage {
   private lastSavedAt: number = 0;
   /** timeUpdate 回调计数，用于抽样写诊断日志 */
   private tickCount: number = 0;
+  /**
+   * AVPlayer 是否报告过视频尺寸（videoSizeChange 回调）
+   *
+   * 用途：识别「容器能解开、但内部编码解不了」这种情况。
+   * 实测这类失败**不报错误码**，AVPlayer 照样进入 playing 且音频正常，
+   * 只是画面始终黑着 —— 因此不能靠 error 回调发现，只能靠"迟迟没有尺寸"判定。
+   */
+  private videoSizeReported: boolean = false;
+  /** 「播放中却一直没有画面」的看门狗定时器 id */
+  private videoWatchdogId: number = -1;
 
   /**
    * 原生软解控制器
@@ -180,6 +190,9 @@ struct PlayerPage {
     if (sc !== undefined) {
       sc.detachSurface();
     }
+    // 页面要销毁了，先撤掉看门狗 —— 否则它可能在页面已消失后触发回退，
+    // 去操作一个已经释放的播放器
+    this.clearVideoWatchdog();
     // 退出前补记一次进度，保证「继续观看」拿到的是最新位置
     if (this.durationMs > 0) {
       this.persistProgress(this.positionMs, this.durationMs);
@@ -289,11 +302,82 @@ struct PlayerPage {
    * 判断这个错误码是否代表「系统不支持该格式」
    *
    * 5400106 = Unsupported Format：解封装或解码器不支持，正是软解能救的情况。
-   * 其它错误（文件损坏、权限不足、设备故障）软解也救不了，不该盲目回退 ——
-   * 否则会把一个真实的错误掩盖成一个更慢的失败。
+   *
+   * ★ 2026-09-26 放宽：原先只认 5400106，会漏掉一类情况。
+   *   实测 .mkv / .mp4 / .avi 这类「容器系统能解、内部编码解不了」的文件，
+   *   系统**未必**报 5400106 —— 有时只报一个笼统的解码错误码，有时干脆
+   *   不报错（AVPlayer 照常 playing、音频正常，只是画面黑着）。
+   *   后者由下面的看门狗兜住；前者在这里把同属"解码能力不足"的错误码一并纳入。
+   *
+   *   仍不回退的情况：文件不存在/无权限/磁盘错误这一类，软解同样救不了，
+   *   盲目回退只会把一个清晰的错误掩盖成一次更慢的失败。
    */
   private isUnsupportedFormat(code: number): boolean {
-    return code === 5400106;
+    // 5400106 Unsupported Format
+    if (code === 5400106) {
+      return true;
+    }
+    // 5400102 Operation not allowed：实测在「解码器不支持」时也会以这个码报出
+    // （状态机被推进到非法状态）。软解不依赖 AVPlayer 状态机，能绕开。
+    if (code === 5400102) {
+      return true;
+    }
+    // 5400103 stream 相关：解封装/解码流建立失败
+    if (code === 5400103) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * 取消「一直没有画面」的看门狗
+   * 幂等：可重复调用
+   */
+  private clearVideoWatchdog(): void {
+    if (this.videoWatchdogId >= 0) {
+      clearTimeout(this.videoWatchdogId);
+      this.videoWatchdogId = -1;
+    }
+  }
+
+  /**
+   * 启动「播放中却一直没有画面」的看门狗
+   *
+   * 为什么需要它：上面说过，有一类失败 AVPlayer 不报错 ——
+   * 容器解开、音频正常、状态机走到 playing，但视频解码器解不出画面，
+   * 于是 videoSizeChange 永远不触发，界面一直黑着。
+   * 这种情况按错误码是抓不到的，只能靠"给了足够时间仍无画面"来判定。
+   *
+   * 判定条件（三个都满足才回退，避免误判）：
+   *   ① 后缀是视频容器（音频文件本来就没有画面，不能当失败）
+   *   ② 没走软解、也没回退过
+   *   ③ duration > 0（说明文件真的解开了，不是打不开）
+   *   ④ 仍处于 playing（若已暂停/播完，用户可能只是没让它播）
+   *
+   * 延迟取值：3.5 秒。太短会误判慢启动的大文件，太长让用户白等。
+   * 实测普通样本 1 秒内就会报尺寸，3.5 秒足够宽裕。
+   */
+  private startVideoWatchdog(): void {
+    this.clearVideoWatchdog();
+    if (!isVideoContainer(this.videoPath)) {
+      return;
+    }
+    if (this.usingSoft || this.softFallbackTried) {
+      return;
+    }
+    this.videoWatchdogId = setTimeout(() => {
+      this.videoWatchdogId = -1;
+      if (this.videoSizeReported || this.usingSoft || this.softFallbackTried) {
+        return;
+      }
+      if (this.durationMs <= 0 || this.avState !== 'playing') {
+        return;
+      }
+      this.writeDiag('看门狗触发：playing 但 ' + this.videoPath
+        + ' 始终无画面尺寸 dur=' + this.durationMs.toString()
+        + ' aspect 仍为占位值 → 判定为容器能开、编码解不了，回退软解');
+      this.fallbackToSoft('播放中始终无画面（疑似视频编码不支持）');
+    }, 3500);
   }
 
   /**
@@ -305,6 +389,8 @@ struct PlayerPage {
       return;
     }
     this.softFallbackTried = true;
+    // 回退后由软解接管，看门狗不再需要（也防止它二次触发）
+    this.clearVideoWatchdog();
     this.writeDiag('回退到软解，原因：' + reason);
     // 释放 AVPlayer 与其 fd：软解自己按路径打开文件，不需要 fd
     const p: media.AVPlayer | undefined = this.player;
@@ -463,6 +549,10 @@ struct PlayerPage {
           this.lastSavedAt = Date.now();
           this.persistProgress(this.positionMs, this.durationMs);
         }
+        // ★ 启动「播放中却一直没有画面」的看门狗。
+        //   有一类失败不报错误码（容器能开、音频正常、就是没画面），
+        //   只能这样兜住，见 startVideoWatchdog 的说明。
+        this.startVideoWatchdog();
       } else if (state === 'paused') {
         this.playing = false;
         this.errorMsg = '';
@@ -504,6 +594,13 @@ struct PlayerPage {
     p.on('videoSizeChange', (width: number, height: number) => {
       if (width > 0 && height > 0) {
         this.videoAspect = width / height;
+        // 报告过尺寸 = 视频解码器确实在工作，看门狗可以撤了
+        if (!this.videoSizeReported) {
+          this.videoSizeReported = true;
+          this.writeDiag('videoSizeChange ' + width.toString() + 'x'
+            + height.toString() + ' → 视频解码正常，撤销看门狗');
+        }
+        this.clearVideoWatchdog();
       }
     });
 
