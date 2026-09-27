@@ -48,14 +48,18 @@ export const VIDEO_CONTAINERS: string[] = [
   'mp4', 'm4v', 'mkv', 'avi', 'flv', 'webm', 'ts', 'm2ts', 'tp',
   'mpeg', 'mpg', 'vob', 'wmv', 'asf', 'rm', 'rmvb', 'ogv', 'ogm',
   '3gp', '3g2', 'mxf', 'swf', 'f4v', 'mov', 'mpe', 'm1v', 'm2v',
-  'mts', 'divx', 'mod', 'tod', 'dat', 'dv', 'ogx'
+  'mts', 'divx', 'mod', 'tod', 'dat', 'dv', 'ogx',
+  // RealMedia 的 HD 变体（RealVideo 8/9/10 高码率），同一个 rm 解封装器认
+  'rmhd'
 ];
 
 /** 音频容器后缀（同样可交给 AVPlayer 播放） */
 export const AUDIO_CONTAINERS: string[] = [
   'aac', 'mp3', 'flac', 'ape', 'wav', 'aiff', 'aif', 'ogg', 'oga',
   'ac3', 'eac3', 'dts', 'mlp', 'wma', 'mid', 'midi', 'mpc', 'amr',
-  'm4a', 'mka', 'opus', 'ra', 'au', 'caf', 'wv', 'tta'
+  'm4a', 'mka', 'opus', 'ra', 'au', 'caf', 'wv', 'tta',
+  // MPC 的另外两个常见后缀，同一个 mpc8 解封装器认
+  'mp+', 'mpp'
 ];
 
 /** 视频流编码格式（写在这里是为了显示与后续扩展，非后缀） */
@@ -86,14 +90,25 @@ const TIER_PLAYABLE: string[] = ['mp4', 'm4v', 'mov', 'mkv', 'mpeg', 'mpg', 'mpe
  *
  * 后一组（mxf / swf / dv / divx / ape / dts / truehd / mlp）走软解的
  * 原因不同：**系统根本不认这些容器或编码**，而内嵌 FFmpeg 原先也没编，
- * 所以它们原先点开必然失败。2026-09-25 已补齐组件，现已归入可走软解。
+ * 所以它们原先点开必然失败。
+ *
+ * 补齐进度（见下方 2026-09-26 审计说明，这段是易错点）：
+ *   mxf / swf / dv / divx  → 组件已确认真的启用，可用
+ *   ape / dts / truehd / mlp → 2026-09-25 只补了解码器、漏了解封装器，
+ *                              实际仍打不开；已在 v1.1 之后重编补齐
+ * 也就是说这一组里的后缀，**是不是真能播取决于 .so 里解封装器在不在**，
+ * 改动这里之前务必按组件名回读 config_components.h 确认，别只看后缀。
  */
 const TIER_NEEDS_SOFT: string[] = [
   // 系统解封装失败（有真机实测证据）
   'wmv', 'asf', 'rm', 'rmvb', 'ra', 'ogv', 'ogm', 'ogg', 'oga',
-  // 系统完全不支持 + 内嵌 FFmpeg 已补齐（见下方 SOFT_ADDED 说明）
+  // 系统完全不支持，须靠内嵌 FFmpeg 软解（组件补齐状态见下方审计说明）
   'mxf', 'swf', 'dv', 'tod', 'mod',
-  'divx', 'ape', 'dts', 'truehd', 'mlp'
+  'divx', 'ape', 'dts', 'truehd', 'mlp',
+  // 2026-09-26 补充：这五个系统同样不认，且内嵌解封装器+解码器已实测编入
+  // （AIFF 需 pcm_s16be、WavPack 解码器名为 wavpack、Musepack 为 mpc8），
+  // 归到 NEEDS_SOFT 可直接走软解，不必先让 AVPlayer 失败一次。
+  'aiff', 'aif', 'wv', 'tta', 'mpc', 'mp+', 'mpp'
 ];
 
 /**
@@ -113,14 +128,32 @@ const AUDIO_PLAYABLE: string[] = ['aac', 'm4a', 'mp3', 'amr', 'flac', 'wav'];
  *       → 覆盖 .divx（DivX 3 就是 msmpeg4v3；DivX 4/5 是标准 MPEG-4，本来就能解）
  *       ★ 坑：configure 里不能写 msmpeg4，那样只匹配到同名配置项组，
  *         三个具体解码器仍为 0。必须写带版本号的名字
- *   解码器 ape / dca / truehd / mlp + parser dca / mlp
- *       → 覆盖 .ape（Monkey's Audio）、.dts、.truehd / .mlp
  *
- * 体积代价：全部加起来只增加 0.36 MB（7.01 → 7.37 MB），
- * 远低于预估 —— 解封装器和小众解码器都不大。
+ * ⚠️⚠️ 下一段是 2026-09-26 代码层审计的修正结论，务必先读再改本文件 ⚠️⚠️
  *
- * ⚠️ 这些是「组件已编入」，尚未在真机上验证实际解码效果
- * （没有对应样本，且验证受阻：模拟器是 x86_64 装不上，真机当时不可用）。
+ * 上面那句「解码器 ape / dca / truehd / mlp + parser dca / mlp」是**当时写错的**：
+ * 那次只加了【解码器】，对应的【解封装器一个都没加】。核对 configure 的真实产物
+ * config_components.h，当时的状态是：
+ *
+ *     CONFIG_APE_DECODER   = 1   CONFIG_APE_DEMUXER    = 0
+ *     CONFIG_DCA_DECODER   = 1   CONFIG_DTS_DEMUXER    = 0
+ *     CONFIG_TRUEHD_DECODER= 1   CONFIG_TRUEHD_DEMUXER = 0
+ *     CONFIG_MLP_DECODER   = 1   CONFIG_MLP_DEMUXER    = 0
+ *
+ * 有解码器、没解封装器 = 文件在 avformat_open_input 就失败，解码器永远走不到。
+ * 也就是说 .ape / .dts / .truehd / .mlp 当时**仍然打不开**，
+ * 下面 TIER_NEEDS_SOFT 把它们归入「可走软解」是超前了。
+ * 同批还有 .eac3 缺 eac3 解封装器、.aiff 缺 aiff 解封装器 + pcm_s16be 解码器、
+ * .wv / .tta / .mpc 两层都缺（注意 WavPack 的解码器名是 wavpack，不是 wv）。
+ *
+ * 教训：configure 退出码为 0【不代表】请求的组件真的启用了 —— 名字写错、
+ * 依赖没满足时会静默跳过。**每次 configure 之后必须回读 config_components.h 核对**，
+ * 而且要按「容器 → 解封装器名、编码 → 解码器名」分别核对，
+ * 不能拿后缀名当组件名（RM 的解码器叫 rv10/rv20/rv30/rv40，ASF 的叫 wmv1/wmv2/wmv3/vc1，
+ * 都和后缀不同名）。
+ *
+ * 上面的缺口已在 v1.1 之后重编补齐，但**尚未在真机验证实际解码效果**
+ * （验证受阻：模拟器是 x86_64 装不上，真机当时不可用）。
  */
 
 /** 可解码后缀集合：容器白名单 + 音频白名单 */
