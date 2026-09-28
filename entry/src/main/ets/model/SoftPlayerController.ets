@@ -77,9 +77,36 @@ export class SoftPlayerController {
     this.onUpdate = onUpdate;
   }
 
-  /** 当前状态快照（副本） */
+  /**
+   * 当前状态快照（**真正的副本**）
+   *
+   * ★ 2026-09-29 自检修正：原先直接 `return this.snapshot`，
+   *   与"副本"的注释不符，而且会带来两个真实问题：
+   *     · 调用方拿到的对象会被下一次 applyEvent **就地改写** ——
+   *       界面可能读到渲染到一半时被换掉的值；
+   *     · ArkUI 的 @State/@Prop 对对象是**按引用比较**的，
+   *       引用不变时可能整块跳过刷新，表现为"状态偶尔不更新、偶发跳一帧"，
+   *       这类问题极难定位。
+   *
+   *   现在返回浅拷贝，并对两个数组字段单独 slice ——
+   *   数组是引用类型，浅拷贝后仍与原数组共享，必须再切一份。
+   */
   getSnapshot(): SoftPlayerSnapshot {
-    return this.snapshot;
+    const s: SoftPlayerSnapshot = this.snapshot;
+    return {
+      state: s.state,
+      positionMs: s.positionMs,
+      durationMs: s.durationMs,
+      width: s.width,
+      height: s.height,
+      videoCodec: s.videoCodec,
+      audioCodec: s.audioCodec,
+      error: s.error,
+      audioTracks: s.audioTracks.slice(0),
+      subtitleTracks: s.subtitleTracks.slice(0),
+      currentAudioIndex: s.currentAudioIndex,
+      currentSubtitleIndex: s.currentSubtitleIndex
+    };
   }
 
   /**
@@ -425,6 +452,8 @@ export class SoftPlayerController {
 
   /** 通知 UI */
   private notify(): void {
-    this.onUpdate(this.snapshot);
+    // 传副本而不是内部对象：理由同 getSnapshot 的说明 ——
+    // 内部对象会被后续事件就地改写，直接交出去等于让界面持有一个会变的引用
+    this.onUpdate(this.getSnapshot());
   }
 }

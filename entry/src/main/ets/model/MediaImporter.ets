@@ -117,6 +117,9 @@ export class MediaImporter {
   private async copyOne(uri: string): Promise<boolean> {
     let srcFile: fileIo.File | undefined = undefined;
     let destFile: fileIo.File | undefined = undefined;
+    // 记下最终路径：失败时要把它清掉，别留下半成品被媒体库当正常文件扫出来
+    let finalPath: string = '';
+    let succeeded: boolean = false;
     try {
       // 文档 URI 不能直接当路径用，但可以用 openSync 打开拿到 fd
       srcFile = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
@@ -124,12 +127,13 @@ export class MediaImporter {
       const destPath: string = this.targetDir + '/' + fileName;
 
       // 已存在同名文件时加序号，避免覆盖用户已导入的内容
-      const finalPath: string = this.uniquePath(destPath);
+      finalPath = this.uniquePath(destPath);
 
       destFile = fileIo.openSync(finalPath,
         fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
       // copyFile 支持 fd 作为源与目标，大文件也不会一次性读进内存
       await fileIo.copyFile(srcFile.fd, destFile.fd);
+      succeeded = true;
       return true;
     } catch (err) {
       const e = err as BusinessError;
@@ -150,12 +154,39 @@ export class MediaImporter {
           console.error('close dest failed');
         }
       }
+      // ★ 失败时清掉半成品。
+      //   CREATE|TRUNC 在打开时就已经把目标文件建出来了，
+      //   若 copyFile 中途失败，磁盘上会留下一个 0 字节或半截视频 ——
+      //   它会被媒体库当正常文件扫出来，用户点开必然报错。
+      if (finalPath.length > 0 && !succeeded) {
+        try {
+          if (fileIo.accessSync(finalPath)) {
+            fileIo.unlinkSync(finalPath);
+          }
+        } catch (e) {
+          console.error('清理导入半成品失败: ' + finalPath);
+        }
+      }
     }
   }
 
   /**
    * 从 URI 里提取文件名
    * 文档 URI 形如 file://docs/storage/Users/currentUser/Download/xxx.mp4
+   *
+   * ★ 2026-09-29 自检修正：**解码之后必须再清洗一次**
+   *
+   *   原实现是「先按 '/' 取末段 → 再 decodeURIComponent」，
+   *   解码之后就不再校验了。问题在于**解码会改变字符串结构**：
+   *     · 末段 `%2E%2E%2Fx.mp4` 解码后是 `../x.mp4`
+   *     · 末段 `a%2Fb.mp4`   解码后是 `a/b.mp4`
+   *   前者会让 `targetDir + '/' + name` 跳出去（`../` 指向上级目录），
+   *   而上级目录必然存在，CREATE 会成功 —— 也就是**越界写入**；
+   *   后者会让中间目录不存在，导入静默失败，用户只看到"跳过 1 个"。
+   *
+   *   所以顺序要反过来想：先解码（拿到真实名字），再对真实名字做清洗。
+   *   清洗规则与 MediaFileOps.validateName 保持一致：拒绝路径分隔符与 ..
+   *
    * @param uri 文档 URI
    */
   private buildFileName(uri: string): string {
@@ -175,10 +206,50 @@ export class MediaImporter {
     } catch (err) {
       // 解码失败就用原串
     }
+
+    // ---- 解码之后才做的清洗（这一步原先缺失）----
+    // 去掉可能存在的目录成分：再取一次末段，防止解码出的 '/' 把路径带出去
+    const lastSlash: number = name.lastIndexOf('/');
+    if (lastSlash >= 0) {
+      name = name.substring(lastSlash + 1);
+    }
+    // Windows 风格分隔符也一并去掉
+    name = name.replace(/\\/g, '');
+    // 任何形式的 . 或 .. 一律不接受（避免指向上级目录）
+    if (name === '.' || name === '..' || name.indexOf('..') >= 0) {
+      name = '';
+    }
+    // 去掉首尾空白与点（首尾的点在某些实现里会被忽略，容易造成同名覆盖）
+    name = name.trim();
+    while (name.length > 0 && name.charAt(0) === '.') {
+      name = name.substring(1);
+    }
+    // 控制字符一律剔除
+    name = name.replace(/[\u0000-\u001f]/g, '');
+
     if (name.length === 0) {
-      name = 'imported_' + Date.now().toString() + '.mp4';
+      // 名字非法或为空时给一个安全的名字，后缀尽量沿用原来的
+      name = 'imported_' + Date.now().toString() + this.extOf(uri);
     }
     return name;
+  }
+
+  /** 取 URI 的扩展名（含点）；取不到时回退 .mp4 */
+  private extOf(uri: string): string {
+    const dot: number = uri.lastIndexOf('.');
+    if (dot < 0) {
+      return '.mp4';
+    }
+    let ext: string = uri.substring(dot);
+    const query: number = ext.indexOf('?');
+    if (query >= 0) {
+      ext = ext.substring(0, query);
+    }
+    // 只接受 2~5 个字母数字的扩展名，其它一律回退
+    if (ext.length < 2 || ext.length > 6) {
+      return '.mp4';
+    }
+    return ext;
   }
 
   /**

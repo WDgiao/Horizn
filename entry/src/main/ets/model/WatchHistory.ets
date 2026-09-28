@@ -79,12 +79,70 @@ export class WatchHistory {
     this.cache = undefined;
   }
 
-  /** 读取全部记录（按最后观看时间倒序） */
+  /**
+   * 读取全部记录（按最后观看时间倒序）
+   *
+   * 会在返回前剔除「文件已不存在」的记录，见 pruneMissingFiles。
+   */
   list(): WatchRecord[] {
-    const all: WatchRecord[] = this.load();
+    const all: WatchRecord[] = this.pruneMissingFiles(this.load());
     const copy: WatchRecord[] = all.slice(0);
     copy.sort((a: WatchRecord, b: WatchRecord): number => b.updatedAt - a.updatedAt);
     return copy;
+  }
+
+  /**
+   * 剔除文件已经不存在的记录（惰性清理）
+   *
+   * ★ 2026-09-29 自检新增。要解决的问题：
+   *   观看记录以**绝对路径**为唯一键，而文件操作（重命名 / 移动 / 删除）
+   *   只动文件系统、不同步记录 —— 于是重命名或删除之后，旧路径的记录
+   *   永远匹配不到新文件，变成"死记录"。
+   *   首页「继续观看」是直接把记录渲染成卡片的、**不校验文件是否存在**，
+   *   所以用户会看到一张点开必然报错的卡片；而且这条脏记录还占着
+   *   MAX_RECORDS 的名额，会把真实记录挤掉。
+   *
+   * 为什么选"读的时候顺手清"而不是"在文件操作里同步"：
+   *   · 需要同步的地方有三处（rename / move / remove），且将来任何新的
+   *     文件操作都要记得加 —— 漏一处就有新的死记录，属于容易漂移的设计
+   *   · 而"列表里不该出现打不开的条目"是**读取方自己的需求**，
+   *     放在读取侧一次性解决，任何来源的脏数据都能被兜住
+   *   · 代价是要做若干次 accessSync。记录上限是 MAX_RECORDS(50)，
+   *     stat 类调用一次几微秒，实测可忽略
+   *
+   * @param records 原始记录
+   * @returns 文件仍然存在的记录；若有剔除则顺带落盘
+   */
+  private pruneMissingFiles(records: WatchRecord[]): WatchRecord[] {
+    const kept: WatchRecord[] = [];
+    let removed: number = 0;
+    for (let i = 0; i < records.length; i++) {
+      const r: WatchRecord = records[i];
+      // 网络流地址不是沙箱路径，不适用"文件是否存在"的判断
+      if (r.path.indexOf('://') >= 0) {
+        kept.push(r);
+        continue;
+      }
+      let exists: boolean = false;
+      try {
+        exists = fileIo.accessSync(r.path);
+      } catch (err) {
+        // 路径异常（非法字符等）一律当不存在
+        exists = false;
+      }
+      if (exists) {
+        kept.push(r);
+      } else {
+        removed++;
+      }
+    }
+    if (removed > 0) {
+      console.info('[WatchHistory] 清理了 ' + removed.toString() + ' 条失效记录（文件已不存在）');
+      // 落盘一次，避免每次读都要重新判一遍
+      this.cache = kept;
+      this.persist(kept);
+    }
+    return kept;
   }
 
   /**
