@@ -136,9 +136,18 @@ export class ThumbnailProvider {
    *
    * @param raw 原始 PixelMap
    * @param tag 日志用的路径标识
-   * @returns 转换后的 PixelMap；失败返回 undefined
+   * @param ownRaw 是否由本函数负责释放 raw（默认 true）
+   *
+   * ★ 2026-09-29 自检修正：原先**从不释放 raw**。
+   *   raw 来自 AVImageGenerator.fetchFrameByTime，是一块原生位图
+   *   （1080p 约 8MB，而且请求的 {width,height} 只是期望值、不保证缩放）。
+   *   本类对 generator / packer / ImageSource 都严格 release 了，唯独漏了
+   *   占内存最大的 PixelMap —— 每次成功抓帧都漏一块，首页批量刷新时线性叠加，
+   *   靠 GC 回收原生 buffer 并不可靠，典型表现是刷几次首页后被系统杀掉。
+   *   传 ownRaw=false 可以让调用方自己管（当前调用方都是让它自己管）。
    */
-  private async toStablePixelMap(raw: image.PixelMap, tag: string): Promise<image.PixelMap | undefined> {
+  private async toStablePixelMap(raw: image.PixelMap, tag: string,
+                                 ownRaw: boolean = true): Promise<image.PixelMap | undefined> {
     let packer: image.ImagePacker | undefined = undefined;
     let source: image.ImageSource | undefined = undefined;
     try {
@@ -171,6 +180,16 @@ export class ThumbnailProvider {
         + 'roundtrip err=' + e.code + ':' + e.message;
       return undefined;
     } finally {
+      // 释放原始位图（占内存最大的一块）。
+      // 放在 finally 里：packing 之后 raw 就已经没用了，
+      // 无论成功、失败还是提前 return，都必须把它还回去。
+      if (ownRaw) {
+        try {
+          await raw.release();
+        } catch (e) {
+          console.error('release raw pixelmap failed');
+        }
+      }
       if (source !== undefined) {
         try {
           await source.release();
@@ -468,6 +487,14 @@ export class ThumbnailProvider {
           this.lastFrameInfo = this.lastFrameInfo + ' saved=' + filePath;
         } else {
           this.lastFrameInfo = this.lastFrameInfo + ' save-failed';
+        }
+        // ★ 存盘之后这块位图就没用了，必须释放。
+        //   界面拿到的是文件 URI（Image() 自己去读文件），不再引用这个 PixelMap。
+        //   原先这里没有 release，每次成功生成缩略图都漏一块原生位图。
+        try {
+          await result.release();
+        } catch (err) {
+          this.lastFrameInfo = this.lastFrameInfo + ' release-failed';
         }
       }
 

@@ -97,11 +97,14 @@ struct StreamEditPage {
     const url: string = this.inputUrl.trim();
 
     if (this.isEditing()) {
-      if (s.update(this.editingId, this.inputName, false)) {
+      // 注意要把 url 一起传进去。原先只传了 name，而 store 内部写死沿用旧 url，
+      // 于是"编辑地址"这个动作在界面上看起来成功、实际被静默丢弃。
+      const failReason: string = s.update(this.editingId, this.inputName, url, false);
+      if (failReason.length === 0) {
         showToast('已保存');
         this.getUIContext().getRouter().back();
       } else {
-        showToast('保存失败：记录不存在');
+        showToast('保存失败：' + failReason);
       }
       return;
     }

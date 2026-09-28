@@ -167,6 +167,21 @@ struct PlayerPage {
   private mediaFile: fileIo.File | undefined = undefined;
   /** 媒体文件字节数，作为 fdSrc.length 传入 */
   private mediaFileSize: number = 0;
+
+  /**
+   * 页面是否已进入销毁流程
+   *
+   * 为什么必须有它：本页多处是异步回调（createAVPlayer().then、restoreExternalSubtitle
+   * 的 then、各种 setTimeout），而用户完全可能在回调回来之前就点了返回。
+   * 那时 aboutToDisappear 已经跑完 releasePlayer()，但**它什么都不找到** ——
+   * this.player 还是 undefined，于是直接返回；随后 then 回调把
+   * this.player 赋成一个新建的 AVPlayer，就再也没有人去释放它了。
+   * 结果：AVPlayer 与它持有的 fd 泄漏，甚至可能在后台继续解码/出声，
+   * 反复进出播放页会持续累积。
+   *
+   * 所以：进销毁流程先置位，所有异步回调开头都先看这个标志。
+   */
+  private disposed: boolean = false;
   /** 渲染 surface id */
   private surfaceId: string = '';
   /** surface 是否已就绪 */
@@ -257,6 +272,11 @@ struct PlayerPage {
     // 不恢复的话用户每进出一次都要重选一遍，体验很差。
     if (isExternalActive() && externalSubtitle.path.length > 0) {
       restoreExternalSubtitle().then((count: number) => {
+        // 恢复是异步读盘，回来时页面可能已经销毁 —— 此时写 @State 会告警，
+        // 而且写进去也没人看。先判销毁标志直接放弃。
+        if (this.disposed) {
+          return;
+        }
         if (count > 0) {
           this.usingExternalSubtitle = true;
           this.externalSubtitleName = externalSubtitle.name;
@@ -264,6 +284,10 @@ struct PlayerPage {
           this.writeDiag('已恢复外挂字幕: ' + externalSubtitle.name
             + ' 共 ' + count.toString() + ' 条');
         }
+      }).catch((err: object) => {
+        // 原先没有 catch：读盘失败会产生 unhandled rejection，
+        // 而且失败原因彻底看不到。这里至少把它记进诊断日志。
+        this.writeDiag('恢复外挂字幕失败: ' + JSON.stringify(err));
       });
     }
     // 字幕刷新定时器。100ms 与事件轮询同频 —— 字幕的时间精度本来
@@ -318,6 +342,12 @@ struct PlayerPage {
   }
 
   aboutToDisappear(): void {
+    // ★ 第一件事：置销毁标志。
+    //   本页有多个异步回调（createAVPlayer().then、字幕恢复、看门狗、
+    //   各种 setTimeout），它们可能在页面已经销毁之后才回来。
+    //   置位之后那些回调会自行放弃并释放自己造出来的资源（尤其是 AVPlayer）。
+    //   必须放在最前面 —— 放在后面就等于给了回调一个抢先的窗口。
+    this.disposed = true;
     this.writeDiag('aboutToDisappear pos=' + this.positionMs.toString()
       + ' dur=' + this.durationMs.toString());
     // 先停字幕定时器：它每 100ms 会调一次原生 getActiveSubtitle，
@@ -352,6 +382,43 @@ struct PlayerPage {
     this.releasePlayer();
     // 退出播放页时恢复默认方向，避免影响其它页面
     this.applyOrientation(window.Orientation.AUTO_ROTATION_UNSPECIFIED);
+    // ★ 恢复系统栏与窗口布局 —— 这两项也必须在这里还原。
+    //
+    //   窗口属性属于 **window 而不是页面**，一旦设置就一直是那个状态。
+    //   setupWindow 里设了 setWindowLayoutFullScreen(true) 和
+    //   setWindowSystemBarEnable([])，但之前**从来没有还原过**，
+    //   于是"只要进过一次播放页，返回首页/搜索页后状态栏与导航条就永久消失"，
+    //   影响的是整个 App 而不只是播放页。
+    //   （DeveloperModePage 的「跳转压测」会把播放页反复开关 40 次，
+    //    每次都在施加这个状态，问题更容易被撞到。）
+    this.restoreWindowChrome();
+  }
+
+  /**
+   * 还原系统栏与窗口布局
+   *
+   * 与 setupWindow 成对使用。恢复失败不影响退出流程，所以只记日志不抛。
+   */
+  private restoreWindowChrome(): void {
+    const w: window.Window | undefined = this.mainWindow;
+    if (w === undefined) {
+      // 没拿到过窗口对象（setupWindow 失败或还没回来），
+      // 说明也没设置过，不需要还原
+      return;
+    }
+    try {
+      // ['status','navigation'] = 状态栏 + 导航条都恢复显示
+      w.setWindowSystemBarEnable(['status', 'navigation'])
+        .catch((err: BusinessError) => {
+          console.error('恢复系统栏失败: ' + JSON.stringify(err));
+        });
+      w.setWindowLayoutFullScreen(false)
+        .catch((err: BusinessError) => {
+          console.error('恢复窗口布局失败: ' + JSON.stringify(err));
+        });
+    } catch (err) {
+      console.error('restoreWindowChrome failed: ' + JSON.stringify(err));
+    }
   }
 
   /**
@@ -452,6 +519,18 @@ struct PlayerPage {
 
     // ---- 第二步：创建播放器并绑定 fd ----
     media.createAVPlayer().then((p: media.AVPlayer) => {
+      // ★ 页面可能已经销毁（用户创建完立刻点了返回）。
+      //   此时 aboutToDisappear 的 releasePlayer() 什么也没找到
+      //   （this.player 还是 undefined），所以这个刚造出来的播放器
+      //   必须由我们自己释放，否则 AVPlayer + fd 一起泄漏。
+      if (this.disposed) {
+        this.writeDiag('页面已销毁，放弃本次创建的 AVPlayer 并释放');
+        p.release().catch((err: BusinessError) => {
+          console.error('释放迟到的 AVPlayer 失败: ' + JSON.stringify(err));
+        });
+        this.closeMediaFile();
+        return;
+      }
       this.player = p;
       this.registerCallbacks(p);
       // 注意：audioInterruptMode 只能在 prepared/playing/paused/completed 态设置，
@@ -466,6 +545,14 @@ struct PlayerPage {
       // 设置 fdSrc 后进入 initialized 态；offset/length 描述的是整个文件
       p.fdSrc = { fd: opened.fd, offset: 0, length: this.mediaFileSize };
     }).catch((err: BusinessError) => {
+      // ★ 创建失败时必须把已经打开的 fd 关掉。
+      //   原先这里只置 errorMsg/preparing 就返回，而 fd 只在
+      //   releasePlayer/closeMediaFile 路径释放 —— 于是每次
+      //   "播放器创建失败"都漏一个 fd，重试同一个坏文件会持续累积。
+      this.closeMediaFile();
+      if (this.disposed) {
+        return;   // 页面已销毁就不再改动 UI 状态
+      }
       this.errorMsg = '播放器创建失败：' + err.message;
       this.preparing = false;
     });
@@ -490,11 +577,22 @@ struct PlayerPage {
     this.preparing = true;
     this.errorMsg = '';
     media.createAVPlayer().then((p: media.AVPlayer) => {
+      // 与本地文件同理：页面已销毁时这个播放器必须自己释放
+      if (this.disposed) {
+        this.writeDiag('页面已销毁，放弃本次创建的网络 AVPlayer 并释放');
+        p.release().catch((err: BusinessError) => {
+          console.error('释放迟到的网络 AVPlayer 失败: ' + JSON.stringify(err));
+        });
+        return;
+      }
       this.player = p;
       this.registerCallbacks(p);
       // url 通道：直接交给系统去请求
       p.url = this.videoPath;
     }).catch((err: BusinessError) => {
+      if (this.disposed) {
+        return;
+      }
       this.errorMsg = '网络播放器创建失败：' + err.message;
       this.preparing = false;
     });

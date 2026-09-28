@@ -104,9 +104,10 @@ struct NetworkStreamPage {
       return;
     }
     // 记一次使用时间，列表里能看到"上次使用"
+    // 只更新时间戳：name 与 url 都传空串表示不改动
     const s: NetworkStreamStore | undefined = this.store;
     if (s !== undefined) {
-      s.update(item.id, '', true);
+      s.update(item.id, '', '', true);
     }
     this.getUIContext().getRouter().pushUrl({
       url: 'pages/PlayerPage',

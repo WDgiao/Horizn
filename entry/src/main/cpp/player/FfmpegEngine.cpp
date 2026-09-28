@@ -82,15 +82,50 @@ void FfmpegEngine::SetState(PlayerState st) {
 int32_t FfmpegEngine::Prepare(const std::string &path) {
     // 全 -1 = 音轨自动选、不开字幕（与加入轨道选择之前的行为一致），
     // manageAudio=true 表示这是"首次打开"，音频设备要按需创建/启动
-    return PrepareWithTracks(path, -1, -1, /*manageAudio=*/true);
+    std::string err;
+    return PrepareWithTracks(path, -1, -1, /*manageAudio=*/true, err);
 }
 
 int32_t FfmpegEngine::PrepareWithTracks(const std::string &path,
                                        int32_t audioStreamIndex,
                                        int32_t subtitleStreamIndex,
-                                       bool manageAudio) {
+                                       bool manageAudio,
+                                       std::string &outErr) {
     if (state_.load() == PlayerState::RELEASED) {
         return -1;
+    }
+
+    // ---- 验证：带新轨道能不能打开 ----
+    //
+    // ★ 为什么要在拆掉旧会话之前先验一遍（这是一个真实缺陷的修法）
+    //
+    //   本函数的清理阶段是**不可逆**的：它会停掉三条线程、关掉旧会话、
+    //   并且为了让音频线程能安全 join 而 Stop 掉音频设备。
+    //   如果在那之后再 codecapi::Open 失败（文件被删/被占用、U 盘被拔出、
+    //   指定流下标在当前文件里不存在……），就**没有任何东西可以回滚**：
+    //   旧会话已经没了、音频设备停了，引擎直接卡在 ERROR_STATE，
+    //   用户只能退出重进。
+    //
+    //   而"切换音轨/字幕"本该是**非破坏性**操作 —— 切不过去，
+    //   就应该老老实实保持原样继续播，而不是把正在播的东西弄没。
+    //
+    //   所以这里先用同一组参数做一次"试打开"：确认能开，再走不可逆的清理。
+    //   代价是一次轻量的打开+关闭（实测换轨总耗时本来就有几百毫秒，
+    //   这点开销可以忽略）；收益是**失败路径彻底消失**。
+    {
+        std::string probeErr;
+        const int32_t probe = codecapi::ProbeTracks(path_, audioStreamIndex,
+                                                     subtitleStreamIndex, probeErr);
+        if (probe != codecapi::kOk) {
+            const std::string reason = "换轨被拒绝（新轨道无法打开）：" + probeErr;
+            LOGW("%{public}s", reason.c_str());
+            outErr = reason;
+            // 注意：这里**什么都不动** —— 旧会话、线程、音频设备全部保持原状，
+            // 调用方可以直接告诉用户"这条轨道切不过去"，播放继续
+            return probe;
+        }
+        LOGI("换轨预检通过（音轨=%{public}d 字幕=%{public}d），开始切换",
+             audioStreamIndex, subtitleStreamIndex);
     }
 
     // ==================== 清理顺序（这里有一个必须讲清的坑） ====================
@@ -1206,11 +1241,12 @@ int32_t FfmpegEngine::SwitchAudioTrack(int32_t streamIndex) {
 
     // 关键：换成新音轨重开，并把旧位置带过去。
     // 字幕轨保持当前选择不变 —— 用户换配音不该把字幕也关掉。
+    std::string switchErr;
     const int32_t ret = PrepareWithTracks(path_, streamIndex,
                                           info_.currentSubtitleIndex,
-                                          /*manageAudio=*/false);
+                                          /*manageAudio=*/false, switchErr);
     if (ret != 0) {
-        LOGE("切换音轨重开失败(%{public}d)，播放已中断", ret);
+        LOGE("切换音轨重开失败(%{public}d): %{public}s", ret, switchErr.c_str());
         return ret;
     }
 
@@ -1276,11 +1312,16 @@ int32_t FfmpegEngine::SetSubtitleTrack(int32_t streamIndex) {
     const bool wasPlaying = playing_.load();
     LOGI("启用字幕轨 %{public}d（当前位置 %{public}lld ms）",
          streamIndex, static_cast<long long>(pos));
+    // 预检失败原因（用于日志；界面靠返回值判断即可）
+    std::string switchErr;
 
     const int32_t ret = PrepareWithTracks(path_, info_.currentAudioIndex, streamIndex,
-                                          /*manageAudio=*/false);
+                                          /*manageAudio=*/false, switchErr);
     if (ret != 0) {
-        LOGE("启用字幕重开失败(%{public}d)", ret);
+        // 换轨失败：预检已经保证过"正常情况下不会失败"，走到这里说明是
+        // 预检之后、重开之前那一瞬间文件出了问题（被删/被占用）。
+        // 此时旧会话已拆，播放确实中断了 —— 把原因报上去让界面能说清楚。
+        LOGE("启用字幕重开失败(%{public}d): %{public}s", ret, switchErr.c_str());
         return ret;
     }
     if (pos > 0) {

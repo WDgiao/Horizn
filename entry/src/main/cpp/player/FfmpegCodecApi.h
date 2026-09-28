@@ -145,6 +145,22 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
              std::string &errMsg, const TrackRequest &tracks);
 
 /**
+ * 试着用指定的音轨 / 字幕轨打开一次，随即关闭
+ *
+ * 用途：给"播放中切换轨道"做**预检**。
+ *   切换的实现是「关掉旧会话 → 用新轨道重开」，而这个清理过程不可逆
+ *   （线程要停、会话要释放、音频设备要停）。如果重开失败就没法回滚，
+ *   正在播的内容会直接挂掉。
+ *   先用本函数确认"这组轨道开得起来"，再去拆旧的，失败路径就消失了。
+ *
+ * 本函数**不碰任何已有会话**，只是自己开一次再关，因此可以在播放中安全调用。
+ *
+ * @return kOk 表示这组轨道可打开；否则返回具体错误码，errMsg 说明原因
+ */
+int32_t ProbeTracks(const std::string &path, int32_t audioStreamIndex,
+                    int32_t subtitleStreamIndex, std::string &errMsg);
+
+/**
  * 取一条字幕事件
  *
  * 只在 TrackRequest::subtitleStreamIndex >= 0 时有内容 —— 没选字幕轨时

@@ -12,7 +12,6 @@
 #include <mutex>
 #include <string>
 #include <thread>
-
 /** 前向声明，避免把 external_window.h 带进所有包含者 */
 struct NativeWindow;
 
@@ -91,9 +90,12 @@ private:
      *     · 重建音频输出设备（会有一声爆音 + 华为设备上几百毫秒延迟）
      *     · 重新枚举轨道（其实没变）
      *   manageAudio=false 就是"换轨"路径，复用正在跑的音频设备。
+     *
+     * @param errMsg 失败时写入可读原因（换轨失败时由界面提示给用户）
      */
     int32_t PrepareWithTracks(const std::string &path, int32_t audioStreamIndex,
-                              int32_t subtitleStreamIndex, bool manageAudio);
+                              int32_t subtitleStreamIndex, bool manageAudio,
+                              std::string &errMsg);
 
     /** 解码线程主体 */
     void DecodeLoop();

@@ -2069,6 +2069,38 @@ bool HasSubtitle(Session session) {
     return s != nullptr && s->subtitleStreamIndex >= 0 && s->subtitleQueue != nullptr;
 }
 
+/**
+ * 试着用指定轨道打开一次再关掉（给"播放中换轨"做预检）
+ *
+ * 实现上就是调一次 Open 再调一次 Close —— 刻意如此，理由：
+ *   · 预检必须和真正要走的路径**完全一致**，否则验过的东西和实际开的东西
+ *     可能不是一回事（例如只检查"流下标存在"是不够的，真正的失败点可能在
+ *     解码器初始化、容器重解析等更靠后的位置）；
+ *   · Open/Close 已经是经过真机验证的成熟路径，不需要另写一套简化校验，
+ *     少一套代码就少一处将来会漂移的地方。
+ *
+ * 代价是一次完整的打开+关闭（含 avformat_find_stream_info）。
+ * 实测换轨总耗时本来就有几百毫秒（要等音频设备重启），这点开销可忽略。
+ */
+int32_t ProbeTracks(const std::string &path, int32_t audioStreamIndex,
+                    int32_t subtitleStreamIndex, std::string &errMsg) {
+    TrackRequest req;
+    req.audioStreamIndex = audioStreamIndex;
+    req.subtitleStreamIndex = subtitleStreamIndex;
+
+    MediaSummary summary;
+    Session probe = nullptr;
+    const int32_t ret = Open(path, probe, summary, errMsg, req);
+    if (ret != kOk) {
+        // Open 失败时它自己已经清理干净（内部所有失败分支都释放了资源），
+        // 这里不需要也不能再 Close
+        return ret;
+    }
+    // 开成功 = 这组轨道可用。立刻关掉，避免白白占着文件句柄与解码器
+    Close(probe);
+    return kOk;
+}
+
 int32_t ReadSubtitleEvent(Session session, softplayer::SubtitleEvent &out,
                           std::string &errMsg) {
     auto *s = static_cast<DecoderSession *>(session);
@@ -2626,6 +2658,15 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
 int32_t ReadSubtitleEvent(Session session, SubtitleEvent &out, std::string &errMsg) {
     (void)session;
     (void)out;
+    errMsg = "未集成 FFmpeg";
+    return kNotIntegrated;
+}
+
+int32_t ProbeTracks(const std::string &path, int32_t audioStreamIndex,
+                    int32_t subtitleStreamIndex, std::string &errMsg) {
+    (void)path;
+    (void)audioStreamIndex;
+    (void)subtitleStreamIndex;
     errMsg = "未集成 FFmpeg";
     return kNotIntegrated;
 }

@@ -1,6 +1,7 @@
 import { fileIo } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
 import { util } from '@kit.ArkTS';
+import { readJsonArraySafe, writeJsonArrayAtomic, AtomicWriteResult } from './JsonStore';
 
 /** 观看记录落盘文件名（存在应用沙箱 files 目录） */
 const FILE_NAME: string = 'watch_history.json';
@@ -168,14 +169,33 @@ export class WatchHistory {
    * @param duration 总时长（毫秒）
    */
   save(path: string, title: string, position: number, duration: number): void {
-    if (path.length === 0 || duration <= 0) {
+    if (path.length === 0) {
       return;
     }
+    // ★ 2026-09-29 自检加固：原先只有 `duration <= 0` 一道闸，挡不住 NaN。
+    //
+    //   `NaN <= 0` 的结果是 **false**，所以 NaN 时长能顺利通过检查；
+    //   而 positionMs/durationMs 是直接来自原生事件的（畸形容器会报异常值）。
+    //   一旦写入，`JSON.stringify(NaN)` 会变成 `null`；下次读回来
+    //   `typeof null !== 'number'`（load 里会过滤掉）或 `null <= 0` 为 true，
+    //   这条记录就被当成"已看完" —— 用户的续播点**永久**丢失。
+    //
+    //   另外 position 也要夹到 [0, duration]：
+    //   seek 越界或时钟回退时可能报出 position > duration，
+    //   首页按 position/duration 画进度条就会画出界（>1）。
+    if (!Number.isFinite(duration) || duration <= 0) {
+      return;
+    }
+    if (!Number.isFinite(position)) {
+      return;
+    }
+    const safePosition: number = Math.min(Math.max(position, 0), duration);
+
     const all: WatchRecord[] = this.load();
     const record: WatchRecord = {
       path: path,
       title: title,
-      position: position,
+      position: safePosition,
       duration: duration,
       updatedAt: Date.now()
     };
@@ -230,66 +250,44 @@ export class WatchHistory {
     if (cached !== undefined) {
       return cached;
     }
-    let result: WatchRecord[] = [];
-    try {
-      if (fileIo.accessSync(this.filePath)) {
-        const stat = fileIo.statSync(this.filePath);
-        if (stat.size > 0) {
-          const file = fileIo.openSync(this.filePath, fileIo.OpenMode.READ_ONLY);
-          try {
-            const buffer = new ArrayBuffer(stat.size);
-            const readLen: number = fileIo.readSync(file.fd, buffer);
-            const decoder: util.TextDecoder = util.TextDecoder.create('utf-8');
-            const text: string = decoder.decodeToString(new Uint8Array(buffer, 0, readLen));
-            const parsed: WatchRecord[] = JSON.parse(text) as WatchRecord[];
-            if (parsed !== null && parsed !== undefined) {
-              result = parsed;
-            }
-          } finally {
-            fileIo.closeSync(file);
-          }
-        }
+    // 交给公共模块：它会做类型校验，并在文件损坏时**先留档再当空**，
+    // 避免"读取失败 → 当成没有记录 → 下次保存把可抢救的内容永久覆盖"。
+    const raw: Object[] = readJsonArraySafe(this.filePath);
+    const result: WatchRecord[] = [];
+    for (let i = 0; i < raw.length; i++) {
+      const r = raw[i] as WatchRecord;
+      // 逐条校验必备字段类型：旧 schema 或手改过的文件里可能缺字段，
+      // 缺了的话后面按字段运算会得到 NaN 甚至抛错
+      if (typeof r.path !== 'string' || r.path.length === 0) {
+        continue;
       }
-    } catch (err) {
-      console.error('load history failed: ' + JSON.stringify(err));
-      result = [];
+      if (typeof r.position !== 'number' || !Number.isFinite(r.position)) {
+        continue;
+      }
+      if (typeof r.duration !== 'number' || !Number.isFinite(r.duration)) {
+        continue;
+      }
+      result.push(r);
     }
     this.cache = result;
     return result;
   }
 
   /**
-   * 序列化并写回磁盘
+   * 序列化并写回磁盘（原子写）
    * @param records 要写入的记录
    * @returns 写盘结果描述（用于诊断），成功时形如 "ok 164/164"
    */
   private persist(records: WatchRecord[]): string {
-    let expected: number = 0;
-    let written: number = 0;
-    try {
-      const text: string = JSON.stringify(records);
-      const encoder: util.TextEncoder = new util.TextEncoder();
-      const bytes: Uint8Array = encoder.encodeInto(text);
-      expected = bytes.length;
-      const file = fileIo.openSync(
-        this.filePath,
-        fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC
-      );
-      try {
-        // 只写入 bytes 实际覆盖的那一段，避免把底层 ArrayBuffer 的多余字节一起写出
-        written = fileIo.writeSync(file.fd, bytes.buffer.slice(0, bytes.length));
-      } finally {
-        fileIo.closeSync(file);
-      }
-    } catch (err) {
-      console.error('persist history failed: ' + JSON.stringify(err));
-      return 'error ' + JSON.stringify(err);
+    // 改用原子写：先写 .tmp 再 rename 替换。
+    // 原先"先 TRUNC 再写"的做法一旦崩在中间，整个文件就没了 ——
+    // 而这是**用户的全部断点续播记录**，不能赌运气。
+    const r: AtomicWriteResult = writeJsonArrayAtomic(this.filePath, records);
+    if (!r.ok) {
+      console.error('persist history failed: ' + r.error);
+      return 'error ' + r.error;
     }
-    if (written !== expected) {
-      // 字节数不符 = 写盘不完整，这是之前"保存成功但读不出来"的直接嫌疑
-      return 'SHORT ' + written.toString() + '/' + expected.toString();
-    }
-    return 'ok ' + written.toString() + '/' + expected.toString();
+    return 'ok ' + r.written.toString() + '/' + r.expected.toString();
   }
 
   /**

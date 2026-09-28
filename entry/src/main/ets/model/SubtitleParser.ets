@@ -45,6 +45,18 @@ function isLikelyUtf8(bytes: Uint8Array): boolean {
   let i: number = 0;
   while (i < bytes.length) {
     const b: number = bytes[i];
+    // ★ 2026-09-29 自检修正：遇到 NUL 字节直接判定"不是 UTF-8"。
+    //
+    //   原先 `b < 0x80` 一律放行，而 0x00 也 < 0x80 —— 于是
+    //   **无 BOM 的 UTF-16 会被判成合法 UTF-8**：
+    //   UTF-16 里每个 ASCII 字符后面都跟一个 0x00，整份文件全是 NUL，
+    //   却一路通过结构校验，最后返回一串夹着 NUL 的"乱码"
+    //   （比直接解码失败更难排查，因为它看起来像是解出来了）。
+    //
+    //   正常的 UTF-8 文本文件里不该出现 NUL，所以这条判据是安全的。
+    if (b === 0x00) {
+      return false;
+    }
     if (b < 0x80) {
       i++;
       continue;
@@ -390,7 +402,12 @@ function parseAssFormat(content: string): SubtitleCue[] {
  */
 function parsePlainText(content: string): SubtitleCue[] {
   const out: SubtitleCue[] = [];
-  const blocks: string[] = content.replace(/\r\n/g, '\n').split(/\n\s*\n/);
+  // 换行归一化要和另两个解析器保持一致：
+  // 原先只 replace 了 \r\n，漏了裸 \r —— 而老编辑器/部分字幕工具导出的
+  // 文件就是纯 CR 换行，那样 `split(/\n\s*\n/)` 根本切不开，
+  // 整份台词稿会被当成"一个段落"，屏幕上一整块文字永不消失。
+  const normalized: string = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const blocks: string[] = normalized.split(/\n\s*\n/);
   let t: number = 0;
   for (let i: number = 0; i < blocks.length; i++) {
     const text: string = cleanSubtitleText(blocks[i]);
@@ -440,6 +457,20 @@ export function parseSubtitleText(content: string, fileName: string): SubtitleCu
  * 二分查找而不是线性扫描：一部影片的字幕可能有几千条，
  * 而这个查询在播放时会被频繁调用（UI 刷新）。
  *
+ * ★ 2026-09-29 自检修正：**区间重叠时原先会误判为"无字幕"**
+ *
+ *   旧实现只找"最后一个 startMs <= nowMs"的那条，然后检查它是否过期。
+ *   这在"区间互不重叠"时才等价于区间查找。而 ASS 字幕里重叠非常常见
+ *   （同一时刻既有对白、又有屏幕字/歌词标注），例如：
+ *     A 覆盖 0–10000ms，B 覆盖 2000–3000ms
+ *     在 now=5000ms 时二分命中 B（start 更大），5000 > 3000 → 返回 -1，
+ *     屏幕上本该显示的 A 直接消失了。
+ *
+ *   修法：命中候选之后**向前回溯**，取真正包含 nowMs 的那条。
+ *   为什么限一个回溯上限：理论上重叠深度不受限，但实际上字幕文件里
+ *   同时重叠十几条的极为罕见；设上限可以保证最坏情况仍是常数时间，
+ *   不会因为恶意/畸形字幕文件把每次查询变成 O(n)。
+ *
  * @param cues 已按 startMs 升序排好的列表
  * @param nowMs 当前播放位置
  * @return 命中的索引；-1 表示这一刻没有字幕
@@ -464,7 +495,16 @@ export function findActiveCueIndex(cues: SubtitleCue[], nowMs: number): number {
   if (found < 0) {
     return -1;   // 还没到第一条
   }
-  // 找到了最晚开始的一条，但还要确认它还没过期
-  // （两条字幕之间的空隙里就不该显示任何东西）
-  return nowMs <= cues[found].endMs ? found : -1;
+
+  // 从候选点向前回溯，找第一条真正覆盖 nowMs 的
+  // （回溯上限固定，保证最坏情况是常数时间）
+  const BACK_LIMIT: number = 16;
+  const lowest: number = Math.max(0, found - BACK_LIMIT);
+  for (let i = found; i >= lowest; i--) {
+    if (cues[i].startMs <= nowMs && nowMs <= cues[i].endMs) {
+      return i;
+    }
+  }
+  // 回溯范围内都没覆盖到 —— 当前时刻确实处在空隙里
+  return -1;
 }

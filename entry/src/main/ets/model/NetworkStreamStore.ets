@@ -1,6 +1,5 @@
-import { fileIo } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
-import { util } from '@kit.ArkTS';
+import { readJsonArraySafe, writeJsonArrayAtomic, AtomicWriteResult } from './JsonStore';
 
 /** 落盘文件名（存在应用沙箱 files 目录） */
 const FILE_NAME: string = 'network_streams.json';
@@ -145,13 +144,40 @@ export class NetworkStreamStore {
   }
 
   /**
-   * 更新一条记录（改名或记录播放时间）
+   * 更新一条记录（改名 / 改地址 / 记录播放时间）
+   *
+   * ★ 2026-09-29 修正：原先签名是 `update(id, name, markPlayed)`，
+   *   内部写死 `url: r.url` —— 也就是**地址永远沿用旧值**。
+   *   而编辑页的地址框是可编辑的、还实时提示"✓ 格式可用，保存后即可播放"，
+   *   保存后弹"已保存"。用户改了地址被告知成功，实际播的还是旧地址，
+   *   典型的"数据丢失 + 误导性确认"。
+   *   现在增加 url 参数（空串表示不改地址），并补上改地址必做的两件事：
+   *   重新校验、重新探测协议、查重。
+   *
    * @param id 记录 id
    * @param name 新名称；空串表示不改
+   * @param url 新地址；空串表示不改地址（保持原有行为兼容）
    * @param markPlayed 是否把最后播放时间置为当前
+   * @return 空串表示成功；非空为失败原因（可直接提示给用户）
    */
-  update(id: string, name: string, markPlayed: boolean): boolean {
+  update(id: string, name: string, url: string, markPlayed: boolean): string {
     const all: NetworkStream[] = this.load();
+    const trimmedUrl: string = url.trim();
+
+    // 地址真要改时，必须先过校验与查重 —— 否则等于绕过了 add() 的全部把关
+    if (trimmedUrl.length > 0) {
+      const verr: string = NetworkStreamStore.validateUrl(trimmedUrl);
+      if (verr.length > 0) {
+        return verr;
+      }
+      // 查重时要排除自己，否则"不改地址只改名"会被自己挡下来
+      for (let i = 0; i < all.length; i++) {
+        if (all[i].id !== id && all[i].url === trimmedUrl) {
+          return '该地址已经添加过了';
+        }
+      }
+    }
+
     let hit: boolean = false;
     const next: NetworkStream[] = [];
     for (let i = 0; i < all.length; i++) {
@@ -161,24 +187,27 @@ export class NetworkStreamStore {
         continue;
       }
       hit = true;
+      // 地址变了要同步重算协议，否则列表上的协议徽章会与地址对不上
+      const finalUrl: string = trimmedUrl.length > 0 ? trimmedUrl : r.url;
       // ArkTS 的对象是引用语义，但这里显式重建一份，
       // 避免缓存里的旧对象被就地改写导致界面读不到变化
       const updated: NetworkStream = {
         id: r.id,
         name: name.trim().length > 0 ? name.trim() : r.name,
-        url: r.url,
-        protocol: r.protocol,
+        url: finalUrl,
+        protocol: trimmedUrl.length > 0
+          ? NetworkStreamStore.detectProtocol(finalUrl) : r.protocol,
         createdAt: r.createdAt,
         lastPlayedAt: markPlayed ? Date.now() : r.lastPlayedAt
       };
       next.push(updated);
     }
     if (!hit) {
-      return false;
+      return '记录不存在';
     }
     this.cache = next;
     this.persist(next);
-    return true;
+    return '';   // 空串 = 成功
   }
 
   /**
@@ -329,54 +358,33 @@ export class NetworkStreamStore {
     if (cached !== undefined) {
       return cached;
     }
-    let result: NetworkStream[] = [];
-    try {
-      if (fileIo.accessSync(this.filePath)) {
-        const stat = fileIo.statSync(this.filePath);
-        if (stat.size > 0) {
-          const file = fileIo.openSync(this.filePath, fileIo.OpenMode.READ_ONLY);
-          try {
-            const buffer = new ArrayBuffer(stat.size);
-            const readLen: number = fileIo.readSync(file.fd, buffer);
-            const decoder: util.TextDecoder = util.TextDecoder.create('utf-8');
-            const text: string = decoder.decodeToString(new Uint8Array(buffer, 0, readLen));
-            const parsed: NetworkStream[] = JSON.parse(text) as NetworkStream[];
-            if (parsed !== null && parsed !== undefined) {
-              result = parsed;
-            }
-          } finally {
-            fileIo.closeSync(file);
-          }
-        }
+    // 公共模块负责类型校验与"损坏先留档"，理由见 JsonStore.ets
+    const raw: Object[] = readJsonArraySafe(this.filePath);
+    const result: NetworkStream[] = [];
+    for (let i = 0; i < raw.length; i++) {
+      const r = raw[i] as NetworkStream;
+      // 地址是唯一键，缺了就没法播；其余字段缺了给安全默认值
+      if (typeof r.url !== 'string' || r.url.length === 0) {
+        continue;
       }
-    } catch (err) {
-      console.error('load network streams failed: ' + JSON.stringify(err));
-      result = [];
+      if (typeof r.id !== 'string' || r.id.length === 0) {
+        continue;
+      }
+      result.push(r);
     }
     this.cache = result;
     return result;
   }
 
   /**
-   * 序列化并写回磁盘
+   * 序列化并写回磁盘（原子写）
    * @param records 要写入的记录
    */
   private persist(records: NetworkStream[]): void {
-    try {
-      const text: string = JSON.stringify(records);
-      const encoder: util.TextEncoder = new util.TextEncoder();
-      const bytes: Uint8Array = encoder.encodeInto(text);
-      const file = fileIo.openSync(
-        this.filePath,
-        fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC
-      );
-      try {
-        fileIo.writeSync(file.fd, bytes.buffer.slice(0, bytes.length));
-      } finally {
-        fileIo.closeSync(file);
-      }
-    } catch (err) {
-      console.error('persist network streams failed: ' + JSON.stringify(err));
+    // 原子写：先写 .tmp 再 rename 替换，避免"崩在 TRUNC 与 write 之间"丢光地址列表
+    const r: AtomicWriteResult = writeJsonArrayAtomic(this.filePath, records);
+    if (!r.ok) {
+      console.error('persist network streams failed: ' + r.error);
     }
   }
 }
