@@ -537,6 +537,19 @@ struct DecoderSession {
     int64_t audioSeekGen = 0;
 
     /**
+     * "当前手上这个包是在哪个 seek 世代读出来的"
+     *
+     * 每读出一个包就记一次；消费者送解码器之前拿它和 seekGeneration 比对，
+     * 不一致说明这个包是 seek 之前的残留 → 丢弃。
+     * 为什么需要它：seek 时"清队列"清不掉已经被消费者取走、正拿在手上的包，
+     * 那个旧包若被送进刚 flush 过的解码器（要求从关键帧重开）就会被拒，
+     * 报 AVERROR_INVALIDDATA。详见 DecodeVideoFrame 开头的说明。
+     */
+    int64_t videoPacketGen = 0;
+    /** 音频侧同理 */
+    int64_t audioPacketGen = 0;
+
+    /**
      * 解复用线程的致命错误（av_read_frame 返回真错误时记下）
      * 0 表示无错。解码线程看到它就直接报错，避免静默卡死。
      */
@@ -1658,11 +1671,17 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
                     break;
                 }
                 // ③ 按流索引分流；未启用的流（未选中的音轨/字幕轨）直接丢弃
+                //
+                //   分流前先记下"这些包属于哪个 seek 世代"，
+                //   消费者据此丢弃 seek 之前的残留包（见 videoPacketGen 说明）
+                const int64_t curGen = s->seekGeneration.load();
                 bool pushed = true;
                 if (pkt->stream_index == s->videoStreamIndex) {
+                    s->videoPacketGen = curGen;
                     pushed = s->videoQueue->Push(pkt);
                 } else if (s->audioStreamIndex >= 0
                            && pkt->stream_index == s->audioStreamIndex) {
+                    s->audioPacketGen = curGen;
                     pushed = s->audioQueue->Push(pkt);
                 } else if (s->subtitleStreamIndex >= 0
                            && pkt->stream_index == s->subtitleStreamIndex
@@ -1767,7 +1786,23 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
     // ★ 先处理 seek：如果解复用线程刚 seek 过，这里要清掉本线程这套
     //   解码器里的旧帧。**必须由本线程做**（谁拥有 context 谁 flush），
     //   原因见 seekGeneration 的说明与 SeekInternal 的注释。
-    //   放在循环之前而不是循环里：一次调用最多 flush 一次就够了。
+    //
+    //   ★★ 同时必须**丢弃上一代的残留包** —— 这是一个真实 bug 的修法 ★★
+    //
+    //   症状（真机截图确证）：换字幕轨后播放到某一刻弹出
+    //     「软解失败: avcodec_send_packet: Invalid data found when processing input」
+    //   失败包 size=73670 pts=5640，像 VP9 关键帧。
+    //
+    //   根因：seek 时解复用线程要清包队列，但**清不掉"已经被解码线程
+    //   取走、正拿在手上"的那个包**。于是会出现：
+    //     · 解码线程已经 flush（按新一代清了缓冲）→ 解码器要求从关键帧重开
+    //     · 但它手上/队列里紧跟着的却是 **seek 之前的旧包**（非关键帧）
+    //     → 解码器拒绝 → AVERROR_INVALIDDATA
+    //   "清队列"只保证队列干净，保证不了"消费者手里那个包也是新的"。
+    //
+    //   修法：给每个包打上它被读出来时的 seek 世代号，消费者在**送解码器
+    //   之前**校验一次；世代对不上就丢掉换下一个。这样无论包是"手上的"
+    //   还是"队列里的"，只要它来自旧世代就不会被送进解码器。
     {
         const int64_t gen = s->seekGeneration.load();
         if (gen != s->videoSeekGen) {
@@ -1818,6 +1853,13 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
             return kAgain;
         }
         AVPacket *vpkt = s->videoPacket;
+        // ★ 世代校验：丢弃 seek 之前读出来的残留包（理由见本函数开头）。
+        //   注意要在**送解码器之前**判定，判定完直接 unref 换下一个包。
+        const int64_t pktGen = s->videoPacketGen;
+        if (pktGen != s->seekGeneration.load()) {
+            av_packet_unref(vpkt);
+            continue;   // 旧世代的包一律不要
+        }
         // 先留一份包的关键信息 —— unref 之后这些字段就没了，
         // 而失败日志要靠它们说明「被拒的是哪个包」
         s->dbgLastSize = vpkt->size;
@@ -1945,6 +1987,12 @@ int32_t DecodeAudioChunk(Session session, AudioChunk &chunk, std::string &errMsg
                 return kDecodeFailed;
             }
             return kAgain;
+        }
+        // ★ 世代校验：丢弃 seek 之前读出的残留包（与视频侧同理，
+        //   理由见 DecodeVideoFrame 开头与 videoPacketGen 的说明）
+        if (s->audioPacketGen != s->seekGeneration.load()) {
+            av_packet_unref(s->audioPacket);
+            continue;
         }
         const int rret = avcodec_send_packet(s->audioCtx, s->audioPacket);
         av_packet_unref(s->audioPacket);
