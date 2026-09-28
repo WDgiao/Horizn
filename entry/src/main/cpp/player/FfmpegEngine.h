@@ -141,6 +141,8 @@ private:
 
     /** 累计丢帧数（诊断用） */
     std::atomic<int64_t> droppedFrames_{0};
+    /** sync 诊断日志已打印次数（只打印前几次"落后"，避免刷屏） */
+    int32_t dropDbgCount_ = 0;
 
     /**
      * surface 实际分配的 buffer 尺寸（显示区域尺寸，不是视频尺寸）

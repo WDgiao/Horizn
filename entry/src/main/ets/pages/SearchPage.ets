@@ -8,6 +8,7 @@ import { showToast, initToast, confirmDialog } from '../common/Toast';
 import { MediaImporter, ImportResult } from '../model/MediaImporter';
 import { MediaFileOps } from '../model/MediaFileOps';
 import { FolderRepository, MediaFolder } from '../model/FolderRepository';
+import { WatchHistory, WatchRecord } from '../model/WatchHistory';
 import { nativeProbe, nativeBuildInfo } from 'libsoftplayer.so';
 /**
  * 文件搜索页
@@ -73,6 +74,18 @@ struct SearchPage {
   @State showMoveMenu: boolean = false;
   /** 当前被按下的列表项路径（用于按压缩放反馈） */
   @State pressedPath: string = '';
+  /**
+   * 观看记录仓库，用于「从上次位置继续播放」
+   *
+   * ★ 2026-09-28 真机实测补上的关键一环：
+   *   在此之前，从本页点开文件进入播放页时【没有传续播起点】，
+   *   于是播放页的 startMs 永远是 0 —— 表现就是「rm 等文件无法同步继续播放」。
+   *   当时误以为是软解/seek 的问题，实际根因只是这里少传了一个参数：
+   *   首页（Index.ets）走的是 openPlayer(path, title, resumeMsOf(path))，有起点；
+   *   而本页 pushUrl 时只给了 path 和 title，漏了 startMs。
+   *   历史记录本身一直是正常写入的（真机 watch_history.json 有正确内容）。
+   */
+  private history: WatchHistory | undefined = undefined;
 
   aboutToAppear(): void {
     initToast(this.getUIContext());
@@ -81,6 +94,7 @@ struct SearchPage {
     this.repository = new VideoRepository(ctx);
     this.importer = new MediaImporter(ctx);
     this.folderRepo = new FolderRepository(ctx);
+    this.history = new WatchHistory(ctx);
     // 若从首页某个文件夹进来，则只扫描该目录
     const params = this.getUIContext().getRouter().getParams() as FolderParamsForSearch;
     if (params !== undefined && params !== null) {
@@ -94,6 +108,26 @@ struct SearchPage {
 
   aboutToDisappear(): void {
     this.scanning = false;
+  }
+
+  /**
+   * 从播放页返回时让观看记录缓存失效
+   *
+   * ★ 2026-09-28 真机实测补上：这一步缺失会让上一个修复【完全失效】。
+   *
+   *   本页是压栈跳转到播放页的，返回时走的是 onPageShow ——
+   *   **不会**重新执行 aboutToAppear，因此 this.history 还是进入播放页之前
+   *   那个实例；而 WatchHistory 内部有内存缓存，find() 会直接返回旧记录，
+   *   拿到的续播起点仍是 0。
+   *
+   *   首页（Index.ets）早就有这段处理，注释里也写明了原因，本页漏了。
+   *   实测现象：修改后 startMs 依然恒为 0，直到补上这段才生效。
+   */
+  onPageShow(): void {
+    const repo: WatchHistory | undefined = this.history;
+    if (repo !== undefined) {
+      repo.invalidateCache();
+    }
   }
 
   /**
@@ -360,8 +394,7 @@ struct SearchPage {
     if (!item.playable) {
       showToast('该格式不在可播放白名单内：.' + item.extension);
       return;
-    }
-    // ★ 防连点：跳转正在途中就忽略后续点击。
+    }    // ★ 防连点：跳转正在途中就忽略后续点击。
     //
     //   为什么必须有这道闸：
     //   实测崩溃现场（cid 02:04）的 Page switch history 显示
@@ -378,15 +411,37 @@ struct SearchPage {
       return;
     }
     this.lastOpenAt = now;
+    // 取上次播放位置作为续播起点（已看完或没看过则为 0，表示从头播）
+    const startMs: number = this.resumeMsOf(item.path);
     // 注意：NEEDS_SOFT_DECODE 这一类【不再拦截】。
     // 之前拦截是因为内置软解还没接上，点进去必然失败；
     // 现在 FFmpeg 已集成，这类文件改由播放页自动走软解通道，应当允许点开。
     this.getUIContext().getRouter().pushUrl({
       url: 'pages/PlayerPage',
-      params: { path: item.path, title: item.name } as PlayerParamsForSearch
+      params: { path: item.path, title: item.name, startMs: startMs } as PlayerParamsForSearch
     }).catch(() => {
       showToast('无法打开播放页');
     });
+  }
+
+  /**
+   * 查某路径的续播起点（毫秒）
+   *
+   * 与首页 Index.resumeMsOf 同口径，都走 WatchHistory.resumePosition，
+   * 保证「已看完」的判定规则两处一致（否则会出现首页从头播、搜索页续播这种不一致）。
+   *
+   * @param path 视频绝对路径
+   */
+  private resumeMsOf(path: string): number {
+    const repo: WatchHistory | undefined = this.history;
+    if (repo === undefined) {
+      return 0;
+    }
+    const record: WatchRecord | undefined = repo.find(path);
+    if (record === undefined) {
+      return 0;
+    }
+    return WatchHistory.resumePosition(record);
   }
 
   /** 顶部摘要文案 */
@@ -863,6 +918,11 @@ struct SearchPage {
 interface PlayerParamsForSearch {
   path: string;
   title: string;
+  /**
+   * 续播起点（毫秒），0 或省略表示从头播
+   * 对应 PlayerParams.startMs —— 字段名必须一致，否则播放页读不到
+   */
+  startMs?: number;
 }
 
 /** 从首页文件夹进入时携带的参数 */

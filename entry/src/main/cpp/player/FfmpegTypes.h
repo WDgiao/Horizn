@@ -37,6 +37,13 @@ struct VideoFrame {
     int height = 0;
     /** 显示时间戳（毫秒） */
     int64_t ptsMs = 0;
+    /**
+     * 该帧应显示多久（毫秒）
+     *
+     * 用途：帧间隔兜底。某些流（实测 .rm 的 RealVideo）相邻帧时间戳相同或缺失，
+     * 那时播放器只能按这个值给每帧安排时长，否则整片会被瞬间播完。
+     */
+    int64_t durationMs = 0;
 
     /** 释放内存，避免大帧在队列里堆积 */
     void Clear() {
@@ -46,6 +53,7 @@ struct VideoFrame {
         width = 0;
         height = 0;
         ptsMs = 0;
+        durationMs = 0;
     }
 };
 

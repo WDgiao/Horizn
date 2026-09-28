@@ -607,6 +607,7 @@ void FfmpegEngine::DecodeLoop() {
             //
             //   没有可用音频轨时才退回单调时钟。
             int64_t waitMs = 0;
+            int64_t audioClockDbg = -1;
             const AudioOutput *ao = audio_.get();
             if (audioReady_ && ao != nullptr && ao->IsRunning()) {
                 const int64_t bytesPerMs = static_cast<int64_t>(codecapi::AudioSampleRate())
@@ -615,6 +616,7 @@ void FfmpegEngine::DecodeLoop() {
                 const int64_t notYetPlayedMs = (bytesPerMs > 0)
                     ? (static_cast<int64_t>(ao->BufferedBytes()) / bytesPerMs) : 0;
                 const int64_t audioClockMs = audioWrittenMs_.load() - notYetPlayedMs;
+                audioClockDbg = audioClockMs;
                 waitMs = frame.ptsMs - audioClockMs;
             } else {
                 const int64_t targetSysMs = lastFrameSysMs_ + (frame.ptsMs - lastFramePtsMs_);
@@ -626,6 +628,52 @@ void FfmpegEngine::DecodeLoop() {
             // 超过 1 秒就认为"时钟还没准备好"，改为立即显示。
             if (waitMs > 1000) {
                 waitMs = 0;
+            }
+
+            // ★★ 丢帧保护：把 waitMs 夹到「两帧应间隔的上限」★★
+            //
+            //   为什么必须有这道夹子（2026-09-28 真机实测发现的 bug）：
+            //   丢帧判据原本是 waitMs < -100，也就是"这帧比主时钟落后 100ms 以上"。
+            //   但 waitMs 是拿【音频时钟】减【绝对 pts】，两者基准并不总是同一原点：
+            //     · seek 之后 audioWrittenMs_ 被清零重新累积，而帧 pts 仍是绝对值，
+            //       于是 waitMs 里混进了一个与 seek 目标等量的偏移；
+            //     · 更严重的是当视频流本身短于容器时长（音频比视频长）时，
+            //       音频时钟会一路超过所有剩余帧的 pts，
+            //       表现为 waitMs 恒为一个大负数 →【剩余视频帧被全部丢掉】。
+            //   实测现场：10 秒 .rm 样本解出 65 帧、只上屏 1 帧，
+            //   position 因此永远停在 0（进度按已上屏帧的 pts 上报）。
+            //
+            //   两道夹子分别挡住这两种偏移，且都不影响正常的"追进度"：
+            //     ① 下限 = -两帧间隔：差值再大也只当"落后一帧"，
+            //        真正持续落后时仍会连续丢帧追上（丢的是零头，不是全部）。
+            //     ② 上限 = 当前帧 pts 相对上一帧的增量：时钟超前不应让画面加速。
+            //   只有当「上一帧已经渲染过、而当前帧 pts 比它还早」才夹下限 ——
+            //   那种情况帧序本身就是乱序或重复，夹住比丢掉更合理。
+            const int64_t frameDeltaMs = (lastFramePtsMs_ >= 0)
+                ? (frame.ptsMs - lastFramePtsMs_) : 0;
+            // 帧时长兜底：相邻帧时间戳相同或缺失时（实测 .rm 的 RealVideo 就是
+            // 每帧 pts 都为 0），按解码层给出的帧时长推进，而不是当成 0 差值 ——
+            // 否则整个视频会被瞬间播完，进度条也永远停在 0。
+            const int64_t frameSpanMs = (frame.durationMs > 0) ? frame.durationMs : 40;
+            const int64_t deltaClamp = (frameDeltaMs > 0) ? frameDeltaMs : frameSpanMs;
+            if (waitMs < -deltaClamp) {
+                waitMs = -deltaClamp;
+            }
+            if (frameDeltaMs > 0 && waitMs > frameDeltaMs) {
+                waitMs = frameDeltaMs;
+            }
+
+            // 抽样诊断：前 8 次"即将丢帧"各打一次，便于核对时钟与 pts 的真实差值
+            // （这两个数最容易出错：一个是绝对时间戳，一个是从 0 起算的相对量）
+            if (waitMs < -20 && dropDbgCount_ < 8) {
+                dropDbgCount_++;
+                LOGI("sync: pts=%{public}lld audioClock=%{public}lld writtenMs=%{public}lld "
+                     "wait=%{public}lld delta=%{public}lld",
+                     static_cast<long long>(frame.ptsMs),
+                     static_cast<long long>(audioClockDbg),
+                     static_cast<long long>(audioWrittenMs_.load()),
+                     static_cast<long long>(waitMs),
+                     static_cast<long long>(frameDeltaMs));
             }
 
             if (waitMs > 2) {

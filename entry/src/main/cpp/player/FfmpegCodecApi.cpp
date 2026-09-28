@@ -162,6 +162,22 @@ struct DecoderSession {
      * 那些本来就该并行，锁住反而会拖慢解码。
      */
     std::mutex demuxMutex;
+
+    // ---------- 时间戳兜底用 ----------
+    /**
+     * 已解出的视频帧数
+     *
+     * 用途：某些容器/编码（实测 .rm 的 RealVideo）里帧的 pts/dts **全部缺失**，
+     * 只能按帧序 × 帧间隔合成时间轴，否则时间轴恒为 0。
+     */
+    int64_t frameCounter = 0;
+    /**
+     * 默认帧间隔（毫秒），来自流帧率；取不到时退回 40ms（25fps）
+     *
+     * 为什么必须有这个兜底：帧 pts 全缺时，播放器只能靠帧序推算时间，
+     * 而推算需要知道每帧该占多久。
+     */
+    double defaultFrameMs = 40.0;
 };
 
 /** 把解码器的错误码转成可读文本 */
@@ -169,6 +185,54 @@ std::string AvErr(int err) {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
     av_strerror(err, buf, sizeof(buf));
     return std::string(buf);
+}
+
+/**
+ * 取出一个解码帧的显示时间戳（毫秒），并推算它该显示多久
+ *
+ * ★★ 这里曾经有一个严重 bug（2026-09-28 真机实测定位）★★
+ *
+ *   原实现是 `use->pts` / `use->best_effort_timestamp`，而 `use` 指向
+ *   **sws_scale 的输出帧 convFrame** —— 那个帧是我们自己分配来装 RGBA 的，
+ *   从未被赋过时间戳，FFmpeg 也不会给它赋。于是两条分支都拿到
+ *   AV_NOPTS_VALUE，最后落到 `pts = 0`：**每帧的时间戳都是 0**。
+ *
+ *   症状链（全都能对上实测现象）：
+ *     · 进度条永远停在 00:00（位置按已上屏帧的 pts 上报）
+ *     · 10 秒的视频瞬间播完（没有时间轴就没法按时间节流）
+ *     · 续播的 startMs 恒为 0 —— 这曾被误判为"缓存/续播逻辑坏了"，
+ *       也一度被误判成"软解 seek 有问题"，实际只是时间戳全是 0
+ *
+ *   正确做法：时间戳必须从**原始解码帧 raw** 上取。
+ *   FFmpeg 的约定是优先用 best_effort_timestamp（它对 B 帧和缺失 pts
+ *   的流做过修正），拿不到再退 pts / pkt_dts。
+ *
+ * @param s     会话（读写 frameCounter；读 defaultFrameMs / timeBase）
+ * @param raw   原始解码帧，时间戳来源
+ * @param ptsMs 输出：显示时间戳（毫秒）
+ * @return 该帧应显示多久（毫秒），供上层做帧间隔兜底
+ */
+int64_t ResolveFrameTimestamp(DecoderSession *s, const AVFrame *raw, int64_t &ptsMs) {
+    int64_t pts = raw->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE) {
+        pts = raw->pts;
+    }
+    if (pts == AV_NOPTS_VALUE) {
+        pts = raw->pkt_dts;
+    }
+    if (pts != AV_NOPTS_VALUE) {
+        ptsMs = av_rescale_q(pts, s->timeBase, AVRational{1, 1000});
+        s->frameCounter++;
+        return (s->defaultFrameMs > 1.0) ? static_cast<int64_t>(s->defaultFrameMs) : 40;
+    }
+    // ★ 完全没有时间戳的流（实测 .rm 的 RealVideo 就是这种）：
+    //   按帧序 × 帧间隔合成一条时间轴。
+    //   否则 ptsMs 恒为 0，播放器就没了时间基准。
+    const int64_t step = (s->defaultFrameMs > 1.0)
+        ? static_cast<int64_t>(s->defaultFrameMs) : 40;
+    ptsMs = s->frameCounter * step;
+    s->frameCounter++;
+    return step;
 }
 
 /**
@@ -253,15 +317,13 @@ int32_t CopyFrame(DecoderSession *s, const AVFrame *src, VideoFrame &out,
     out.height = use->height;
     out.stride = use->linesize[0];
 
-    // pts 可能是 AV_NOPTS_VALUE，此时退回用 best_effort_timestamp
-    int64_t pts = use->pts;
-    if (pts == AV_NOPTS_VALUE) {
-        pts = use->best_effort_timestamp;
-    }
-    if (pts == AV_NOPTS_VALUE) {
-        pts = 0;
-    }
-    out.ptsMs = av_rescale_q(pts, s->timeBase, AVRational{1, 1000});
+    // ★ 时间戳必须从【原始解码帧 src】上取，不能从 convFrame 取！
+    //   convFrame 是 sws_scale 的输出帧，我们只往里写像素、从不设时间戳，
+    //   从它读 pts 会永远得到 AV_NOPTS_VALUE（这段曾是真实 bug，详见
+    //   ResolveFrameTimestamp 的说明）。
+    int64_t ptsMs = 0;
+    out.durationMs = ResolveFrameTimestamp(s, src, ptsMs);
+    out.ptsMs = ptsMs;
 
     // RGBA 是打包格式（单平面），按行拷进自有缓冲
     const size_t size = static_cast<size_t>(out.stride) * use->height;
@@ -414,6 +476,16 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
         const AVRational fr = fmt->streams[vIdx]->avg_frame_rate;
         if (fr.num > 0 && fr.den > 0) {
             out.frameRate = av_q2d(fr);
+        }
+        // 帧间隔兜底值：优先用解码器帧率，其次容器帧率，都取不到就用 40ms（25fps）。
+        // 用途见 ResolveFrameTimestamp —— 时间戳全缺的流要靠它合成时间轴。
+        if (vctx->framerate.num > 0 && vctx->framerate.den > 0) {
+            s->defaultFrameMs = 1000.0 * vctx->framerate.den / vctx->framerate.num;
+        } else if (out.frameRate > 0.1) {
+            s->defaultFrameMs = 1000.0 / out.frameRate;
+        }
+        if (s->defaultFrameMs < 1.0 || s->defaultFrameMs > 1000.0) {
+            s->defaultFrameMs = 40.0;   // 异常值一律退回 25fps
         }
         const char *pf = av_get_pix_fmt_name(vctx->pix_fmt);
         out.pixelFormat = pf != nullptr ? pf : "unknown";
