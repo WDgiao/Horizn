@@ -70,4 +70,54 @@ export interface SoftMediaInfo {
   hasVideo: boolean;
   /** 是否含音频流 */
   hasAudio: boolean;
+  /** 文件里的全部可切换音轨 */
+  audioTracks: SoftAudioTrack[];
+  /** 文件里的全部字幕轨 */
+  subtitleTracks: SoftSubtitleTrack[];
+  /** 当前生效的音轨流下标；-1 表示无 */
+  currentAudioIndex: number;
+  /** 当前生效的字幕轨流下标；-1 表示未启用 */
+  currentSubtitleIndex: number;
+}
+
+/**
+ * 一条可切换的音轨
+ *
+ * 注意：index 是**容器里的流下标**，不是"第几条音轨"。
+ * 流下标可能不连续（0 是视频、1 是音频、2 是字幕、3 又是音频），
+ * 所以界面显示"音轨 1/2/3"时要自己编号，传给原生时必须用 index。
+ */
+export interface SoftAudioTrack {
+  index: number;
+  /** 编码名，例如 "aac" / "ac3" / "dca" */
+  codec: string;
+  /** 语言标签，例如 "chi" / "eng"（可能是空串） */
+  language: string;
+  /** 轨道标题（可能是空串） */
+  title: string;
+  /** 声道数，0 表示未知 */
+  channels: number;
+  /** 采样率，0 表示未知 */
+  sampleRate: number;
+  /** 码率（bps），0 表示未知 */
+  bitRate: number;
+  /** 是否为容器标记的默认轨 */
+  isDefault: boolean;
+}
+
+/** 一条字幕轨 */
+export interface SoftSubtitleTrack {
+  index: number;
+  /** 编码名，例如 "subrip" / "ass" / "mov_text" / "hdmv_pgs_subtitle" */
+  codec: string;
+  language: string;
+  title: string;
+  isDefault: boolean;
+  /**
+   * 是否可解码成文本
+   *
+   * 位图字幕（PGS / VobSub）为 false —— 界面要把它们显示成"不支持"，
+   * 而不是让用户点了之后毫无反应。
+   */
+  supported: boolean;
 }

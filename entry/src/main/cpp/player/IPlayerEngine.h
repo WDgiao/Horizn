@@ -1,9 +1,12 @@
 #ifndef SOFT_PLAYER_IPLAYER_ENGINE_H
 #define SOFT_PLAYER_IPLAYER_ENGINE_H
 
+#include "FfmpegTypes.h"
+
 #include <string>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 namespace softplayer {
 
@@ -38,6 +41,34 @@ struct MediaInfo {
      * 旋转 90/270 时实际观看尺寸是两者互换。
      */
     int32_t rotationDeg = 0;
+
+    /**
+     * 文件里的全部音轨 / 字幕轨
+     *
+     * 引擎自己保留一份，供界面查询"这个文件有哪些声道可选"。
+     * 类型直接复用 FfmpegTypes.h 里的定义 —— 这样做让引擎层耦合了
+     * FFmpeg 侧的类型，但换来的是不用维护两套结构再逐字段互拷。
+     */
+    std::vector<AudioTrackInfo> audioTracks;
+    std::vector<SubtitleTrackInfo> subtitleTracks;
+    /** 当前生效的音轨 / 字幕轨下标（-1 表示无 / 未启用） */
+    int32_t currentAudioIndex = -1;
+    int32_t currentSubtitleIndex = -1;
+};
+
+/**
+ * 一条待显示的字幕
+ *
+ * 为什么用"取当前字幕"(GetActiveSubtitle) 而不是事件推送：
+ *   字幕天生是**时间对齐**的 —— 该显示哪一条只取决于当前播放位置。
+ *   用事件推就得在 ArkTS 侧再做一次时间判断与去重，还要处理
+ *   "推送延迟导致字幕晚了半秒"这类问题。
+ *   让界面按当前 positionMs 来问"现在该显示什么"，逻辑简单且天然同步。
+ */
+struct SubtitleCue {
+    int64_t startMs = 0;
+    int64_t endMs = 0;
+    std::string text;
 };
 
 /** 事件类型，通过回调上报到 JS 侧 */
@@ -115,6 +146,41 @@ public:
 
     /** 当前播放位置（毫秒） */
     virtual int64_t GetPositionMs() const = 0;
+
+    /**
+     * 切换音轨
+     *
+     * 实现方式见 FfmpegCodecApi.h 里 TrackRequest 的说明：
+     * 「用新下标把会话重开一次，再 seek 回原来的位置」。
+     * 之所以不做就地热替换，是因为解码器上下文、重采样上下文、包队列
+     * 全都与具体那条流绑定，热替换要处理线程停顿、队列清空、解码器冲刷，
+     * 出错面远大于重开。
+     *
+     * @param streamIndex 目标音轨的流下标（取自 MediaInfo::audioTracks）
+     * @return 0 成功；非 0 失败（失败时会尽量保持原音轨可用）
+     */
+    virtual int32_t SwitchAudioTrack(int32_t streamIndex) { (void)streamIndex; return -1; }
+
+    /**
+     * 启用 / 关闭字幕轨
+     *
+     * @param streamIndex 字幕流下标；-1 表示关闭字幕
+     * @return 0 成功；非 0 失败
+     */
+    virtual int32_t SetSubtitleTrack(int32_t streamIndex) { (void)streamIndex; return -1; }
+
+    /**
+     * 取"当前时刻该显示的字幕"
+     *
+     * @param out 有字幕时填充
+     * @return true 表示当前有字幕要显示；false 表示这一时刻没有字幕
+     *
+     * 语义刻意做成"查询"而不是"事件"，理由见 SubtitleCue 的说明。
+     */
+    virtual bool GetActiveSubtitle(SubtitleCue &out) const { (void)out; return false; }
+
+    /** 音频轨是否支持切换（文件里有多条可解码音轨） */
+    virtual bool CanSwitchAudioTrack() const { return false; }
 
     /** 释放全部资源，之后不可再调用其它方法 */
     virtual void Release() = 0;

@@ -22,6 +22,30 @@ export interface SoftPlayerEvent {
   text: string;
 }
 
+/** 一条可切换的音轨 */
+export interface SoftAudioTrack {
+  /** 容器里的流下标（传给 switchAudioTrack 用这个，不是"第几条"） */
+  index: number;
+  codec: string;
+  language: string;
+  title: string;
+  channels: number;
+  sampleRate: number;
+  bitRate: number;
+  isDefault: boolean;
+}
+
+/** 一条字幕轨 */
+export interface SoftSubtitleTrack {
+  index: number;
+  codec: string;
+  language: string;
+  title: string;
+  isDefault: boolean;
+  /** false 表示位图字幕（PGS/VobSub），本播放器解不了 */
+  supported: boolean;
+}
+
 /** 媒体信息 */
 export interface SoftMediaInfo {
   durationMs: number;
@@ -32,6 +56,14 @@ export interface SoftMediaInfo {
   audioCodec: string;
   hasVideo: boolean;
   hasAudio: boolean;
+  /** 全部可切换音轨 */
+  audioTracks: SoftAudioTrack[];
+  /** 全部字幕轨（含不支持的图形字幕，靠 supported 区分） */
+  subtitleTracks: SoftSubtitleTrack[];
+  /** 当前生效的音轨流下标；-1 表示无 */
+  currentAudioIndex: number;
+  /** 当前生效的字幕轨流下标；-1 表示未启用 */
+  currentSubtitleIndex: number;
 }
 
 /**
@@ -60,6 +92,36 @@ export class SoftPlayer {
   getDuration(): number;
   getPosition(): number;
   getMediaInfo(): SoftMediaInfo;
+
+  /**
+   * 切换音轨
+   *
+   * 原生实现是「用新下标重开会话 + seek 回原播放位置」——
+   * 所以会有短暂的中断，这是预期行为。
+   *
+   * @param streamIndex 流下标（取自 getMediaInfo().audioTracks[].index）
+   * @returns 0 成功；非 0 失败
+   */
+  switchAudioTrack(streamIndex: number): number;
+
+  /**
+   * 启用 / 关闭内嵌字幕轨
+   * @param streamIndex 流下标；-1 关闭字幕
+   * @returns 0 成功；非 0 失败
+   */
+  setSubtitleTrack(streamIndex: number): number;
+
+  /**
+   * 取当前该显示的字幕文本
+   *
+   * 空串表示这一刻没有字幕 —— 直接绑到 Text 组件上就是"不显示"。
+   * 这是"查询"而非"事件"：字幕按播放位置对齐，UI 每帧来问最省事。
+   */
+  getActiveSubtitle(): string;
+
+  /** 文件里是否有多条可切换音轨 */
+  canSwitchAudioTrack(): boolean;
+
   pollEvents(): SoftPlayerEvent[];
 }
 

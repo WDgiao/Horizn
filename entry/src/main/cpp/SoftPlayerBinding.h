@@ -65,6 +65,14 @@ public:
     static napi_value JsGetDuration(napi_env env, napi_callback_info info);
     static napi_value JsGetPosition(napi_env env, napi_callback_info info);
     static napi_value JsGetMediaInfo(napi_env env, napi_callback_info info);
+    /** 切换音轨；参数是流下标（取自 getMediaInfo 的 audioTracks） */
+    static napi_value JsSwitchAudioTrack(napi_env env, napi_callback_info info);
+    /** 启用/关闭字幕轨；参数是流下标，传 -1 表示关闭 */
+    static napi_value JsSetSubtitleTrack(napi_env env, napi_callback_info info);
+    /** 取当前该显示的字幕文本；没有时返回空串 */
+    static napi_value JsGetActiveSubtitle(napi_env env, napi_callback_info info);
+    /** 文件里是否有多条可切换音轨 */
+    static napi_value JsCanSwitchAudioTrack(napi_env env, napi_callback_info info);
     static napi_value JsPollEvents(napi_env env, napi_callback_info info);
 
 private:

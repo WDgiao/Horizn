@@ -11,7 +11,12 @@ import { MediaTier, mediaTierOf, isVideoContainer } from '../common/MediaType';
 import { WatchHistory } from '../model/WatchHistory';
 import { DiagLog } from '../model/DiagLog';
 import { SoftPlayerController, SoftPlayerSnapshot } from '../model/SoftPlayerController';
-import { SoftPlayerState } from '../model/SoftPlayerTypes';
+import { SoftPlayerState, SoftAudioTrack, SoftSubtitleTrack } from '../model/SoftPlayerTypes';
+import {
+  ExternalSubtitle, SubtitleCandidate, current as externalSubtitle,
+  findSidecarSubtitles, loadSubtitleFile, pickSubtitleFile, SUBTITLE_EXTENSIONS,
+  isExternalActive, setExternalActive, restoreExternalSubtitle
+} from '../model/SubtitleLoader';
 
 /** 播放器路由参数 */
 export interface PlayerParams {
@@ -30,6 +35,41 @@ export interface PlayerParams {
  */
 function formatTime(ms: number): string {
   return formatDuration(ms);
+}
+
+/**
+ * 把容器里的语言标签换成中文
+ *
+ * 为什么值得做这层映射：音轨/字幕轨的语言在容器里是 ISO 639-2 三字母码
+ * （chi / eng / jpn），直接显示"音轨 1 · chi"对普通用户没有意义 ——
+ * 而这几行代码能让它变成"音轨 1 · 中文"。常见的十几种覆盖了就够。
+ */
+function translateLanguage(code: string): string {
+  const c: string = code.toLowerCase();
+  if (c === 'chi' || c === 'zho' || c === 'zh') { return '中文'; }
+  if (c === 'eng' || c === 'en') { return '英语'; }
+  if (c === 'jpn' || c === 'ja') { return '日语'; }
+  if (c === 'kor' || c === 'ko') { return '韩语'; }
+  if (c === 'fra' || c === 'fre' || c === 'fr') { return '法语'; }
+  if (c === 'deu' || c === 'ger' || c === 'de') { return '德语'; }
+  if (c === 'spa' || c === 'es') { return '西班牙语'; }
+  if (c === 'rus' || c === 'ru') { return '俄语'; }
+  if (c === 'ita' || c === 'it') { return '意大利语'; }
+  if (c === 'por' || c === 'pt') { return '葡萄牙语'; }
+  if (c === 'tha' || c === 'th') { return '泰语'; }
+  if (c === 'vie' || c === 'vi') { return '越南语'; }
+  if (c === 'ara' || c === 'ar') { return '阿拉伯语'; }
+  if (c === 'hin' || c === 'hi') { return '印地语'; }
+  return code;
+}
+
+/** 声道数 → 人话（5.1 / 7.1 这类叫法比"6 声道"更符合习惯） */
+function channelLabel(ch: number): string {
+  if (ch === 1) { return '单声道'; }
+  if (ch === 2) { return '立体声'; }
+  if (ch === 6) { return '5.1'; }
+  if (ch === 8) { return '7.1'; }
+  return ch.toString() + ' 声道';
 }
 
 /**
@@ -76,6 +116,42 @@ struct PlayerPage {
    */
   @State areaWidth: number = 0;
   @State areaHeight: number = 0;
+
+  // ==================== 音轨与字幕（2026-09-29 新增） ====================
+  //
+  // 为什么字幕文本用 @State 而轨道列表不用：
+  //   字幕文本每次变化都要重绘（就是屏幕上的那行字），必须是响应式的；
+  //   而轨道列表只在打开面板时读一次，用普通成员就够，
+  //   让它参与渲染只会带来无谓的重绘。
+
+  /** 当前要显示的字幕文本（空串 = 不显示） */
+  @State subtitleText: string = '';
+  /** 是否显示音轨/字幕选择面板 */
+  @State showTrackPanel: boolean = false;
+  /** 文件里可切换的音轨（面板打开时从控制器快照刷新） */
+  @State audioTracks: SoftAudioTrack[] = [];
+  /** 文件里的字幕轨（含不支持的图形字幕） */
+  @State subtitleTracks: SoftSubtitleTrack[] = [];
+  /** 当前音轨流下标 */
+  @State currentAudioIndex: number = -1;
+  /** 当前内嵌字幕轨流下标 */
+  @State currentSubtitleIndex: number = -1;
+  /**
+   * 外挂字幕：是否启用
+   *
+   * 外挂与内嵌是**互斥**的两条路径（同时显示会叠字），
+   * 所以用这个标志表示"当前生效的是外挂字幕"。
+   */
+  @State usingExternalSubtitle: boolean = false;
+  /** 外挂字幕显示名（面板上展示） */
+  @State externalSubtitleName: string = '';
+  /** 同目录发现的外挂字幕候选 */
+  @State sidecarCandidates: SubtitleCandidate[] = [];
+  /** 轨道/字幕操作的状态提示（例如"切换音轨失败"） */
+  @State trackNotice: string = '';
+
+  /** 字幕刷新定时器 */
+  private subtitleTimer: number = -1;
 
   /** 用户是否正在拖动进度条 */
   private dragging: boolean = false;
@@ -171,11 +247,86 @@ struct PlayerPage {
     }
     this.setupWindow();
     this.createPlayer();
+    // 外挂字幕：同目录同名/同前缀的自动发现（网络流没有目录，跳过）
+    if (!this.isNetworkUrl(this.videoPath)) {
+      this.sidecarCandidates = findSidecarSubtitles(this.videoPath);
+    }
+    // 恢复上次选中的外挂字幕。
+    // 为什么需要这一步：外挂字幕的选择是"针对这个视频"的长期意图，
+    // 而播放页会被反复创建（返回搜索页再进来就是一次新创建）。
+    // 不恢复的话用户每进出一次都要重选一遍，体验很差。
+    if (isExternalActive() && externalSubtitle.path.length > 0) {
+      restoreExternalSubtitle().then((count: number) => {
+        if (count > 0) {
+          this.usingExternalSubtitle = true;
+          this.externalSubtitleName = externalSubtitle.name;
+          this.subtitleText = externalSubtitle.textAt(this.positionMs);
+          this.writeDiag('已恢复外挂字幕: ' + externalSubtitle.name
+            + ' 共 ' + count.toString() + ' 条');
+        }
+      });
+    }
+    // 字幕刷新定时器。100ms 与事件轮询同频 —— 字幕的时间精度本来
+    // 就在几十毫秒量级，再密也没有意义，反而白耗电。
+    this.subtitleTimer = setInterval(() => {
+      this.refreshSubtitle();
+    }, 100);
+  }
+
+  /**
+   * 刷新当前该显示的字幕
+   *
+   * 两条来源的优先级：**外挂优先于内嵌**。
+   *
+   * 为什么外挂优先：用户主动去选一个外挂字幕，就是明确表示"我要用这个"，
+   * 通常是因为内嵌字幕语言不对或者质量差。这时如果还让内嵌字幕盖在上面，
+   * 等于无视用户的明确意图。
+   */
+  /**
+   * 刷新当前该显示的字幕
+   *
+   * 两条来源的优先级：**外挂优先于内嵌**。
+   *
+   * 为什么外挂优先：用户主动去选一个外挂字幕，就是明确表示"我要用这个"，
+   * 通常是因为内嵌字幕语言不对或者质量差。这时如果还让内嵌字幕盖在上面，
+   * 等于无视用户的明确意图。
+   */
+  private refreshSubtitle(): void {
+    const sc: SoftPlayerController | undefined = this.softCtl;
+    const extReady: boolean = this.usingExternalSubtitle && externalSubtitle.loaded;
+    if (this.showTrackPanel) {
+      // 面板打开时不刷新：面板是模态的，字幕跟着动反而干扰阅读
+      return;
+    }
+    if (extReady) {
+      const t: string = externalSubtitle.textAt(this.positionMs);
+      if (t !== this.subtitleText) {
+        this.subtitleText = t;
+      }
+      return;
+    }
+    if (sc === undefined) {
+      if (this.subtitleText.length > 0) {
+        this.subtitleText = '';
+      }
+      return;
+    }
+    const t2: string = sc.getActiveSubtitle();
+    if (t2 !== this.subtitleText) {
+      this.subtitleText = t2;
+    }
   }
 
   aboutToDisappear(): void {
     this.writeDiag('aboutToDisappear pos=' + this.positionMs.toString()
       + ' dur=' + this.durationMs.toString());
+    // 先停字幕定时器：它每 100ms 会调一次原生 getActiveSubtitle，
+    // 而下面马上就要释放原生播放器 —— 不停掉就会在释放后继续调用，
+    // 轻则报错刷日志，重则碰到已释放的对象
+    if (this.subtitleTimer >= 0) {
+      clearInterval(this.subtitleTimer);
+      this.subtitleTimer = -1;
+    }
     // ★ 第一步：先解绑 surface，再往下走。
     //
     //   顺序在这里是决定性的。XComponent 随页面销毁时，ArkUI 会析构它的
@@ -498,6 +649,7 @@ struct PlayerPage {
       this.errorMsg = '软解失败：' + snap.error;
       return;
     }
+
     // 诊断：确认软解报上来的时长到底是数字还是别的类型
     if (this.tickCount === 0) {
       this.tickCount = 1;
@@ -520,6 +672,30 @@ struct PlayerPage {
     // 播放位置（拖动时不要被回写覆盖）
     if (!this.dragging) {
       this.positionMs = snap.positionMs;
+    }
+
+    // ★ 轨道状态每次都跟着快照同步，不要只在打开面板时才刷新。
+    //
+    //   踩过的坑：底部那两个按钮的文字（"音轨 1/3"、"字幕 2"）是从
+    //   audioTracks / subtitleTracks / currentXxxIndex 算出来的，
+    //   而这些 @State 原先只在 toggleTrackPanel() 里赋值。
+    //   结果是"进了播放页但没打开过面板"时，按钮永远显示"字幕 -"
+    //   —— 因为 subtitleTracks 是空数组，findIndex 返回 -1。
+    //   把同步放到快照更新里，按钮文字在任何时刻都是准的。
+    if (snap.audioTracks.length > 0 && this.audioTracks.length === 0) {
+      this.audioTracks = snap.audioTracks;
+    }
+    if (snap.subtitleTracks.length > 0 && this.subtitleTracks.length === 0) {
+      this.subtitleTracks = snap.subtitleTracks;
+    }
+    if (snap.currentAudioIndex !== this.currentAudioIndex) {
+      this.currentAudioIndex = snap.currentAudioIndex;
+    }
+    // 内嵌字幕轨下标变化时同步；外挂生效时不动它（外挂优先，
+    // 此时内嵌下标可能是 -1，界面靠 usingExternalSubtitle 区分）
+    if (!this.usingExternalSubtitle
+        && snap.currentSubtitleIndex !== this.currentSubtitleIndex) {
+      this.currentSubtitleIndex = snap.currentSubtitleIndex;
     }
 
     const st: SoftPlayerState = snap.state;
@@ -963,6 +1139,432 @@ struct PlayerPage {
     this.getUIContext().getRouter().back();
   }
 
+  // ==================== 音轨 / 字幕操作（2026-09-29 新增） ====================
+
+  /**
+   * 打开/关闭音轨字幕面板
+   *
+   * 打开时从控制器快照刷新一次轨道列表 —— 而不是用 @State 一直同步：
+   * 轨道列表在播放期间不会变，只在 Prepare 之后才有值，
+   * 需要时读一次最省事（也避免快照每次更新都触发列表重绘）。
+   */
+  private toggleTrackPanel(): void {
+    if (this.showTrackPanel) {
+      this.showTrackPanel = false;
+      return;
+    }
+    const sc: SoftPlayerController | undefined = this.softCtl;
+    if (sc !== undefined) {
+      const snap: SoftPlayerSnapshot = sc.getSnapshot();
+      this.audioTracks = snap.audioTracks;
+      this.subtitleTracks = snap.subtitleTracks;
+      this.currentAudioIndex = snap.currentAudioIndex;
+      this.currentSubtitleIndex = snap.currentSubtitleIndex;
+    }
+    this.trackNotice = '';
+    this.showTrackPanel = true;
+  }
+
+  /** 切换音轨 */
+  private chooseAudioTrack(index: number): void {
+    const sc: SoftPlayerController | undefined = this.softCtl;
+    if (sc === undefined) {
+      this.trackNotice = '当前不是软解播放，无法切换音轨';
+      return;
+    }
+    if (index === this.currentAudioIndex) {
+      return;
+    }
+    this.trackNotice = '正在切换音轨…';
+    const r: number = sc.switchAudioTrack(index);
+    if (r === 0) {
+      this.currentAudioIndex = sc.getSnapshot().currentAudioIndex;
+      this.trackNotice = '';
+      this.writeDiag('切换音轨到 ' + index.toString() + ' 成功');
+    } else {
+      this.trackNotice = '切换音轨失败（错误码 ' + r.toString() + '）';
+      this.writeDiag('切换音轨到 ' + index.toString() + ' 失败: ' + r.toString());
+    }
+  }
+
+  /**
+   * 选择内嵌字幕轨
+   * @param index 流下标；-1 表示关闭内嵌字幕
+   */
+  private chooseEmbeddedSubtitle(index: number): void {
+    const sc: SoftPlayerController | undefined = this.softCtl;
+    if (sc === undefined) {
+      this.trackNotice = '当前不是软解播放，无法启用内嵌字幕';
+      return;
+    }
+    if (index === this.currentSubtitleIndex && !this.usingExternalSubtitle) {
+      return;
+    }
+    this.trackNotice = index < 0 ? '正在关闭字幕…' : '正在启用内嵌字幕…';
+    const r: number = sc.setSubtitleTrack(index);
+    if (r === 0) {
+      this.currentSubtitleIndex = sc.getSnapshot().currentSubtitleIndex;
+      // 选内嵌字幕就自动关掉外挂 —— 两条来源互斥，
+      // 否则会出现两行字幕叠在一起
+      this.usingExternalSubtitle = false;
+      setExternalActive(false);
+      externalSubtitle.clear();
+      this.externalSubtitleName = '';
+      this.subtitleText = '';
+      this.trackNotice = '';
+      this.writeDiag('内嵌字幕轨设为 ' + index.toString());
+    } else {
+      this.trackNotice = '启用内嵌字幕失败（错误码 ' + r.toString() + '）';
+    }
+  }
+
+  /** 用同目录发现的候选外挂字幕 */
+  private async useSidecarSubtitle(cand: SubtitleCandidate): Promise<void> {
+    this.trackNotice = '正在加载 ' + cand.name + ' …';
+    const res = await loadSubtitleFile(cand.path);
+    if (res.error.length > 0) {
+      this.trackNotice = '加载失败：' + res.error;
+      return;
+    }
+    await this.enableExternalSubtitle(cand.name);
+    this.trackNotice = '';
+    this.writeDiag('外挂字幕已加载: ' + cand.name + ' 共 '
+      + res.count.toString() + ' 条');
+  }
+
+  /**
+   * 外挂字幕生效后的共同收尾
+   *
+   * 为什么要关掉内嵌字幕：两者会同时显示，叠字几乎不可读。
+   * 用户主动选了外挂，就说明要以它为准。
+   */
+  private async enableExternalSubtitle(name: string): Promise<void> {
+    this.usingExternalSubtitle = true;
+    // 模块级状态也要同步：播放页重建时要靠它决定"是否恢复上次的外挂字幕"
+    setExternalActive(true);
+    this.externalSubtitleName = name;
+    // 关掉内嵌字幕（如果开着）。传 -1 只停消费端、不重开会话，
+    // 所以不会有播放中断。
+    const sc: SoftPlayerController | undefined = this.softCtl;
+    if (sc !== undefined && this.currentSubtitleIndex >= 0) {
+      sc.setSubtitleTrack(-1);
+      this.currentSubtitleIndex = -1;
+    }
+    this.subtitleText = externalSubtitle.textAt(this.positionMs);
+  }
+
+  /** 关闭外挂字幕 */
+  private disableExternalSubtitle(): void {
+    this.usingExternalSubtitle = false;
+    setExternalActive(false);
+    externalSubtitle.clear();
+    this.externalSubtitleName = '';
+    this.subtitleText = '';
+    this.writeDiag('外挂字幕已关闭');
+  }
+
+  /** 用系统文件选择器挑一个外挂字幕 */
+  private async pickExternalSubtitle(): Promise<void> {
+    let destDir: string = '';
+    try {
+      const ctx = this.getUIContext().getHostContext() as commonKit.UIAbilityContext;
+      destDir = ctx.filesDir + '/subtitles';
+      if (!fileIo.accessSync(destDir)) {
+        fileIo.mkdirSync(destDir);
+      }
+      this.trackNotice = '请选择字幕文件…';
+      const res = await pickSubtitleFile(ctx, destDir);
+      if (res.error.length > 0) {
+        this.trackNotice = res.error;
+        return;
+      }
+      await this.enableExternalSubtitle(externalSubtitle.name);
+      this.trackNotice = '';
+      this.writeDiag('外挂字幕已导入: ' + externalSubtitle.name + ' 共 '
+        + res.count.toString() + ' 条');
+    } catch (err) {
+      const e = err as BusinessError;
+      this.trackNotice = '选择字幕失败：' + (e.message !== undefined ? e.message : '未知错误');
+    }
+  }
+
+  // ---- 面板上用的文案 ----
+
+  /** 底部"音轨"按钮的文字 */
+  private audioTracksLabel(): string {
+    if (this.audioTracks.length <= 1) {
+      return '音轨';
+    }
+    const n: number = this.audioTracks.findIndex((t: SoftAudioTrack) =>
+      t.index === this.currentAudioIndex);
+    return '音轨 ' + (n >= 0 ? (n + 1).toString() : '-') + '/'
+      + this.audioTracks.length.toString();
+  }
+
+  /** 底部"字幕"按钮的文字 */
+  private subtitleLabel(): string {
+    if (this.usingExternalSubtitle) {
+      return '字幕·外挂';
+    }
+    if (this.currentSubtitleIndex >= 0) {
+      const n: number = this.subtitleTracks.findIndex((t: SoftSubtitleTrack) =>
+        t.index === this.currentSubtitleIndex);
+      return '字幕 ' + (n >= 0 ? (n + 1).toString() : '-');
+    }
+    return '字幕';
+  }
+
+  /**
+   * 一条音轨在面板上显示的文字
+   *
+   * 音轨的"编号"要用列表序号而不是流下标 —— 流下标是容器内部编号，
+   * 可能是 1、3、7 这种跳号，直接显示会让人以为少了几条。
+   */
+  private audioTrackLabel(t: SoftAudioTrack, i: number): string {
+    const parts: string[] = [];
+    parts.push('音轨 ' + (i + 1).toString());
+    if (t.title.length > 0) {
+      parts.push(t.title);
+    }
+    if (t.language.length > 0) {
+      parts.push(translateLanguage(t.language));
+    }
+    if (t.channels > 0) {
+      parts.push(channelLabel(t.channels));
+    }
+    parts.push(t.codec.toUpperCase());
+    if (t.bitRate > 0) {
+      parts.push(Math.round(t.bitRate / 1000).toString() + ' kbps');
+    }
+    if (t.isDefault) {
+      parts.push('默认');
+    }
+    return parts.join(' · ');
+  }
+
+  /** 一条字幕轨在面板上显示的文字 */
+  private subtitleTrackLabel(t: SoftSubtitleTrack, i: number): string {
+    const parts: string[] = [];
+    parts.push('字幕 ' + (i + 1).toString());
+    if (t.title.length > 0) {
+      parts.push(t.title);
+    }
+    if (t.language.length > 0) {
+      parts.push(translateLanguage(t.language));
+    }
+    parts.push(t.codec.toUpperCase());
+    if (t.isDefault) {
+      parts.push('默认');
+    }
+    if (!t.supported) {
+      parts.push('图形字幕，暂不支持');
+    }
+    return parts.join(' · ');
+  }
+
+  /**
+   * 音轨 / 字幕选择面板
+   *
+   * 设计取舍：
+   *   · 用底部弹出面板而不是新页面 —— 换音轨/换字幕都是"边看边调"的动作，
+   *     跳走一页再回来会打断观看，而且新页面还得重新绑定 surface。
+   *   · 面板里轨道用 List 而不是 Column：一部片子可能有十几条字幕轨
+   *     （多语言 + 评论轨），Column 会把面板撑出屏幕。
+   */
+  @Builder
+  TrackPanel() {
+    Column({ space: 0 }) {
+      // ---- 标题栏 ----
+      Row() {
+        Text('音轨与字幕')
+          .fontSize(16)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Color.White)
+          .layoutWeight(1)
+        Text('✕')
+          .fontSize(18)
+          .fontColor('rgba(255,255,255,0.70)')
+          .padding(8)
+          .onClick(() => {
+            this.showTrackPanel = false;
+          })
+      }
+      .width('100%')
+      .padding({ left: 20, right: 12, top: 14, bottom: 10 })
+
+      // ---- 操作提示 ----
+      if (this.trackNotice.length > 0) {
+        Text(this.trackNotice)
+          .fontSize(12)
+          .fontColor(Theme.ACCENT)
+          .width('100%')
+          .padding({ left: 20, right: 20, bottom: 8 })
+      }
+
+      List({ space: 0 }) {
+        // ============ 音轨 ============
+        ListItem() {
+          Text('音轨')
+            .fontSize(12)
+            .fontColor('rgba(255,255,255,0.50)')
+            .width('100%')
+            .padding({ left: 20, top: 6, bottom: 6 })
+        }
+
+        if (this.audioTracks.length === 0) {
+          ListItem() {
+            Text('当前文件没有可切换的音轨')
+              .fontSize(13)
+              .fontColor('rgba(255,255,255,0.45)')
+              .width('100%')
+              .padding({ left: 20, top: 10, bottom: 10 })
+          }
+        }
+        ForEach(this.audioTracks, (t: SoftAudioTrack, i: number) => {
+          ListItem() {
+            Row({ space: 10 }) {
+              Text(this.currentAudioIndex === t.index ? '●' : '○')
+                .fontSize(14)
+                .fontColor(this.currentAudioIndex === t.index
+                  ? Theme.ACCENT : 'rgba(255,255,255,0.40)')
+              Text(this.audioTrackLabel(t, i))
+                .fontSize(13)
+                .fontColor(Color.White)
+                .layoutWeight(1)
+                .maxLines(2)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .width('100%')
+            .padding({ left: 20, right: 20, top: 12, bottom: 12 })
+            .onClick(() => {
+              this.chooseAudioTrack(t.index);
+            })
+          }
+        }, (t: SoftAudioTrack) => 'a' + t.index.toString())
+
+        // ============ 字幕 ============
+        ListItem() {
+          Text('字幕')
+            .fontSize(12)
+            .fontColor('rgba(255,255,255,0.50)')
+            .width('100%')
+            .padding({ left: 20, top: 14, bottom: 6 })
+        }
+
+        // 「关闭字幕」永远在第一项：用户想关字幕时不该还要先找
+        ListItem() {
+          Row({ space: 10 }) {
+            Text((this.currentSubtitleIndex < 0 && !this.usingExternalSubtitle)
+              ? '●' : '○')
+              .fontSize(14)
+              .fontColor((this.currentSubtitleIndex < 0 && !this.usingExternalSubtitle)
+                ? Theme.ACCENT : 'rgba(255,255,255,0.40)')
+            Text('关闭字幕')
+              .fontSize(13)
+              .fontColor(Color.White)
+              .layoutWeight(1)
+          }
+          .width('100%')
+          .padding({ left: 20, right: 20, top: 12, bottom: 12 })
+          .onClick(() => {
+            // 两条来源都要关：只关一个的话另一个会继续显示，
+            // 用户点了"关闭字幕"却还有字，会以为功能坏了
+            this.chooseEmbeddedSubtitle(-1);
+            this.disableExternalSubtitle();
+          })
+        }
+
+        // 内嵌字幕轨
+        ForEach(this.subtitleTracks, (t: SoftSubtitleTrack, i: number) => {
+          ListItem() {
+            Row({ space: 10 }) {
+              Text((this.currentSubtitleIndex === t.index && !this.usingExternalSubtitle)
+                ? '●' : '○')
+                .fontSize(14)
+                .fontColor((this.currentSubtitleIndex === t.index
+                  && !this.usingExternalSubtitle)
+                  ? Theme.ACCENT : 'rgba(255,255,255,0.40)')
+              Text('内嵌 · ' + this.subtitleTrackLabel(t, i))
+                .fontSize(13)
+                .fontColor(t.supported ? Color.White : 'rgba(255,255,255,0.42)')
+                .layoutWeight(1)
+                .maxLines(2)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .width('100%')
+            .padding({ left: 20, right: 20, top: 12, bottom: 12 })
+            .onClick(() => {
+              if (!t.supported) {
+                // 明确告知而不是静默忽略：用户点了没反应最让人困惑
+                this.trackNotice = '该轨道是图形字幕（PGS/VobSub），本播放器只支持文本字幕';
+                return;
+              }
+              this.chooseEmbeddedSubtitle(t.index);
+            })
+          }
+        }, (t: SoftSubtitleTrack) => 's' + t.index.toString())
+
+        // 同目录发现的外挂字幕
+        ForEach(this.sidecarCandidates, (c: SubtitleCandidate) => {
+          ListItem() {
+            Row({ space: 10 }) {
+              Text((this.usingExternalSubtitle && this.externalSubtitleName === c.name)
+                ? '●' : '○')
+                .fontSize(14)
+                .fontColor((this.usingExternalSubtitle
+                  && this.externalSubtitleName === c.name)
+                  ? Theme.ACCENT : 'rgba(255,255,255,0.40)')
+              Text('外挂 · ' + c.name)
+                .fontSize(13)
+                .fontColor(Color.White)
+                .layoutWeight(1)
+                .maxLines(2)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .width('100%')
+            .padding({ left: 20, right: 20, top: 12, bottom: 12 })
+            .onClick(() => {
+              this.useSidecarSubtitle(c);
+            })
+          }
+        }, (c: SubtitleCandidate) => 'x' + c.path)
+
+        // 手动选外挂字幕文件
+        ListItem() {
+          Text('＋ 从文件选择外挂字幕…')
+            .fontSize(13)
+            .fontColor(Theme.ACCENT)
+            .width('100%')
+            .padding({ left: 20, right: 20, top: 14, bottom: 14 })
+            .onClick(() => {
+              this.pickExternalSubtitle();
+            })
+        }
+
+        // 关闭外挂字幕（仅在启用时出现）
+        if (this.usingExternalSubtitle) {
+          ListItem() {
+            Text('关闭外挂字幕')
+              .fontSize(13)
+              .fontColor('rgba(255,255,255,0.70)')
+              .width('100%')
+              .padding({ left: 20, right: 20, top: 12, bottom: 20 })
+              .onClick(() => {
+                this.disableExternalSubtitle();
+              })
+          }
+        }
+      }
+      .width('100%')
+      // 高度给上限：轨道多的时候内部滚动，少的时候也不会留一大片空白
+      .constraintSize({ maxHeight: 420 })
+    }
+    .width('100%')
+    .backgroundColor('#F21A1A1E')
+    .borderRadius({ topLeft: 18, topRight: 18 })
+    .padding({ bottom: 12 })
+  }
+
   build() {
     // ===================== 布局要点（踩过三次坑后的最终做法） =====================
     //
@@ -1076,10 +1678,63 @@ struct PlayerPage {
           })
         }
 
-        // ===== 2.2 弹性空隙：吃掉全部剩余高度，把底栏推到底部 =====
+        // ===== 2.2 字幕层 =====
+        //
+        // ★ 这里踩过一次坑，记下来避免重犯：
+        //   第一版写成 Column { Blank().layoutWeight(4); Text(字幕); Blank().height(150) }
+        //   并且给这个 Column 设了 .height('100%')。
+        //   结果 layoutWeight 的弹性把整个 100% 高度吃光了，
+        //   紧跟其后的 Blank 与底部控制栏被挤成 0 高度 —— 实测布局转储里
+        //   控制栏那两个子节点是 `Blank [[0,2205][1084,2412]]`（高度为 0），
+        //   也就是"控制栏整个消失了"。而它的 if (this.showControls) 明明是 true，
+        //   极容易误判成状态问题去查半天。
+        //
+        //   正确做法：用 Stack + .position() 把字幕层**绝对定位**在底部固定高度里。
+        //   绝对定位不参与父级的高度分配，挤压问题从根上消失。
+        //
+        //   ★ 第二版又踩了一个小坑：写成 .position({ x: 0, y: '100%' })，
+        //     想用"父高度的 100%"把元素压到底边。但 100% 正好等于父高，
+        //     元素起点落在父容器之外，实测布局转储里这个节点干脆不出现
+        //     （既不报错也不显示，最难查）。改成用 .alignContent(Alignment.Bottom)
+        //     做定位锚点，再用 padding 给控制栏留位置 —— 全部是确定值，
+        //     不依赖百分比解析。
+        Stack() {
+          if (this.subtitleText.length > 0) {
+            Text(this.subtitleText)
+              .fontSize(18)
+              .fontColor(Color.White)
+              .maxLines(3)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .textAlign(TextAlign.Center)
+              .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+              // 半透明底衬：白色字幕压在亮画面上会看不清，
+              // 而描边在 ArkUI 里要配多个 Text 叠放，代价大于收益
+              .backgroundColor('rgba(0,0,0,0.45)')
+              .borderRadius(6)
+              .width('92%')
+          }
+        }
+        .width('100%')
+        // ★ 这里连着调了三版才对，把结论写清楚，别再试错：
+        //   ArkUI 的 .offset 是相对**元素自身布局位置**的位移，而本层在
+        //   Column 里排在"顶栏 + 视频区"之后，自身布局位置本来就在屏幕中部偏下。
+        //   给它加负 y 会继续**往上**推，加正的才往下 —— 我按"负值是往下"想，
+        //   结果字幕越调越靠上，一路跑到了标题栏底下。
+        //
+        //   与其推算布局位置，不如直接用 .position() 用绝对坐标锚定：
+        //   高度 270、起点 y=1500 → 字幕带落在 y≈1680..1740，
+        //   正好在画面下沿、进度条（y≈1976）上方，且与视频区（901..1511）相接。
+        //   绝对定位还不参与 Column 的高度分配，不会挤压控制栏。
+        .height(270)
+        .position({ x: 0, y: 1500 })
+        .alignContent(Alignment.Bottom)
+        // 字幕层不吃点击：否则会在字幕区域挡住"点屏幕唤出控制栏"
+        .hitTestBehavior(HitTestMode.Transparent)
+
+        // ===== 2.3 弹性空隙：吃掉全部剩余高度，把底栏推到底部 =====
         Blank()
 
-        // ===== 2.3 底部控制栏（贴底） =====
+        // ===== 2.4 底部控制栏（贴底） =====
         if (this.showControls) {
           Column({ space: 10 }) {
             // ---- 进度条行 ----
@@ -1147,6 +1802,36 @@ struct PlayerPage {
             }
             .justifyContent(FlexAlign.Center)
             .width('100%')
+
+            // ---- 音轨 / 字幕入口 ----
+            //
+            // 为什么单独占一行而不是塞进上面的按钮行：
+            //   播放按钮那一行已经占了 24+34+24 的字号和 32 的间距，
+            //   再塞进去会在窄屏（竖屏 360vp）上挤成一团。
+            //   而且这两个是"低频但重要"的操作，独立一行更好点中。
+            Row({ space: 28 }) {
+              Text(this.audioTracksLabel())
+                .fontSize(13)
+                .fontColor(this.audioTracks.length > 1 ? Color.White : 'rgba(255,255,255,0.40)')
+                .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+                .borderRadius(14)
+                .backgroundColor('rgba(255,255,255,0.14)')
+                .onClick(() => {
+                  this.toggleTrackPanel();
+                })
+
+              Text(this.subtitleLabel())
+                .fontSize(13)
+                .fontColor(Color.White)
+                .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+                .borderRadius(14)
+                .backgroundColor('rgba(255,255,255,0.14)')
+                .onClick(() => {
+                  this.toggleTrackPanel();
+                })
+            }
+            .justifyContent(FlexAlign.Center)
+            .width('100%')
           }
           .width('100%')
           .alignItems(HorizontalAlign.Center)
@@ -1198,6 +1883,26 @@ struct PlayerPage {
         .height('100%')
         .justifyContent(FlexAlign.Center)
         .backgroundColor('rgba(0,0,0,0.85)')
+      }
+
+      // ---------- 5. 音轨 / 字幕面板（最上层） ----------
+      //
+      // 放在最后：Stack 里"后写的在上层"，面板必须盖住控制栏与字幕层。
+      if (this.showTrackPanel) {
+        Column() {
+          // 半透明遮罩：点空白处关闭面板（下方整块绑定 onClick）
+          Column()
+            .width('100%')
+            .layoutWeight(1)
+            .onClick(() => {
+              this.showTrackPanel = false;
+            })
+
+          this.TrackPanel()
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('rgba(0,0,0,0.55)')
       }
     }
     .width('100%')

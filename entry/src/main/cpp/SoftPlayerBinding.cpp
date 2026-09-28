@@ -376,7 +376,136 @@ napi_value SoftPlayerBinding::JsGetMediaInfo(napi_env env, napi_callback_info in
     napi_set_named_property(env, obj, "hasVideo", v);
     napi_get_boolean(env, mi.hasAudio, &v);
     napi_set_named_property(env, obj, "hasAudio", v);
+
+    // ---- 轨道列表（2026-09-29 新增）----
+    //
+    // 为什么要在这里转成 JS 数组而不是让 ArkTS 侧逐个查询：
+    //   轨道数量很少（通常 1~8 条），一次性给完最省事；
+    //   分次查询就得为"查第 i 条"设计一个按索引取字段的接口，
+    //   反而更啰嗦也更容易在 napi 边界上出错。
+    napi_value audioArr = nullptr;
+    napi_create_array_with_length(env, mi.audioTracks.size(), &audioArr);
+    for (size_t i = 0; i < mi.audioTracks.size(); i++) {
+        const AudioTrackInfo &t = mi.audioTracks[i];
+        napi_value item = nullptr;
+        napi_create_object(env, &item);
+        napi_create_int32(env, t.index, &v);
+        napi_set_named_property(env, item, "index", v);
+        napi_create_string_utf8(env, t.codec.c_str(), t.codec.size(), &v);
+        napi_set_named_property(env, item, "codec", v);
+        napi_create_string_utf8(env, t.language.c_str(), t.language.size(), &v);
+        napi_set_named_property(env, item, "language", v);
+        napi_create_string_utf8(env, t.title.c_str(), t.title.size(), &v);
+        napi_set_named_property(env, item, "title", v);
+        napi_create_int32(env, t.channels, &v);
+        napi_set_named_property(env, item, "channels", v);
+        napi_create_int32(env, t.sampleRate, &v);
+        napi_set_named_property(env, item, "sampleRate", v);
+        napi_create_int64(env, t.bitRate, &v);
+        napi_set_named_property(env, item, "bitRate", v);
+        napi_get_boolean(env, t.isDefault, &v);
+        napi_set_named_property(env, item, "isDefault", v);
+        napi_set_element(env, audioArr, static_cast<uint32_t>(i), item);
+    }
+    napi_set_named_property(env, obj, "audioTracks", audioArr);
+
+    napi_value subArr = nullptr;
+    napi_create_array_with_length(env, mi.subtitleTracks.size(), &subArr);
+    for (size_t i = 0; i < mi.subtitleTracks.size(); i++) {
+        const SubtitleTrackInfo &t = mi.subtitleTracks[i];
+        napi_value item = nullptr;
+        napi_create_object(env, &item);
+        napi_create_int32(env, t.index, &v);
+        napi_set_named_property(env, item, "index", v);
+        napi_create_string_utf8(env, t.codec.c_str(), t.codec.size(), &v);
+        napi_set_named_property(env, item, "codec", v);
+        napi_create_string_utf8(env, t.language.c_str(), t.language.size(), &v);
+        napi_set_named_property(env, item, "language", v);
+        napi_create_string_utf8(env, t.title.c_str(), t.title.size(), &v);
+        napi_set_named_property(env, item, "title", v);
+        napi_get_boolean(env, t.isDefault, &v);
+        napi_set_named_property(env, item, "isDefault", v);
+        // supported 必须传下去：界面要根据它把图形字幕显示成"不支持"，
+        // 而不是让用户点了之后毫无反应
+        napi_get_boolean(env, t.supported, &v);
+        napi_set_named_property(env, item, "supported", v);
+        napi_set_element(env, subArr, static_cast<uint32_t>(i), item);
+    }
+    napi_set_named_property(env, obj, "subtitleTracks", subArr);
+
+    napi_create_int32(env, mi.currentAudioIndex, &v);
+    napi_set_named_property(env, obj, "currentAudioIndex", v);
+    napi_create_int32(env, mi.currentSubtitleIndex, &v);
+    napi_set_named_property(env, obj, "currentSubtitleIndex", v);
     return obj;
+}
+
+napi_value SoftPlayerBinding::JsSwitchAudioTrack(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1] = { nullptr };
+    SoftPlayerBinding *self = Unwrap(env, info, &argc, argv);
+    napi_value ret = nullptr;
+    if (self == nullptr || self->released_.load() || !self->engine_) {
+        napi_create_int32(env, -1, &ret);
+        return ret;
+    }
+    int32_t idx = -1;
+    if (argc >= 1) {
+        napi_get_value_int32(env, argv[0], &idx);
+    }
+    napi_create_int32(env, self->engine_->SwitchAudioTrack(idx), &ret);
+    return ret;
+}
+
+napi_value SoftPlayerBinding::JsSetSubtitleTrack(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1] = { nullptr };
+    SoftPlayerBinding *self = Unwrap(env, info, &argc, argv);
+    napi_value ret = nullptr;
+    if (self == nullptr || self->released_.load() || !self->engine_) {
+        napi_create_int32(env, -1, &ret);
+        return ret;
+    }
+    int32_t idx = -1;   // 缺省 -1 = 关闭字幕
+    if (argc >= 1) {
+        napi_get_value_int32(env, argv[0], &idx);
+    }
+    napi_create_int32(env, self->engine_->SetSubtitleTrack(idx), &ret);
+    return ret;
+}
+
+napi_value SoftPlayerBinding::JsGetActiveSubtitle(napi_env env, napi_callback_info info)
+{
+    size_t argc = 0;
+    SoftPlayerBinding *self = Unwrap(env, info, &argc, nullptr);
+    // 没有字幕时返回空字符串而不是 null：
+    // ArkTS 侧拿到的类型稳定（永远是 string），界面逻辑不用做 null 判断，
+    // 而且 "" 直接绑到 Text 上就是"不显示"，正好是想要的效果。
+    napi_value ret = nullptr;
+    std::string text;
+    if (self != nullptr && !self->released_.load() && self->engine_) {
+        SubtitleCue cue;
+        if (self->engine_->GetActiveSubtitle(cue)) {
+            text = cue.text;
+        }
+    }
+    napi_create_string_utf8(env, text.c_str(), text.size(), &ret);
+    return ret;
+}
+
+napi_value SoftPlayerBinding::JsCanSwitchAudioTrack(napi_env env, napi_callback_info info)
+{
+    size_t argc = 0;
+    SoftPlayerBinding *self = Unwrap(env, info, &argc, nullptr);
+    bool can = false;
+    if (self != nullptr && !self->released_.load() && self->engine_) {
+        can = self->engine_->CanSwitchAudioTrack();
+    }
+    napi_value ret = nullptr;
+    napi_get_boolean(env, can, &ret);
+    return ret;
 }
 
 /* ============================================================
@@ -397,6 +526,10 @@ napi_value SoftPlayerBinding::Init(napi_env env, napi_value exports)
         { "getDuration", nullptr, JsGetDuration, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getPosition", nullptr, JsGetPosition, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getMediaInfo", nullptr, JsGetMediaInfo, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "switchAudioTrack", nullptr, JsSwitchAudioTrack, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setSubtitleTrack", nullptr, JsSetSubtitleTrack, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "getActiveSubtitle", nullptr, JsGetActiveSubtitle, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "canSwitchAudioTrack", nullptr, JsCanSwitchAudioTrack, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "pollEvents", nullptr, JsPollEvents, nullptr, nullptr, nullptr, napi_default, nullptr }
     };
     napi_value cls = nullptr;

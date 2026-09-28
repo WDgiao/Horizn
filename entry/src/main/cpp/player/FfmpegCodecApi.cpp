@@ -41,12 +41,15 @@ extern "C" {
 
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
 
 #endif  // SOFT_PLAYER_WITH_FFMPEG
 
@@ -324,6 +327,16 @@ constexpr int32_t kAudioSampleRate = 48000;
 constexpr int32_t kAudioChannels = 2;
 
 /**
+ * 字幕兜底显示时长（毫秒）
+ *
+ * 用于"容器只给开始时间、不给持续时间"的字幕包（MKV / MP4 里的文本字幕
+ * 大多如此）。取 4 秒的理由：真人语速读一行字幕通常 1.5~3 秒，4 秒足够
+ * 覆盖绝大多数情况；而偏长是无害的 —— 播放器在匹配到下一条字幕时会把
+ * 当前这条替换掉，不会两条同时挂着（见引擎侧的匹配逻辑）。
+ */
+constexpr int64_t kSubtitleFallbackMs = 4000;
+
+/**
  * 一次会话的全部 FFmpeg 状态
  *
  * 命名注意：不能叫 Session —— 那会和公开接口里的
@@ -448,10 +461,50 @@ struct DecoderSession {
      */
     std::unique_ptr<PacketQueue> videoQueue;
     std::unique_ptr<PacketQueue> audioQueue;
+    /**
+     * 字幕包队列
+     *
+     * 只在 selectedSubtitleIndex >= 0 时创建并投递。没选字幕轨时
+     * 解复用线程仍然会读到字幕包（容器里就是有这些包），但直接丢弃 ——
+     * 不建队列、不占内存，也就没有解码开销。
+     */
+    std::unique_ptr<PacketQueue> subtitleQueue;
     /** 专职解复用线程 */
     std::thread demuxThread;
     /** 线程对象是否已创建（决定要不要 join） */
     std::atomic<bool> demuxThreadStarted{false};
+
+    // ---------- 字幕（2026-09-29 新增）----------
+    /**
+     * 字幕解码器上下文
+     *
+     * 这里有个必须写下来的结论：**本构建的 FFmpeg 没有编入任何字幕解码器**。
+     * 回读 config_components.h 全是 0：
+     *     CONFIG_SUBRIP_DECODER 0 / CONFIG_ASS_DECODER 0 /
+     *     CONFIG_MOVTEXT_DECODER 0 / CONFIG_WEBVTT_DECODER 0 /
+     *     CONFIG_TEXT_DECODER 0 / CONFIG_SSA_DECODER 0
+     * 所以 subtitleCtx **实际上一直是 nullptr**，走的是下面 SelfDecodeSubtitle()
+     * 那条自实现的解析路径。
+     *
+     * 保留这个字段而不是删掉，是为了：
+     *   ① 将来若重编 FFmpeg 带上字幕解码器，改一处就能切回官方解码器；
+     *   ② 代码意图清楚 —— 「优先用官方解码器、没有才自己解」。
+     */
+    AVCodecContext *subtitleCtx = nullptr;
+    int subtitleStreamIndex = -1;
+    /** 字幕流时间基 */
+    AVRational subtitleTimeBase{1, 1000};
+    /** 字幕解码器输出的帧（仅当 subtitleCtx 非空时使用） */
+    AVFrame *subtitleFrame = nullptr;
+    /**
+     * 自实现解析用的 AVPacket 容器
+     *
+     * 与 videoPacket / audioPacket 同理：每个消费者必须有自己的一份。
+     * 见上面那段"一个线程一个 packet"的说明。
+     */
+    AVPacket *subtitlePacket = nullptr;
+    /** 诊断用：已产出的字幕条数 */
+    int32_t subtitleCount = 0;
 
     /**
      * 待执行的 seek 目标（毫秒），-1 表示没有
@@ -512,6 +565,381 @@ std::string AvErr(int err) {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
     av_strerror(err, buf, sizeof(buf));
     return std::string(buf);
+}
+
+// ==================== 字幕支持（2026-09-29 新增） ====================
+//
+// ★ 先写清楚为什么这里要"自己解字幕"，而不是调 avcodec：
+//
+//   回读本构建的 config_components.h，**所有字幕解码器都是 0**：
+//       CONFIG_SUBRIP_DECODER 0    CONFIG_ASS_DECODER 0
+//       CONFIG_SSA_DECODER 0       CONFIG_MOVTEXT_DECODER 0
+//       CONFIG_WEBVTT_DECODER 0    CONFIG_TEXT_DECODER 0
+//       CONFIG_DVDSUB_DECODER 0    CONFIG_PGSSUB_DECODER 0
+//   也就是说 avcodec_find_decoder(AV_CODEC_ID_SUBRIP) 会返回 nullptr，
+//   这条路根本走不通。
+//
+//   两条备选：
+//     (a) 重编 FFmpeg 带上 --enable-decoder=subrip,ass,ssa,mov_text,webvtt,text
+//     (b) 自己做文本字幕的解析
+//
+//   选了 (b)，理由是**风险与收益不成比例**：
+//     · 文本字幕的"解码"本质就是把包里的字节转成字符串，再按各自格式
+//       取一下起止时间。subrip / mov_text / webvtt / ASS 四种格式的解析
+//       加起来不到两百行，而且完全在我们自己代码里，不会被 FFmpeg
+//       版本变化或组件开关影响。
+//     · 重编 FFmpeg 要动已经验证过的 .so（AV1/VP9/RV/DTS 都测过了），
+//       一次配置漂移就可能悄悄改掉别的东西 —— 之前已经吃过一次
+//       "两个 configure 脚本漂移"的亏。
+//     · 唯一真正需要 FFmpeg 的是**位图字幕**（PGS / VobSub / DVB），
+//       那需要按调色板还原成图片再叠加，成本高得多，本次不做。
+//
+//   所以：文本字幕自解析，位图字幕明确列为"不支持"。
+
+/**
+ * 字幕编码 → 是否支持（文本型）+ 显示名
+ *
+ * @param codecId 流里的编码
+ * @param outName 输出：界面展示用的短名
+ * @return true 表示能用 SelfDecodeSubtitle 解出文本
+ */
+bool IsTextSubtitleCodec(AVCodecID codecId, std::string &outName) {
+    switch (codecId) {
+        case AV_CODEC_ID_SUBRIP:  outName = "SRT";      return true;
+        case AV_CODEC_ID_ASS:     outName = "ASS";      return true;
+        case AV_CODEC_ID_SSA:     outName = "SSA";      return true;
+        case AV_CODEC_ID_MOV_TEXT:outName = "MP4文字";  return true;
+        case AV_CODEC_ID_WEBVTT:  outName = "WebVTT";   return true;
+        case AV_CODEC_ID_TEXT:    outName = "文本";     return true;
+        // 以下都是位图字幕：列出来但标记不支持，让用户知道"轨道在、但放不了"
+        case AV_CODEC_ID_HDMV_PGS_SUBTITLE: outName = "PGS图形";   return false;
+        case AV_CODEC_ID_DVD_SUBTITLE:      outName = "DVD图形";   return false;
+        case AV_CODEC_ID_DVB_SUBTITLE:      outName = "DVB图形";   return false;
+        case AV_CODEC_ID_XSUB:              outName = "XSUB图形";  return false;
+        default:
+            outName = "未知字幕";
+            return false;
+    }
+}
+
+/**
+ * 把 "00:01:23,456" / "00:01:23.456" / "1:23:45.6" 这类时间串转成毫秒
+ *
+ * 为什么自己写而不调 av_parse_time：
+ *   这些字幕时间串的格式比 av_parse_time 支持的更宽松（毫秒位数不定、
+ *   小时位可能只有一位、分隔符是逗号或点），自己按冒号切最稳。
+ *
+ * @return 毫秒；解析失败返回 -1
+ */
+int64_t ParseSubtitleTime(const std::string &s) {
+    // 先去掉首尾空白
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) {
+        return -1;
+    }
+    size_t e = s.find_last_not_of(" \t\r\n");
+    std::string t = s.substr(b, e - b + 1);
+    // 逗号统一成点，方便后面统一处理小数
+    for (size_t i = 0; i < t.size(); i++) {
+        if (t[i] == ',') {
+            t[i] = '.';
+        }
+    }
+
+    // 按冒号切，最后一段带小数
+    std::vector<std::string> parts;
+    size_t start = 0;
+    while (true) {
+        const size_t colon = t.find(':', start);
+        if (colon == std::string::npos) {
+            parts.push_back(t.substr(start));
+            break;
+        }
+        parts.push_back(t.substr(start, colon - start));
+        start = colon + 1;
+        if (parts.size() > 3) {
+            return -1;   // 冒号太多，不是时间
+        }
+    }
+    if (parts.size() < 2 || parts.size() > 3) {
+        return -1;
+    }
+
+    // 解析 "秒.毫秒"
+    const size_t dot = parts.back().find('.');
+    std::string secStr = (dot == std::string::npos) ? parts.back()
+                                                    : parts.back().substr(0, dot);
+    std::string msStr = (dot == std::string::npos) ? "" : parts.back().substr(dot + 1);
+
+    // 全部必须是数字，否则不是时间（避免把正文误判成时间）
+    auto allDigits = [](const std::string &x) {
+        if (x.empty()) {
+            return false;
+        }
+        for (char c : x) {
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!allDigits(secStr) || (!msStr.empty() && !allDigits(msStr))) {
+        return -1;
+    }
+
+    int64_t hours = 0;
+    int64_t minutes = 0;
+    int64_t seconds = 0;
+    try {
+        if (parts.size() == 3) {
+            if (!allDigits(parts[0]) || !allDigits(parts[1])) {
+                return -1;
+            }
+            hours = std::stoll(parts[0]);
+            minutes = std::stoll(parts[1]);
+        } else {
+            minutes = std::stoll(parts[0]);
+        }
+        seconds = std::stoll(secStr);
+    } catch (...) {
+        return -1;
+    }
+
+    // 毫秒：把小数部分补齐/截断到 3 位
+    int64_t millis = 0;
+    if (!msStr.empty()) {
+        std::string m = msStr;
+        if (m.size() > 3) {
+            m = m.substr(0, 3);
+        }
+        while (m.size() < 3) {
+            m += '0';
+        }
+        try {
+            millis = std::stoll(m);
+        } catch (...) {
+            millis = 0;
+        }
+    }
+
+    return ((hours * 60 + minutes) * 60 + seconds) * 1000 + millis;
+}
+
+/**
+ * 清洗字幕文本
+ *
+ * 做三件事：
+ *   ① 去掉 ASS/SSA 的样式覆写标签 {\...}（例如 {\an8}{\pos(320,50)}）
+ *   ② 把 ASS 的硬换行 \N 和 \n 换成真换行
+ *   ③ 去掉 HTML 风格标签（<i> <b> <font ...>）—— WebVTT 和部分 SRT 里有
+ *
+ * 为什么不做完整 ASS 渲染：本构建没有 libass（CONFIG_ASS_DECODER=0，
+ * 且 libass 在 HarmonyOS 上还依赖字体配置）。取舍是明确的：
+ * **能看到字幕文字** 比 **还原字体/位置/描边** 重要得多。
+ */
+std::string CleanSubtitleText(const std::string &in) {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); i++) {
+        const char c = in[i];
+        if (c == '{') {
+            // 跳到匹配的 '}'；ASS 的标签不允许嵌套
+            const size_t close = in.find('}', i + 1);
+            if (close == std::string::npos) {
+                break;              // 没有闭合，后面全是标签残渣，丢掉
+            }
+            i = close;
+            continue;
+        }
+        if (c == '\\' && i + 1 < in.size()) {
+            const char n = in[i + 1];
+            if (n == 'N' || n == 'n') {
+                out += '\n';
+                i++;
+                continue;
+            }
+            if (n == 'h') {         // \h 是 ASS 的不换行空格
+                out += ' ';
+                i++;
+                continue;
+            }
+        }
+        if (c == '<') {
+            const size_t close = in.find('>', i + 1);
+            // 只在看起来像标签时才跳过，避免把正文里的 "a < b" 吃掉
+            if (close != std::string::npos && close - i <= 32) {
+                i = close;
+                continue;
+            }
+        }
+        if (c == '\r') {
+            continue;
+        }
+        out += c;
+    }
+    // 去掉首尾空白
+    const size_t b = out.find_first_not_of(" \t\n");
+    if (b == std::string::npos) {
+        return std::string();
+    }
+    const size_t e = out.find_last_not_of(" \t\n");
+    return out.substr(b, e - b + 1);
+}
+
+/**
+ * 自实现字幕解析：把一个字幕包的原始字节解成 (startMs, endMs, text)
+ *
+ * 支持四种容器里常见的存放方式：
+ *
+ *   ① MKV 里的 SRT / ASS/SSA
+ *      MKV 把每条字幕存成一个包，文本明文放在包数据里。
+ *      ASS 包形如：  "ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text"
+ *      注意它**没有起止时间** —— 时间在容器的时间戳里（用包的 pts）。
+ *      所以 endMs 只能靠"下一条的开始"来补（见 pendingSubtitle* 字段）。
+ *
+ *   ② MP4 / MOV 里的 mov_text
+ *      包数据是 "2字节大端长度 + UTF-8 文本"，同样没有持续时间，
+ *      时间来自包的 pts / duration。
+ *
+ *   ③ 独立的 SRT 文本（整块，含 "序号 / 时间行 / 正文"）
+ *      起止时间都在文本里，直接解析。
+ *
+ *   ④ WebVTT 文本块（形如 "00:00:01.000 --> 00:00:04.000"）
+ *
+ * ★ 关键设计：包的 pts 是**权威时间**。文本里若自带时间行（情况 ③④），
+ *   那只在 pts 不可用时才用 —— 否则会出现"字幕时间被文本里的时间覆盖"
+ *   与"容器时间"打架的情况（实测 MKV 里的 SRT 包同时带 pts 和内嵌时间行）。
+ *
+ * @param data      包数据
+ * @param size      字节数
+ * @param ptsMs     包的显示时间戳（毫秒）；AV_NOPTS_VALUE 表示没有
+ * @param durMs     包的持续时间（毫秒）；<=0 表示未知
+ * @param out       输出字幕事件
+ * @return true 解出了一条有效字幕
+ */
+bool SelfDecodeSubtitle(const uint8_t *data, int size, int64_t ptsMs, int64_t durMs,
+                        softplayer::SubtitleEvent &out) {
+    if (data == nullptr || size <= 0) {
+        return false;
+    }
+
+    // 转成字符串（文本字幕都是 UTF-8 或 Latin-1；这里按字节处理，
+    // 中文的正常情况是 UTF-8，原样传给 ArkTS 即可）
+    std::string raw(reinterpret_cast<const char *>(data), static_cast<size_t>(size));
+
+    // 去掉结尾的 NUL（mov_text 的填充字节）
+    while (!raw.empty() && raw.back() == '\0') {
+        raw.pop_back();
+    }
+    if (raw.empty()) {
+        return false;
+    }
+
+    int64_t startMs = (ptsMs == AV_NOPTS_VALUE) ? -1 : ptsMs;
+    int64_t endMs = (durMs > 0 && startMs >= 0) ? (startMs + durMs) : 0;
+    std::string text;
+
+    // ---- ② mov_text：2 字节大端长度前缀 ----
+    if (size >= 2) {
+        const int len = (static_cast<int>(data[0]) << 8) | static_cast<int>(data[1]);
+        // 长度必须自洽：>=0 且不超过剩余字节数（允许有填充）
+        if (len >= 0 && len <= size - 2) {
+            const std::string candidate(raw, 2, static_cast<size_t>(len));
+            // 判定依据：正文里不应该含控制字符，且长度前缀要"像"
+            bool printable = !candidate.empty();
+            for (char c : candidate) {
+                const unsigned char u = static_cast<unsigned char>(c);
+                if (u < 0x09 || (u > 0x0d && u < 0x20)) {
+                    printable = false;
+                    break;
+                }
+            }
+            // 同时要求：raw 去掉前缀与文本后剩下的基本都是 0 填充
+            if (printable) {
+                bool tailClean = true;
+                for (size_t i = 2 + static_cast<size_t>(len); i < raw.size(); i++) {
+                    if (raw[i] != '\0') {
+                        tailClean = false;
+                        break;
+                    }
+                }
+                if (tailClean) {
+                    text = CleanSubtitleText(candidate);
+                }
+            }
+        }
+    }
+
+    // ---- ③ / ④ 文本块自带时间行（SRT / WebVTT）----
+    if (text.empty()) {
+        // 找 "-->"，它前面是起始时间、后面是结束时间
+        const size_t arrow = raw.find("-->");
+        if (arrow != std::string::npos) {
+            // 起始时间：从行首到 arrow
+            size_t lineStart = raw.rfind('\n', arrow);
+            lineStart = (lineStart == std::string::npos) ? 0 : lineStart + 1;
+            // 跳过可能的序号行残留（SRT 的 "1\n00:00:01,000 --> ..."）
+            const int64_t t1 = ParseSubtitleTime(raw.substr(lineStart, arrow - lineStart));
+            // 结束时间：arrow 之后到行尾
+            size_t lineEnd = raw.find('\n', arrow);
+            const size_t endFrom = arrow + 3;
+            const std::string endStr = (lineEnd == std::string::npos)
+                ? raw.substr(endFrom) : raw.substr(endFrom, lineEnd - endFrom);
+            int64_t t2 = ParseSubtitleTime(endStr);
+            if (t1 >= 0) {
+                // ★ 包自带时间才用它覆盖容器时间（见函数头的说明）
+                if (startMs < 0) {
+                    startMs = t1;
+                }
+                if (t2 > 0) {
+                    endMs = t2;
+                }
+                // 正文 = 时间行之后的所有内容
+                const size_t bodyFrom = (lineEnd == std::string::npos) ? raw.size()
+                                                                      : lineEnd + 1;
+                text = CleanSubtitleText(raw.substr(bodyFrom));
+            }
+        }
+    }
+
+    // ---- ① 明文包：ASS 的 Dialogue 行，或 MKV 里直接放的纯文本 ----
+    if (text.empty()) {
+        size_t bodyFrom = 0;
+        // ASS/SSA 的完整行可能以 "Dialogue: " 开头
+        const std::string dlg = "Dialogue:";
+        if (raw.compare(0, dlg.size(), dlg) == 0) {
+            bodyFrom = dlg.size();
+        }
+        std::string body = raw.substr(bodyFrom);
+
+        // ASS 的字段顺序：ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+        // 所以从左边数第 8 个逗号之后才是正文
+        if (dlg.size() > 0 || raw.find(',') != std::string::npos) {
+            int commas = 0;
+            size_t pos = 0;
+            for (; pos < body.size(); pos++) {
+                if (body[pos] == ',') {
+                    commas++;
+                    if (commas == 8) {
+                        break;
+                    }
+                }
+            }
+            if (commas == 8 && pos + 1 <= body.size()) {
+                body = body.substr(pos + 1);
+            }
+        }
+        text = CleanSubtitleText(body);
+    }
+
+    if (text.empty() || startMs < 0) {
+        return false;
+    }
+
+    out.startMs = startMs;
+    out.endMs = endMs;
+    out.text = text;
+    return true;
 }
 
 /**
@@ -738,8 +1166,16 @@ bool IsIntegrated() {
  */
 int SeekInternal(DecoderSession *s, int64_t positionMs);
 
+/**
+ * 不带轨道选择的 Open：等价于全 -1（自动）
+ *
+ * 单独保留这个重载是为了让 ThumbnailExtractor 之类的老调用点一行都不用改。
+ */
 int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
-             std::string &errMsg) {
+             std::string &errMsg);
+
+int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
+             std::string &errMsg, const TrackRequest &tracks) {
     outSession = nullptr;
 
     // ---- 打开容器 ----
@@ -768,8 +1204,134 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
     // ---- 找流 ----
     // av_find_best_stream 会顺带把解码器找出来，比自己遍历更省事
     const AVCodec *vdec = nullptr;
-    const int vIdx = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &vdec, 0);
-    const int aIdx = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    int vIdx = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, &vdec, 0);
+
+    // ---- 音频流：枚举全部可解码的音轨，再决定用哪一条 ----
+    //
+    // 为什么不能只留 av_find_best_stream 的结果：
+    //   多语言影片 / 带导演评论的片子有 2~8 条音轨，自动挑的"最好"那条
+    //   常常不是用户想要的那条（例如自动挑了 5.1 英语，用户要国语立体声）。
+    //   所以这里把全部可解码的音轨列给界面，并允许 TrackRequest 指定。
+    std::vector<int32_t> audioCandidates;   // 能真正解码的音轨下标
+    for (unsigned i = 0; i < fmt->nb_streams; i++) {
+        const AVStream *st = fmt->streams[i];
+        // codecpar 理论上一定非空，但畸形容器下见过空指针 —— 这里挡一下，
+        // 一个坏流不该让整个文件打不开
+        if (st == nullptr || st->codecpar == nullptr) {
+            continue;
+        }
+        if (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) {
+            continue;
+        }
+        if (avcodec_find_decoder(st->codecpar->codec_id) == nullptr) {
+            LOGW("音轨 #%{public}u（%{public}s）没有可用解码器，不列入可切换列表",
+                 i, avcodec_get_name(st->codecpar->codec_id));
+            continue;
+        }
+        AudioTrackInfo info;
+        info.index = static_cast<int32_t>(i);
+        info.codec = avcodec_get_name(st->codecpar->codec_id);
+        info.channels = st->codecpar->ch_layout.nb_channels;
+        info.sampleRate = st->codecpar->sample_rate;
+        info.bitRate = st->codecpar->bit_rate;
+        info.isDefault = (st->disposition & AV_DISPOSITION_DEFAULT) != 0;
+        const AVDictionaryEntry *lang = av_dict_get(st->metadata, "language", nullptr, 0);
+        if (lang != nullptr && lang->value != nullptr) {
+            info.language = lang->value;
+        }
+        const AVDictionaryEntry *title = av_dict_get(st->metadata, "title", nullptr, 0);
+        if (title != nullptr && title->value != nullptr) {
+            info.title = title->value;
+        }
+        out.audioTracks.push_back(info);
+        audioCandidates.push_back(static_cast<int32_t>(i));
+    }
+
+    // 决定实际用哪条音轨
+    int aIdx = -1;
+    if (tracks.audioStreamIndex >= 0) {
+        // 调用方明确指定：必须是上面列出的可解码音轨之一
+        if (std::find(audioCandidates.begin(), audioCandidates.end(),
+                      tracks.audioStreamIndex) != audioCandidates.end()) {
+            aIdx = tracks.audioStreamIndex;
+        } else {
+            // 指定了切不过去的音轨：不静默退回自动选，而是明确告诉调用方
+            errMsg = "指定的音轨下标 " + std::to_string(tracks.audioStreamIndex)
+                     + " 不可用（该流不存在或没有解码器）";
+            avformat_close_input(&fmt);
+            delete s;
+            return kNoStream;
+        }
+    } else if (!audioCandidates.empty()) {
+        // 没指定：沿用 av_find_best_stream 的判断（它会考虑默认轨、声道数、
+        // 码率等）；如果它挑中的那条恰恰不可解码，则退到第一条可解码的
+        const int best = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+        if (best >= 0
+            && std::find(audioCandidates.begin(), audioCandidates.end(), best)
+               != audioCandidates.end()) {
+            aIdx = best;
+        } else {
+            aIdx = audioCandidates.front();
+        }
+    }
+    out.selectedAudioIndex = aIdx;
+
+    // ---- 字幕流：枚举全部，并决定启用哪一条 ----
+    for (unsigned i = 0; i < fmt->nb_streams; i++) {
+        const AVStream *st = fmt->streams[i];
+        if (st == nullptr || st->codecpar == nullptr) {
+            continue;
+        }
+        if (st->codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
+            continue;
+        }
+        SubtitleTrackInfo info;
+        info.index = static_cast<int32_t>(i);
+        info.codec = avcodec_get_name(st->codecpar->codec_id);
+        info.isDefault = (st->disposition & AV_DISPOSITION_DEFAULT) != 0;
+        std::string shortName;
+        info.supported = IsTextSubtitleCodec(st->codecpar->codec_id, shortName);
+        // 把短名（SRT/ASS/PGS图形…）放进 title 的兜底位：容器没写 title 时，
+        // 界面至少能显示字幕格式，而不是一行空白
+        if (info.title.empty() && !shortName.empty()) {
+            info.title = shortName;
+        }
+        const AVDictionaryEntry *lang = av_dict_get(st->metadata, "language", nullptr, 0);
+        if (lang != nullptr && lang->value != nullptr) {
+            info.language = lang->value;
+        }
+        const AVDictionaryEntry *title = av_dict_get(st->metadata, "title", nullptr, 0);
+        if (title != nullptr && title->value != nullptr) {
+            info.title = title->value;
+        }
+        out.subtitleTracks.push_back(info);
+    }
+
+    // 决定启用的字幕轨：只接受 supported 的
+    if (tracks.subtitleStreamIndex >= 0) {
+        bool usable = false;
+        for (const SubtitleTrackInfo &ti : out.subtitleTracks) {
+            if (ti.index == tracks.subtitleStreamIndex && ti.supported) {
+                usable = true;
+                break;
+            }
+        }
+        if (!usable) {
+            errMsg = "指定的字幕轨 " + std::to_string(tracks.subtitleStreamIndex)
+                     + " 不可用（不存在，或是本播放器不支持的图形字幕）";
+            avformat_close_input(&fmt);
+            delete s;
+            return kNoStream;
+        }
+        s->subtitleStreamIndex = tracks.subtitleStreamIndex;
+        out.selectedSubtitleIndex = tracks.subtitleStreamIndex;
+        // 字幕的时间基必须从流里取 —— 不同容器的字幕时间基差别很大
+        // （MKV 常见 1/1000，MP4 常见 1/媒体时基），写死就会算错时间轴
+        s->subtitleTimeBase = fmt->streams[tracks.subtitleStreamIndex]->time_base;
+        LOGI("字幕轨已选中: 流下标 %{public}d time_base %{public}d/%{public}d",
+             tracks.subtitleStreamIndex,
+             s->subtitleTimeBase.num, s->subtitleTimeBase.den);
+    }
 
     if (vIdx < 0 && aIdx < 0) {
         errMsg = "没有找到任何音视频流";
@@ -997,9 +1559,11 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
     s->packet = av_packet_alloc();
     s->audioPacket = av_packet_alloc();
     s->videoPacket = av_packet_alloc();
+    s->subtitlePacket = av_packet_alloc();
     s->rawFrame = av_frame_alloc();
     if (s->packet == nullptr || s->audioPacket == nullptr
-        || s->videoPacket == nullptr || s->rawFrame == nullptr) {
+        || s->videoPacket == nullptr || s->subtitlePacket == nullptr
+        || s->rawFrame == nullptr) {
         errMsg = "av_packet_alloc / av_frame_alloc 失败";
         delete s;
         return kDecoderOpenFailed;
@@ -1012,6 +1576,14 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
     s->audioQueue = std::make_unique<PacketQueue>();
     s->videoQueue->limit = 512;
     s->audioQueue->limit = 512;
+    // 字幕队列只在启用字幕时才建。容量小得多（128）：
+    // 字幕包很小，而且一次只需要"当前时间附近"的几条 ——
+    // 队列太长只会让已经过期的字幕堆积（消费端会丢弃过期的，见 ReadSubtitleEvent）。
+    if (s->subtitleStreamIndex >= 0) {
+        s->subtitleQueue = std::make_unique<PacketQueue>();
+        s->subtitleQueue->limit = 128;
+        LOGI("字幕轨已启用: 流下标 %{public}d", s->subtitleStreamIndex);
+    }
     try {
         // 线程体直接内联写在 lambda 里，不抽成独立函数。
         //  抽成 DemuxLoop() 会有个坑：本函数在匿名命名空间内、而 DemuxLoop
@@ -1023,6 +1595,9 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
                 s->demuxError.store(AVERROR(ENOMEM));
                 s->videoQueue->SetEof();
                 s->audioQueue->SetEof();
+                if (s->subtitleQueue != nullptr) {
+                    s->subtitleQueue->SetEof();
+                }
                 return;
             }
             while (true) {
@@ -1043,9 +1618,12 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
                 av_packet_unref(pkt);
                 const int rret = av_read_frame(s->fmtCtx, pkt);
                 if (rret == AVERROR_EOF) {
-                    // 正常结束：标记两个队列 EOF，让解码线程冲刷完缓冲的帧
+                    // 正常结束：标记各队列 EOF，让解码线程冲刷完缓冲的帧
                     s->videoQueue->SetEof();
                     s->audioQueue->SetEof();
+                    if (s->subtitleQueue != nullptr) {
+                        s->subtitleQueue->SetEof();
+                    }
                     break;
                 }
                 if (rret < 0) {
@@ -1053,15 +1631,22 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
                     s->demuxError.store(rret);
                     s->videoQueue->SetEof();
                     s->audioQueue->SetEof();
+                    if (s->subtitleQueue != nullptr) {
+                        s->subtitleQueue->SetEof();
+                    }
                     break;
                 }
-                // ③ 按流索引分流；其它流（字幕等）直接丢弃
+                // ③ 按流索引分流；未启用的流（未选中的音轨/字幕轨）直接丢弃
                 bool pushed = true;
                 if (pkt->stream_index == s->videoStreamIndex) {
                     pushed = s->videoQueue->Push(pkt);
                 } else if (s->audioStreamIndex >= 0
                            && pkt->stream_index == s->audioStreamIndex) {
                     pushed = s->audioQueue->Push(pkt);
+                } else if (s->subtitleStreamIndex >= 0
+                           && pkt->stream_index == s->subtitleStreamIndex
+                           && s->subtitleQueue != nullptr) {
+                    pushed = s->subtitleQueue->Push(pkt);
                 }
                 if (!pushed) {
                     break;   // 队列被中止（会话正在关闭）
@@ -1113,8 +1698,27 @@ int SeekInternal(DecoderSession *s, int64_t positionMs) {
         swr_init(s->swr);
     }
     // 旧位置的包全部作废
+    //
+    // ★ 只清**包队列**，不清字幕缓存 —— 这是个必须讲清的取舍。
+    //
+    //   字幕缓存（FfmpegEngine::subtitleCues_）与包队列是两回事：
+    //     · 包队列里是"还没解析的原始包"，seek 后旧位置的包确实没用了 → 清
+    //     · 缓存里是"已经解析成 起止时间+文本 的字幕" → **不该清**
+    //
+    //   踩过的坑：曾经在引擎侧跟着 seek 一起把缓存也清了，
+    //   结果是"长字幕永远不显示"：
+    //     一条字幕覆盖 0.5s~38s，seek 把它从缓存里清掉之后，
+    //     解复用线程从新的位置继续往前读，**永远不会再读到这条已经在
+    //     身后的字幕包**，于是屏幕上一直空白。
+    //   保留缓存就没有这个问题：新位置的包到来时会自然补齐/替换，
+    //   而 GetActiveSubtitle 本来就是按当前播放位置去缓存里**匹配**的，
+    //   多留一些过期条目完全无害（这也是当初选"缓存+查询"而非
+    //   "收到即显示"的原因之一）。
     s->videoQueue->Clear();
     s->audioQueue->Clear();
+    if (s->subtitleQueue != nullptr) {
+        s->subtitleQueue->Clear();
+    }
     return 0;
 }
 
@@ -1294,6 +1898,77 @@ int32_t DecodeAudioChunk(Session session, AudioChunk &chunk, std::string &errMsg
 bool HasAudio(Session session) {
     auto *s = static_cast<DecoderSession *>(session);
     return s != nullptr && s->audioCtx != nullptr && s->swr != nullptr;
+}
+
+bool HasSubtitle(Session session) {
+    auto *s = static_cast<DecoderSession *>(session);
+    return s != nullptr && s->subtitleStreamIndex >= 0 && s->subtitleQueue != nullptr;
+}
+
+int32_t ReadSubtitleEvent(Session session, softplayer::SubtitleEvent &out,
+                          std::string &errMsg) {
+    auto *s = static_cast<DecoderSession *>(session);
+    if (s == nullptr || s->subtitleQueue == nullptr || s->subtitleStreamIndex < 0) {
+        // 没启用字幕：这不是错误，只是"没有内容"
+        return kAgain;
+    }
+
+    // 每次调用最多尝试若干个包就返回 kAgain。
+    //
+    // 为什么要限量：库里可能大片区域没有字幕（比如开场几分钟），
+    // 如果这里一直循环到取出字幕为止，调用线程（视频解码线程）会被
+    // 拖住在字幕解析上，视频反而卡顿。限量 + 让调用方下次再来，
+    // 就能把"找字幕"的成本摊到多帧之间。
+    for (int guard = 0; guard < 64; guard++) {
+        // ★ 用字幕专用的 AVPacket，绝不能借用 audioPacket：
+        //   那个归音频解码线程所有。借用同一对象正是历史上"包数据被并发
+        //   覆盖"那类 bug 的根源（见 DecoderSession 里那段长注释）。
+        av_packet_unref(s->subtitlePacket);
+        const int32_t qret = s->subtitleQueue->Pop(s->subtitlePacket, 0);
+        if (qret == kEof) {
+            return kEof;
+        }
+        if (qret != kOk) {
+            return kAgain;   // 队列暂时空
+        }
+
+        // 取时间戳：pts 优先，其次 dts
+        int64_t pts = s->subtitlePacket->pts;
+        if (pts == AV_NOPTS_VALUE) {
+            pts = s->subtitlePacket->dts;
+        }
+        const int64_t ptsMs = (pts == AV_NOPTS_VALUE)
+            ? AV_NOPTS_VALUE
+            : av_rescale_q(pts, s->subtitleTimeBase, AVRational{1, 1000});
+        const int64_t durMs = (s->subtitlePacket->duration > 0)
+            ? av_rescale_q(s->subtitlePacket->duration, s->subtitleTimeBase,
+                           AVRational{1, 1000})
+            : 0;
+
+        SubtitleEvent ev;
+        if (!SelfDecodeSubtitle(s->subtitlePacket->data, s->subtitlePacket->size,
+                                ptsMs, durMs, ev)) {
+            continue;   // 这个包解不出东西（空行、样式行等），换下一个
+        }
+
+        // ---- 产出策略：立即输出，不等下一条 ----
+        //
+        // 多数容器（MKV / MP4）的文本字幕包**只有开始时间、没有持续时间**。
+        // 按常规可以"攒着这条，等下一条到来时用它的开始时间当结束时间"，
+        // 时间最准。但这里刻意不那么做，理由是上层（引擎）本来就不是
+        // "收到就显示"，而是按**当前播放位置**去匹配字幕：
+        //   · 延迟一条输出，会让字幕相对画面整体晚一条；
+        //   · 拖动进度条后更明显（缓存里全是过期字幕，匹配不上当前的）。
+        // 而兜底时长即使偏长也无害 —— 匹配到下一条时会自然替换。
+        // 包自带结束时间的（SRT 文本块 / WebVTT）当然用真实值。
+        if (ev.endMs <= 0) {
+            ev.endMs = ev.startMs + kSubtitleFallbackMs;
+        }
+        out = ev;
+        s->subtitleCount++;
+        return kOk;
+    }
+    return kAgain;
 }
 
 int32_t AudioSampleRate() {
@@ -1682,8 +2357,22 @@ void Close(Session session) {
     if (s->audioQueue != nullptr) {
         s->audioQueue->Abort();
     }
+    if (s->subtitleQueue != nullptr) {
+        s->subtitleQueue->Abort();
+    }
     if (s->demuxThreadStarted.load() && s->demuxThread.joinable()) {
         s->demuxThread.join();
+    }
+
+    // ---- 字幕资源 ----
+    if (s->subtitleFrame != nullptr) {
+        av_frame_free(&s->subtitleFrame);
+    }
+    if (s->subtitleCtx != nullptr) {
+        avcodec_free_context(&s->subtitleCtx);
+    }
+    if (s->subtitlePacket != nullptr) {
+        av_packet_free(&s->subtitlePacket);
     }
 
     // ---- 音频资源 ----
@@ -1730,7 +2419,19 @@ void Close(Session session) {
     }
     s->videoQueue.reset();
     s->audioQueue.reset();
+    s->subtitleQueue.reset();
     delete s;
+}
+
+/**
+ * 不带轨道选择的 Open：等价于全 -1（自动选音轨、不开字幕）
+ *
+ * 放在真正实现之后定义，这样上面那个五参数版本不需要前置声明。
+ */
+int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
+             std::string &errMsg) {
+    TrackRequest autoPick;   // audioStreamIndex = -1, subtitleStreamIndex = -1
+    return Open(path, outSession, out, errMsg, autoPick);
 }
 
 #else  // !SOFT_PLAYER_WITH_FFMPEG
@@ -1750,6 +2451,24 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
     (void)out;
     errMsg = "编译时未定义 SOFT_PLAYER_WITH_FFMPEG，本构建不含软解";
     return kNotIntegrated;
+}
+
+int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
+             std::string &errMsg, const TrackRequest &tracks) {
+    (void)tracks;
+    return Open(path, outSession, out, errMsg);
+}
+
+int32_t ReadSubtitleEvent(Session session, SubtitleEvent &out, std::string &errMsg) {
+    (void)session;
+    (void)out;
+    errMsg = "未集成 FFmpeg";
+    return kNotIntegrated;
+}
+
+bool HasSubtitle(Session session) {
+    (void)session;
+    return false;
 }
 
 int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg,

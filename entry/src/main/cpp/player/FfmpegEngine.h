@@ -7,6 +7,7 @@
 #include "AudioOutput.h"
 
 #include <atomic>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -74,12 +75,53 @@ public:
     int64_t GetPositionMs() const override;
     void Release() override;
 
+    // ---------- 音轨 / 字幕（2026-09-29 新增）----------
+    int32_t SwitchAudioTrack(int32_t streamIndex) override;
+    int32_t SetSubtitleTrack(int32_t streamIndex) override;
+    bool GetActiveSubtitle(SubtitleCue &out) const override;
+    bool CanSwitchAudioTrack() const override;
+
 private:
+    /**
+     * Prepare 的真正实现，带音轨 / 字幕轨选择
+     *
+     * 为什么单独抽一个带参数的内部版本：
+     *   "切换音轨"的实现就是「用新的音轨下标重新走一遍 Prepare」。
+     *   但公用 Prepare 还多了两件不该重复做的事：
+     *     · 重建音频输出设备（会有一声爆音 + 华为设备上几百毫秒延迟）
+     *     · 重新枚举轨道（其实没变）
+     *   manageAudio=false 就是"换轨"路径，复用正在跑的音频设备。
+     */
+    int32_t PrepareWithTracks(const std::string &path, int32_t audioStreamIndex,
+                              int32_t subtitleStreamIndex, bool manageAudio);
+
     /** 解码线程主体 */
     void DecodeLoop();
 
     /** 音频解码线程主体：把 PCM 持续喂进 AudioOutput 的环形缓冲 */
     void AudioLoop();
+
+    /**
+     * 字幕解码线程主体
+     *
+     * 为什么字幕要单独一条线程：
+     *   字幕解码是"读队列 → 解析文本"的循环，与视频/音频都不共享状态。
+     *   挂在视频线程上的话，一个文件如果有几万条字幕（很常见），
+     *   视频解码每出一帧都要额外解析字幕，会把帧节奏带乱。
+     *   单独线程 + 小队列，互不影响。
+     */
+    void SubtitleLoop();
+
+    /**
+     * 用新的音轨 / 字幕轨重新打开会话
+     *
+     * 这是"切换"的统一实现：停掉三条线程 → 关会话 → 按新下标重开 →
+     * seek 回原位置 → 重启线程。成功返回 0。
+     */
+    int32_t ReopenWithTracks(int32_t audioIndex, int32_t subtitleIndex);
+
+    /** 内部释放线程与会话（Release 与 ReopenWithTracks 共用） */
+    void TearDownThreads();
 
     /** 渲染一帧到 surface，返回是否成功 */
     bool RenderFrame(VideoFrame &frame);
@@ -218,6 +260,42 @@ private:
     std::atomic<int64_t> audioUnderruns_{0};
     /** 音频是否已播完（用于判断整片结束） */
     std::atomic<bool> audioEof_{false};
+
+    /* ==================== 字幕（2026-09-29 新增） ==================== */
+
+    /**
+     * 已解出的字幕，按 startMs 升序
+     *
+     * 为什么要缓存整个列表而不是只留"当前一条"：
+     *   用户随时可能往回拖进度条，往回拖之后需要立刻显示那个位置的字幕。
+     *   只留一条的话必须重新解码整个区间的字幕流，会有明显延迟。
+     *   缓存住就能瞬间响应。
+     *
+     * 上限见 kSubtitleCacheMax —— 超过就从头丢，因为往回拖很远是少数情况，
+     * 而无限增长会让长片（几万条字幕）吃掉几 MB 内存。
+     */
+    std::deque<SubtitleCue> subtitleCues_;
+    /** 保护 subtitleCues_ 的锁（字幕线程写、查询线程读） */
+    mutable std::mutex subtitleMutex_;
+
+    /** 字幕解码线程 */
+    std::thread subtitleThread_;
+    bool subtitleThreadStarted_ = false;
+    /** 是否启用了字幕 */
+    std::atomic<bool> subtitleEnabled_{false};
+
+    /**
+     * 字幕解码位置（毫秒），即 subtitleCues_ 里最后一条的结束时间
+     *
+     * 用途：GetActiveSubtitle 判断"当前没有字幕"时，要区分两种情况 ——
+     *   · 当前位置的字幕还没解出来（需要等）
+     *   · 这个区间本来就没有字幕（正常）
+     * 用它做参照可以避免误判。
+     */
+    std::atomic<int64_t> subtitleDecodedUntilMs_{0};
+
+    /** 诊断：已缓存字幕条数 */
+    std::atomic<int64_t> subtitleCachedCount_{0};
 };
 
 }  // namespace softplayer

@@ -38,6 +38,19 @@ constexpr size_t kFrameQueueSize = 8;
 /** 解码循环里每轮最多连续解多少帧，避免一次占满队列 */
 constexpr int kMaxDecodeBurst = 4;
 
+/**
+ * 字幕缓存上限（条数）
+ *
+ * 取 4000 的理由：
+ *   · 一条字幕平均显示 2~4 秒，4000 条约等于 2~4 小时的播放量 ——
+ *     覆盖绝大多数影片，正着看/往回拖一点都够用。
+ *   · 每条字幕的文本 + 两个时间戳约 100~200 字节，4000 条约 0.5 MB，
+ *     在手机上是可忽略的量级。
+ *   · 不设上限的话，一部带几万条字幕的长片（评论轨字幕很常见）
+ *     会一直涨下去，而真正会用到的只是当前位置附近那几百条。
+ */
+constexpr size_t kSubtitleCacheMax = 4000;
+
 }  // namespace
 
 FfmpegEngine::FfmpegEngine() {
@@ -67,33 +80,48 @@ void FfmpegEngine::SetState(PlayerState st) {
 }
 
 int32_t FfmpegEngine::Prepare(const std::string &path) {
+    // 全 -1 = 音轨自动选、不开字幕（与加入轨道选择之前的行为一致），
+    // manageAudio=true 表示这是"首次打开"，音频设备要按需创建/启动
+    return PrepareWithTracks(path, -1, -1, /*manageAudio=*/true);
+}
+
+int32_t FfmpegEngine::PrepareWithTracks(const std::string &path,
+                                       int32_t audioStreamIndex,
+                                       int32_t subtitleStreamIndex,
+                                       bool manageAudio) {
     if (state_.load() == PlayerState::RELEASED) {
         return -1;
     }
-    // 已经准备过就先清理，允许复用同一个引擎换文件
-    if (session_ != nullptr) {
-        codecapi::Close(session_);
-        session_ = nullptr;
-    }
-    // 换文件前先停掉音频输出与音频线程，否则新文件的音频会和旧的混在一起
-    if (audioThreadStarted_) {
-        quitting_.store(true);
+
+    // ==================== 清理顺序（这里有一个必须讲清的坑） ====================
+    //
+    // ★★ 先停线程，再关会话 —— 顺序反了必然崩溃（真机 SIGABRT 实测）★★
+    //
+    //   第一版写成了「先 codecapi::Close(session_)，再 join 音频/字幕线程」，
+    //   逻辑上看着没错（都是清理），实际是**释放后使用**：
+    //     音频线程当时可能正卡在 DecodeAudioChunk(session_, ...) 里，
+    //     字幕线程可能正卡在 ReadSubtitleEvent(session_, ...) 里，
+    //     而 session_ 指向的 DecoderSession 已经被 Close 里的 delete 释放了。
+    //   → 解引用已释放内存 → SIGABRT / SIGSEGV。
+    //
+    //   为什么原来的 Prepare 没暴露这个问题：
+    //     它只在"换文件"时被调用，而那时播放是停的、线程早就退出了，
+    //     所以"先关会话"恰好是安全的 —— 属于**侥幸正确**。
+    //     一旦新增"播放中换音轨/换字幕"（本函数的新调用方），
+    //     线程是活的，侥幸立刻变成崩溃。
+    //
+    //   正确顺序：置退出标志 → join 全部线程 → 再关会话。
+    //   注意 quitting_ 一旦置位，后续 Start() 会重新置 false（见 Start），
+    //   所以不需要在这里恢复。
+    quitting_.store(true);
+    if (sleeper_ != nullptr) {
         sleeper_->Wake();
-        if (audioThread_.joinable()) {
-            audioThread_.join();
-        }
-        audioThreadStarted_ = false;
     }
-    if (audio_ != nullptr) {
-        audio_->Stop();
-    }
-    audioReady_ = false;
-    audioEof_.store(false);
-    audioWrittenMs_.store(0);
+    // 解码线程先停：它持有 frameQueue_，且会往 surface 写帧
     if (threadStarted_) {
-        quitting_.store(true);
-        sleeper_->Wake();
-        frameQueue_->Abort();
+        if (frameQueue_ != nullptr) {
+            frameQueue_->Abort();
+        }
         if (decodeThread_.joinable()) {
             decodeThread_.join();
         }
@@ -101,6 +129,54 @@ int32_t FfmpegEngine::Prepare(const std::string &path) {
         // 队列被 Abort 过，换一个新的，否则后续 Pop 永远返回 false
         frameQueue_ = std::make_unique<FrameQueue>(kFrameQueueSize);
     }
+    // ★ 先停音频输出，再 join 音频线程。
+    //   反过来的话，音频线程可能正卡在 Write（缓冲满在等），
+    //   而音频回调已经停了、缓冲永远不消耗 —— 就死锁了。
+    //
+    //   manageAudio == false（换轨路径）时这里也不是白停：
+    //   音频设备必须停下来，线程才可能从阻塞的 Write 里出来。
+    //   代价是设备被 Stop 之后需要重启（见下方音频准备处的分支）。
+    //   那点重启延迟是主动接受的 —— **正确性优先**；
+    //   想省掉它就会变成"边写边 join"，反而引入新的竞态。
+    if (audio_ != nullptr) {
+        audio_->Stop();
+    }
+    if (audioThreadStarted_ && audioThread_.joinable()) {
+        audioThread_.join();
+    }
+    audioThreadStarted_ = false;
+    // 字幕线程同样要在关会话之前 join
+    if (subtitleThreadStarted_ && subtitleThread_.joinable()) {
+        subtitleThread_.join();
+    }
+    subtitleThreadStarted_ = false;
+
+    // ---- 线程全部停下之后，才可以安全关闭会话 ----
+    if (session_ != nullptr) {
+        codecapi::Close(session_);
+        session_ = nullptr;
+    }
+
+    // 清掉上一轮的字幕缓存。
+    //
+    // ★ 注意这里与 SeekTo 的区别：**换文件/换字幕轨时要清，单纯的 seek 不能清。**
+    //   · 换文件：旧文件的行星字幕对新文件毫无意义 → 清
+    //   · 换字幕轨：旧轨的文本不该混进新轨 → 清
+    //   · 单纯 seek：缓存里的旧条目无害（查询是按当前播放位置匹配的），
+    //     而清掉会丢掉"已经解析好、但新位置之后不会再读到"的长字幕
+    //     —— 那条字幕会从此永远不显示。详见 FfmpegCodecApi.cpp 里
+    //     SeekInternal 的说明。
+    {
+        std::lock_guard<std::mutex> lk(subtitleMutex_);
+        subtitleCues_.clear();
+    }
+    subtitleCachedCount_.store(0);
+    subtitleDecodedUntilMs_.store(0);
+    LOGI("换轨/换文件：已清空字幕缓存");
+
+    audioReady_ = false;
+    audioEof_.store(false);
+    audioWrittenMs_.store(0);
 
     path_ = path;
     SetState(PlayerState::PREPARING);
@@ -120,7 +196,10 @@ int32_t FfmpegEngine::Prepare(const std::string &path) {
     codecapi::MediaSummary summary;
     std::string errMsg;
     codecapi::Session newSession = nullptr;
-    const int32_t ret = codecapi::Open(path_, newSession, summary, errMsg);
+    codecapi::TrackRequest req;
+    req.audioStreamIndex = audioStreamIndex;
+    req.subtitleStreamIndex = subtitleStreamIndex;
+    const int32_t ret = codecapi::Open(path_, newSession, summary, errMsg, req);
     if (ret != codecapi::kOk) {
         const std::string reason = "打开失败(" + std::to_string(ret) + "): " + errMsg;
         LOGE("Prepare 失败: %{public}s", reason.c_str());
@@ -137,11 +216,28 @@ int32_t FfmpegEngine::Prepare(const std::string &path) {
         if (audio_ == nullptr) {
             audio_ = std::make_unique<AudioOutput>();
         }
-        if (audio_->Start(codecapi::AudioSampleRate(), codecapi::AudioChannels())) {
-            LOGI("音频输出就绪");
+        if (manageAudio) {
+            if (audio_->Start(codecapi::AudioSampleRate(), codecapi::AudioChannels())) {
+                LOGI("音频输出就绪");
+            } else {
+                LOGW("音频输出启动失败，本次播放将静音");
+                audioReady_ = false;
+            }
+        } else if (audio_->IsRunning()) {
+            // 换轨路径，但设备居然还在跑（理论上不该发生：清理阶段已经 Stop 过）。
+            // 保留这条分支是为了"设备复用"这个优化将来重新启用时不用再想一遍；
+            // 现在它几乎不会命中。
+            LOGI("换音轨：沿用已有音频输出设备");
+            audio_->FlushBuffer();
         } else {
-            LOGW("音频输出启动失败，本次播放将静音");
-            audioReady_ = false;
+            // 换轨路径的常态：清理阶段为了安全 join 线程而 Stop 过设备，
+            // 这里把它重新启动（会有几百毫秒延迟，见清理阶段的说明）
+            if (audio_->Start(codecapi::AudioSampleRate(), codecapi::AudioChannels())) {
+                LOGI("换音轨：音频输出已重启");
+            } else {
+                LOGW("换音轨：音频输出重启失败，本次播放将静音");
+                audioReady_ = false;
+            }
         }
     } else {
         LOGI("该文件没有可解码的音频轨，静音播放");
@@ -157,6 +253,16 @@ int32_t FfmpegEngine::Prepare(const std::string &path) {
     info_.hasVideo = summary.hasVideo;
     info_.hasAudio = summary.hasAudio;
     info_.rotationDeg = summary.rotationDeg;
+    // ---- 轨道信息（供界面做选择）----
+    info_.audioTracks = summary.audioTracks;
+    info_.subtitleTracks = summary.subtitleTracks;
+    info_.currentAudioIndex = summary.selectedAudioIndex;
+    info_.currentSubtitleIndex = summary.selectedSubtitleIndex;
+    subtitleEnabled_.store(summary.selectedSubtitleIndex >= 0);
+    LOGI("轨道枚举: 音轨 %{public}zu 条（当前 %{public}d）, "
+         "字幕轨 %{public}zu 条（当前 %{public}d）",
+         info_.audioTracks.size(), info_.currentAudioIndex,
+         info_.subtitleTracks.size(), info_.currentSubtitleIndex);
 
     positionMs_.store(0);
     pendingSeekMs_.store(-1);
@@ -216,6 +322,16 @@ int32_t FfmpegEngine::Start() {
         audioThread_ = std::thread(&FfmpegEngine::AudioLoop, this);
         audioThreadStarted_ = true;
         LOGI("音频线程已启动");
+    }
+
+    // 字幕线程：只在启用了字幕轨时启动。
+    // 与视频线程不同的地方：字幕线程**不依赖 playing_**，暂停时也继续把
+    // 字幕读进来 —— 这样暂停状态下往回拖进度条，字幕能立刻显示，
+    // 不用等恢复播放。字幕解析很轻，暂停期间继续读没有负担。
+    if (subtitleEnabled_.load() && session_ != nullptr && !subtitleThreadStarted_) {
+        subtitleThread_ = std::thread(&FfmpegEngine::SubtitleLoop, this);
+        subtitleThreadStarted_ = true;
+        LOGI("字幕线程已启动");
     }
 
     playing_.store(true);
@@ -921,6 +1037,12 @@ void FfmpegEngine::Release() {
         audioThread_.join();
     }
     audioThreadStarted_ = false;
+    // 字幕线程：同样在音频之后、会话关闭之前 join。
+    // 它读的是 session_，所以必须早于 codecapi::Close(session_)。
+    if (subtitleThreadStarted_ && subtitleThread_.joinable()) {
+        subtitleThread_.join();
+    }
+    subtitleThreadStarted_ = false;
     if (threadStarted_ && decodeThread_.joinable()) {
         decodeThread_.join();
     }
@@ -942,6 +1064,218 @@ void FfmpegEngine::Release() {
     SetState(PlayerState::RELEASED);
     // 释放后不能再有回调进来，清掉避免悬空
     callback_ = nullptr;
+}
+
+// ==================== 字幕线程（2026-09-29 新增） ====================
+
+/**
+ * 字幕解码线程主体
+ *
+ * 循环从会话的字幕队列取事件，追加进 subtitleCues_ 缓存。
+ * 缓存按 startMs 升序，界面用 GetActiveSubtitle 按当前播放位置查询。
+ *
+ * 为什么用"缓存 + 查询"而不是"推送一条显示一条"：
+ *   见 IPlayerEngine.h 里 SubtitleCue 的说明 —— 字幕是时间对齐的，
+ *   让界面按位置来问，天然同步，也不用在 ArkTS 侧再做去重。
+ */
+void FfmpegEngine::SubtitleLoop() {
+    LOGI("字幕线程启动");
+    // 注意类型归属：SubtitleEvent 定义在 softplayer 命名空间（FfmpegTypes.h），
+    // 不在 codecapi 里 —— 它是"解码器产出的原始事件"，与引擎的 SubtitleCue
+    // 是两回事（后者是引擎对外暴露的、给界面查询用的形式）。
+    softplayer::SubtitleEvent ev;
+    std::string errMsg;
+    int64_t idleRounds = 0;
+
+    while (!quitting_.load()) {
+        if (!subtitleEnabled_.load() || session_ == nullptr) {
+            sleeper_->Sleep(100);
+            continue;
+        }
+
+        const int32_t ret = codecapi::ReadSubtitleEvent(session_, ev, errMsg);
+        if (ret == codecapi::kOk) {
+            idleRounds = 0;
+            // 写入缓存（加锁：查询线程同时在读）
+            {
+                std::lock_guard<std::mutex> lk(subtitleMutex_);
+                SubtitleCue cue;
+                cue.startMs = ev.startMs;
+                cue.endMs = ev.endMs;
+                cue.text = ev.text;
+                subtitleCues_.push_back(cue);
+                // 超过上限就从头丢：往回拖很远是少数情况，
+                // 而无限增长会让长片（几万条字幕）白吃几 MB 内存
+                while (subtitleCues_.size() > kSubtitleCacheMax) {
+                    subtitleCues_.pop_front();
+                }
+                subtitleCachedCount_.store(static_cast<int64_t>(subtitleCues_.size()));
+                // 记录"已解到哪"：用最后一条的结束时间
+                subtitleDecodedUntilMs_.store(cue.endMs);
+            }
+            continue;   // 立刻取下一批，尽快把缓存填起来
+        }
+        if (ret == codecapi::kEof) {
+            // 字幕流读完是正常结束，不是错误。停在这里等 quitting，
+            // 不再空转打日志。
+            LOGI("字幕流已解到结尾（已缓存 %{public}lld 条）",
+                 static_cast<long long>(subtitleCachedCount_.load()));
+            while (!quitting_.load()) {
+                sleeper_->Sleep(200);
+            }
+            break;
+        }
+        if (ret == codecapi::kAgain) {
+            // 队列暂时没有包（解复用还没读到，或者这个区间本来就没字幕）
+            idleRounds++;
+            // 空闲时退让：一开始紧凑等（字幕通常连续），
+            // 长时间没有就放慢，避免空转烧 CPU
+            sleeper_->Sleep(idleRounds < 20 ? 5 : 50);
+            continue;
+        }
+        // 真错误：记一次就停，避免刷屏
+        LOGW("字幕读取失败(%{public}d): %{public}s", ret, errMsg.c_str());
+        while (!quitting_.load()) {
+            sleeper_->Sleep(200);
+        }
+        break;
+    }
+    LOGI("字幕线程退出");
+}
+
+// ==================== 音轨 / 字幕切换 ====================
+
+bool FfmpegEngine::CanSwitchAudioTrack() const {
+    return info_.audioTracks.size() > 1;
+}
+
+int32_t FfmpegEngine::SwitchAudioTrack(int32_t streamIndex) {
+    // 目标必须真的存在，否则重开一次也只是白费功夫（还会把播放打断）
+    bool found = false;
+    for (const AudioTrackInfo &t : info_.audioTracks) {
+        if (t.index == streamIndex) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        LOGW("切换音轨失败：下标 %{public}d 不在可切换列表里", streamIndex);
+        return -1;
+    }
+    if (streamIndex == info_.currentAudioIndex) {
+        LOGI("已经在用音轨 %{public}d，无需切换", streamIndex);
+        return 0;
+    }
+
+    const int64_t pos = positionMs_.load();
+    const bool wasPlaying = playing_.load();
+    LOGI("切换音轨 %{public}d -> %{public}d（当前位置 %{public}lld ms, 播放中=%{public}d）",
+         info_.currentAudioIndex, streamIndex,
+         static_cast<long long>(pos), wasPlaying ? 1 : 0);
+
+    // 关键：换成新音轨重开，并把旧位置带过去。
+    // 字幕轨保持当前选择不变 —— 用户换配音不该把字幕也关掉。
+    const int32_t ret = PrepareWithTracks(path_, streamIndex,
+                                          info_.currentSubtitleIndex,
+                                          /*manageAudio=*/false);
+    if (ret != 0) {
+        LOGE("切换音轨重开失败(%{public}d)，播放已中断", ret);
+        return ret;
+    }
+
+    // 恢复到原位置。用 SeekTo 而不是直接写 pendingSeekMs：
+    // SeekTo 里还负责清解码帧队列与重置时钟基准，漏掉会看到"换轨后
+    // 先闪几帧旧画面"的经典现象。
+    if (pos > 0) {
+        SeekTo(pos);
+    }
+    if (wasPlaying) {
+        Start();
+    }
+    LOGI("切换音轨完成，现用音轨 %{public}d", info_.currentAudioIndex);
+    return 0;
+}
+
+int32_t FfmpegEngine::SetSubtitleTrack(int32_t streamIndex) {
+    if (streamIndex < 0) {
+        // 关闭字幕：不必重开会话，只停掉消费端
+        //
+        // 为什么关闭可以这么轻：字幕包本来就在解复用线程里被"没启用就丢弃"，
+        // 真正的成本只是不再往缓存里追加。而重开一次会打断播放，
+        // 关闭字幕却是个纯 UI 操作，不该有副作用。
+        subtitleEnabled_.store(false);
+        {
+            std::lock_guard<std::mutex> lk(subtitleMutex_);
+            subtitleCues_.clear();
+            subtitleCachedCount_.store(0);
+        }
+        info_.currentSubtitleIndex = -1;
+        LOGI("已关闭字幕");
+        return 0;
+    }
+
+    // 打开某条字幕轨需要重开（解复用线程只在 Open 时才知道要投递哪条流）
+    bool usable = false;
+    for (const SubtitleTrackInfo &t : info_.subtitleTracks) {
+        if (t.index == streamIndex) {
+            usable = t.supported;
+            break;
+        }
+    }
+    if (!usable) {
+        LOGW("启用字幕失败：下标 %{public}d 不存在或是不支持的图形字幕", streamIndex);
+        return -1;
+    }
+
+    const int64_t pos = positionMs_.load();
+    const bool wasPlaying = playing_.load();
+    LOGI("启用字幕轨 %{public}d（当前位置 %{public}lld ms）",
+         streamIndex, static_cast<long long>(pos));
+
+    const int32_t ret = PrepareWithTracks(path_, info_.currentAudioIndex, streamIndex,
+                                          /*manageAudio=*/false);
+    if (ret != 0) {
+        LOGE("启用字幕重开失败(%{public}d)", ret);
+        return ret;
+    }
+    if (pos > 0) {
+        SeekTo(pos);
+    }
+    if (wasPlaying) {
+        Start();
+    }
+    LOGI("字幕轨已启用 %{public}d", info_.currentSubtitleIndex);
+    return 0;
+}
+
+bool FfmpegEngine::GetActiveSubtitle(SubtitleCue &out) const {
+    if (!subtitleEnabled_.load()) {
+        return false;
+    }
+    const int64_t now = positionMs_.load();
+    std::lock_guard<std::mutex> lk(subtitleMutex_);
+    if (subtitleCues_.empty()) {
+        return false;
+    }
+
+    // 从后往前找：绝大多数查询命中的都是最近的一条（缓存是升序的），
+    // 从尾部开始找通常一两次就命中。字幕条数可能有几万，
+    // 每次都从头扫会让 UI 线程做无谓的工作。
+    for (auto it = subtitleCues_.rbegin(); it != subtitleCues_.rend(); ++it) {
+        const SubtitleCue &c = *it;
+        if (c.startMs > now) {
+            continue;            // 还没到，继续往前找
+        }
+        // 这是"已经开始"的最晚一条。若当前时间在它的展示区间内就显示它。
+        if (now <= c.endMs) {
+            out = c;
+            return true;
+        }
+        // 已经开始但已经过期 —— 说明当前时刻确实没有字幕（两条之间的空隙）
+        return false;
+    }
+    // 所有字幕都还没开始（now 比最早一条还早）
+    return false;
 }
 
 }  // namespace softplayer

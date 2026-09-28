@@ -1,5 +1,5 @@
 // 原生模块只导出类与函数；枚举/接口来自 ArkTS 侧定义
-import { SoftPlayer, SoftPlayerEvent, SoftMediaInfo } from 'libsoftplayer.so';
+import { SoftPlayer, SoftPlayerEvent, SoftMediaInfo, SoftAudioTrack, SoftSubtitleTrack } from 'libsoftplayer.so';
 import { SoftPlayerState, SoftPlayerEventType } from './SoftPlayerTypes';
 
 /** 事件轮询间隔（毫秒） */
@@ -19,8 +19,18 @@ export interface SoftPlayerSnapshot {
   height: number;
   /** 视频编码名 */
   videoCodec: string;
+  /** 音频编码名 */
+  audioCodec: string;
   /** 错误描述，空串表示无错误 */
   error: string;
+  /** 可切换的音轨列表 */
+  audioTracks: SoftAudioTrack[];
+  /** 字幕轨列表 */
+  subtitleTracks: SoftSubtitleTrack[];
+  /** 当前音轨流下标 */
+  currentAudioIndex: number;
+  /** 当前字幕轨流下标；-1 表示未启用 */
+  currentSubtitleIndex: number;
 }
 
 /**
@@ -50,7 +60,12 @@ export class SoftPlayerController {
     width: 0,
     height: 0,
     videoCodec: '',
-    error: ''
+    audioCodec: '',
+    error: '',
+    audioTracks: [],
+    subtitleTracks: [],
+    currentAudioIndex: -1,
+    currentSubtitleIndex: -1
   };
   /** 状态变化通知（由 UI 传入） */
   private onUpdate: (snap: SoftPlayerSnapshot) => void;
@@ -298,9 +313,106 @@ export class SoftPlayerController {
       this.snapshot.width = info.width;
       this.snapshot.height = info.height;
       this.snapshot.videoCodec = info.videoCodec;
+      this.snapshot.audioCodec = info.audioCodec;
+      // 轨道列表要做空值兜底：原生侧理论上一定返回数组，
+      // 但 crossing napi 边界时类型不匹配只会得到 undefined，
+      // 直接 .length 就会抛异常把整个 PREPARED 处理打断。
+      this.snapshot.audioTracks = info.audioTracks !== undefined ? info.audioTracks : [];
+      this.snapshot.subtitleTracks =
+        info.subtitleTracks !== undefined ? info.subtitleTracks : [];
+      this.snapshot.currentAudioIndex =
+        info.currentAudioIndex !== undefined ? info.currentAudioIndex : -1;
+      this.snapshot.currentSubtitleIndex =
+        info.currentSubtitleIndex !== undefined ? info.currentSubtitleIndex : -1;
+      console.info('[SoftPlayer] 轨道: 音轨 ' + this.snapshot.audioTracks.length.toString()
+        + ' 条(当前 ' + this.snapshot.currentAudioIndex.toString() + '), 字幕轨 '
+        + this.snapshot.subtitleTracks.length.toString() + ' 条(当前 '
+        + this.snapshot.currentSubtitleIndex.toString() + ')');
     } catch (err) {
       console.error('getMediaInfo failed: ' + JSON.stringify(err));
     }
+  }
+
+  /**
+   * 切换音轨
+   *
+   * 原生侧的实现是"重开会话 + seek 回原位"，会有短暂的画面/声音中断，
+   * 这是预期行为（界面可以据此给个提示）。
+   *
+   * @return 0 成功；非 0 失败
+   */
+  switchAudioTrack(index: number): number {
+    const p: SoftPlayer | undefined = this.player;
+    if (p === undefined || this.released) {
+      return -1;
+    }
+    try {
+      const r: number = p.switchAudioTrack(index);
+      if (r === 0) {
+        // 重开之后媒体信息要重新取一次（当前音轨下标变了，
+        // 而且时长、尺寸这些也可能因新音轨而略有不同）
+        this.syncMediaInfo();
+        this.notify();
+      } else {
+        this.snapshot.error = '切换音轨失败（' + r.toString() + '）';
+        this.notify();
+      }
+      return r;
+    } catch (err) {
+      console.error('switchAudioTrack failed: ' + JSON.stringify(err));
+      return -1;
+    }
+  }
+
+  /**
+   * 启用 / 关闭内嵌字幕轨
+   * @param index 字幕流下标；-1 表示关闭字幕
+   */
+  setSubtitleTrack(index: number): number {
+    const p: SoftPlayer | undefined = this.player;
+    if (p === undefined || this.released) {
+      return -1;
+    }
+    try {
+      const r: number = p.setSubtitleTrack(index);
+      this.syncMediaInfo();
+      this.notify();
+      return r;
+    } catch (err) {
+      console.error('setSubtitleTrack failed: ' + JSON.stringify(err));
+      return -1;
+    }
+  }
+
+  /**
+   * 取当前该显示的字幕文本（内嵌字幕用）
+   *
+   * 每次都向原生查询，而不是靠事件推送 —— 理由见 C++ 侧 SubtitleCue 的说明：
+   * 字幕是时间对齐的，让 UI 按当前播放位置来问，天然同步。
+   *
+   * @return 字幕文本；空串表示这一刻没有字幕
+   */
+  getActiveSubtitle(): string {
+    const p: SoftPlayer | undefined = this.player;
+    if (p === undefined || this.released) {
+      return '';
+    }
+    try {
+      const s: string = p.getActiveSubtitle();
+      return s !== undefined && s !== null ? s : '';
+    } catch (err) {
+      return '';
+    }
+  }
+
+  /** 文件里是否有多条可切换音轨 */
+  canSwitchAudioTrack(): boolean {
+    return this.snapshot.audioTracks.length > 1;
+  }
+
+  /** 音频编码名（界面诊断用） */
+  getAudioCodec(): string {
+    return this.snapshot.audioCodec;
   }
 
   /** 记录错误并通知 */

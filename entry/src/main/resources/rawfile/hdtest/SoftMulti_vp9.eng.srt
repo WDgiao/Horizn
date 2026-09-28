@@ -1,0 +1,12 @@
+1
+00:00:01,500 --> 00:00:04,500
+Cue 1 - embedded English subtitle
+
+2
+00:00:06,000 --> 00:00:09,000
+Cue 2 - second line test
+line two
+
+3
+00:00:10,500 --> 00:00:13,500
+Cue 3 - cleanup <b>bold</b> {\pos(10,10)} test

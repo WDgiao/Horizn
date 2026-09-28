@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 /**
  * FFmpeg 调用边界
@@ -62,6 +63,58 @@ struct MediaSummary {
      *   这类文件）。C++ 侧原先是完全没处理这个的。
      */
     int32_t rotationDeg = 0;
+
+    /**
+     * 文件里的全部音轨（按流下标升序）
+     *
+     * 只包含**能真正解码**的音轨：avcodec_find_decoder 找得到解码器的。
+     * 找不到解码器的（例如没编进去的冷门编码）不列出来 —— 列了也切不过去，
+     * 反而让用户以为可以选。
+     */
+    std::vector<AudioTrackInfo> audioTracks;
+
+    /**
+     * 文件里的全部字幕轨（按流下标升序）
+     *
+     * 包含位图字幕（supported=false），理由见 SubtitleTrackInfo。
+     */
+    std::vector<SubtitleTrackInfo> subtitleTracks;
+
+    /**
+     * 本次会话实际选中的音轨下标
+     *
+     * 为什么要在结果里回报：调用方可能请求了一条不存在的音轨，
+     * 或者文件里根本没有音轨。回报真实生效的下标，界面才能正确显示
+     * "当前正在用哪一条"，而不是显示用户点的那条（可能根本没生效）。
+     */
+    int32_t selectedAudioIndex = -1;
+
+    /** 本次会话实际选中的字幕轨下标；-1 表示不显示字幕 */
+    int32_t selectedSubtitleIndex = -1;
+};
+
+/**
+ * 打开媒体时选择音轨 / 字幕轨
+ *
+ * 全部字段都可以用 -1（= 自动）。
+ *
+ * 为什么用"打开时指定"而不是"打开后切换"：
+ *   切换音轨最稳妥的做法就是把解码器重建一次 —— 音频解码上下文、
+ *   重采样上下文、包队列都跟具体那条流绑定，就地热替换要处理
+ *   线程停顿、队列清空、解码器冲刷，出错面大得多。
+ *   实测重开一次的成本也完全可以接受（打开 + 定位到原位置）。
+ *   所以引擎层把"切换"实现成「Close 再用新下标 Open + Seek 回原位置」。
+ */
+struct TrackRequest {
+    /** 期望的音频流下标；-1 = 自动（交给 av_find_best_stream 挑） */
+    int32_t audioStreamIndex = -1;
+    /**
+     * 期望的字幕流下标；-1 = 不启用字幕
+     *
+     * 默认不开字幕是刻意的：现有行为是"不放字幕"，
+     * 改成默认自动开会让老用户的体验突然变化。
+     */
+    int32_t subtitleStreamIndex = -1;
 };
 
 /**
@@ -71,7 +124,7 @@ struct MediaSummary {
 using Session = void *;
 
 /**
- * 打开媒体文件并初始化视频解码器
+ * 打开媒体文件并初始化解码器
  * @param path 文件绝对路径
  * @param outSession 成功时写入会话句柄（失败时保持 nullptr）
  * @param out 成功时填充媒体概况
@@ -80,6 +133,38 @@ using Session = void *;
  */
 int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
              std::string &errMsg);
+
+/**
+ * 打开媒体文件并初始化解码器，同时指定音轨 / 字幕轨
+ *
+ * 与上面的 Open 是同一个实现，上面那个等于传一个全 -1 的 TrackRequest。
+ * 之所以保留两个重载而不是加默认参数：ThumbnailExtractor 等调用方
+ * 不该关心轨道选择，让它们的调用点保持原样。
+ */
+int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
+             std::string &errMsg, const TrackRequest &tracks);
+
+/**
+ * 取一条字幕事件
+ *
+ * 只在 TrackRequest::subtitleStreamIndex >= 0 时有内容 —— 没选字幕轨时
+ * 解复用线程根本不会往字幕队列里放包，这里会立刻返回 kAgain。
+ *
+ * 返回的字幕是**按时间顺序**的。调用方（引擎）需要自己按当前播放位置
+ * 决定显示哪一条：字幕的解码与视频解码是异步的，两者之间没有严格的
+ * 一一对应关系。
+ *
+ * @return kOk 取到一条 / kAgain 暂时没有 / kEof 字幕流已结束 / 错误码
+ *
+ * 参数类型写全 softplayer:: 前缀：SubtitleEvent 定义在**外层** softplayer
+ * 命名空间（FfmpegTypes.h 里，与 VideoFrame / AudioChunk 同一处），
+ * 不在 codecapi 内。在 codecapi 里写裸名 SubtitleEvent 编译器找不到。
+ */
+int32_t ReadSubtitleEvent(Session session, softplayer::SubtitleEvent &out,
+                          std::string &errMsg);
+
+/** 本次会话是否启用了字幕轨 */
+bool HasSubtitle(Session session);
 
 /**
  * 解出一个视频帧

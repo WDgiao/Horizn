@@ -167,6 +167,81 @@ private:
     bool woken_ = false;
 };
 
+/**
+ * 音频轨信息
+ *
+ * 为什么需要它：
+ *   原先 Open() 用 av_find_best_stream 只挑"最好"的一条音轨，用户完全看不到
+ *   文件里还有别的音轨，更没法切换（多语言影片、导演评论轨都取不到）。
+ *   这里把可切换的音轨列出来交给界面做选择。
+ */
+struct AudioTrackInfo {
+    /**
+     * 在 AVFormatContext->streams[] 里的下标
+     *
+     * 这是切换音轨时传给引擎的唯一标识 —— 切换的实现是
+     * 「用新的下标重新 Open 一次 + seek 回原位置」，所以必须有稳定标识。
+     */
+    int32_t index = -1;
+    /** 编码名，例如 "aac" / "ac3" / "dca" */
+    std::string codec;
+    /** 语言标签（容器里的 metadata language，可能是 "chi" / "eng" / "jpn"） */
+    std::string language;
+    /** 轨道标题（例如 "国语" / "Director's Commentary"） */
+    std::string title;
+    /** 声道数，0 表示未知 */
+    int32_t channels = 0;
+    /** 采样率，0 表示未知 */
+    int32_t sampleRate = 0;
+    /** 码率（bps），0 表示未知 */
+    int64_t bitRate = 0;
+    /** 是否为容器标记的默认轨 */
+    bool isDefault = false;
+};
+
+/**
+ * 字幕轨信息
+ *
+ * 只列「文本型」字幕。位图字幕（PGS / VobSub / DVB）虽然也在这里列出，
+ * 但 supported 为 false —— 原因见 SubtitleEvent 的说明。
+ */
+struct SubtitleTrackInfo {
+    /** 在 AVFormatContext->streams[] 里的下标 */
+    int32_t index = -1;
+    /** 编码名，例如 "subrip" / "ass" / "mov_text" / "hdmv_pgs_subtitle" */
+    std::string codec;
+    std::string language;
+    std::string title;
+    /** 是否为容器标记的默认轨 */
+    bool isDefault = false;
+    /**
+     * 是否支持解码成文本
+     *
+     * 位图字幕（pgs / dvd_subtitle / dvb_subtitle / xsub）需要按调色板
+     * 还原成图片再叠加，本播放器只做文本字幕，所以这些会列出来但标记为
+     * 不支持 —— 让用户知道"这条轨道存在但放不了"，比直接隐藏更诚实。
+     */
+    bool supported = false;
+};
+
+/**
+ * 一条字幕事件
+ *
+ * 为什么用「开始/结束时间 + 文本」这种简单模型，而不是复用 FFmpeg 的 ASS 样式：
+ *   本播放器不支持 libass 渲染（那份 FFmpeg 构建里 CONFIG_ASS_DECODER=0，
+ *   而且 libass 依赖字体配置，HarmonyOS 上落地成本很高）。
+ *   所以 ASS 只取出纯文本，丢掉样式与定位 —— 这是有意取舍：
+ *   「能看到字幕」比「字幕样式完全还原」重要得多。
+ */
+struct SubtitleEvent {
+    /** 该条字幕开始显示的时间（毫秒） */
+    int64_t startMs = 0;
+    /** 该条字幕结束显示的时间（毫秒）；0 表示由下一条的到来或固定时长兜底 */
+    int64_t endMs = 0;
+    /** 文本内容（多行用 '\n' 分隔，ASS 已经换成换行） */
+    std::string text;
+};
+
 /** 音频输出参数 */
 struct AudioSpec {
     int sampleRate = 0;
