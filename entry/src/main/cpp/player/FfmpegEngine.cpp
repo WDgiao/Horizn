@@ -293,8 +293,18 @@ int32_t FfmpegEngine::Start() {
         // 否则首帧会按一个陈旧的 lastFrameSysMs_ 去算等待，导致开头卡住
         lastFramePtsMs_ = -1;
         lastFrameSysMs_ = 0;
-        decodeThread_ = std::thread(&FfmpegEngine::DecodeLoop, this);
+        // ★ 先置标志、再构造线程 —— 顺序不能反（踩过一次真机 SIGABRT）
+        //
+        //   原来写的是「构造线程 → threadStarted_ = true」。
+        //   如果线程在标志被置位之前就跑到退出分支（快速失败/瞬间 EOF），
+        //   而此刻 PrepareWithTracks 正好在跑（播放中换轨/换字幕），
+        //   就会出现：
+        //     · PrepareWithTracks 看到 threadStarted_ == false → **跳过 join**
+        //     · 随后 codecapi::Close(session_) 释放会话
+        //     · 那条"没人 join"的线程仍持有 session_ 并继续解引用 → 崩溃
+        //   置位提前之后，清理路径永远能看到它并 join。
         threadStarted_ = true;
+        decodeThread_ = std::thread(&FfmpegEngine::DecodeLoop, this);
     } else if (!threadStarted_ && !info_.hasVideo) {
         // ★ 纯音频文件（没有视频轨）不能启动视频解码线程。
         //
@@ -319,8 +329,9 @@ int32_t FfmpegEngine::Start() {
             audio_->Resume();
         }
         audioEof_.store(false);
-        audioThread_ = std::thread(&FfmpegEngine::AudioLoop, this);
+        // 先置标志再构造，理由同上面视频线程那段（防"没人 join"）
         audioThreadStarted_ = true;
+        audioThread_ = std::thread(&FfmpegEngine::AudioLoop, this);
         LOGI("音频线程已启动");
     }
 
@@ -329,8 +340,13 @@ int32_t FfmpegEngine::Start() {
     // 字幕读进来 —— 这样暂停状态下往回拖进度条，字幕能立刻显示，
     // 不用等恢复播放。字幕解析很轻，暂停期间继续读没有负担。
     if (subtitleEnabled_.load() && session_ != nullptr && !subtitleThreadStarted_) {
-        subtitleThread_ = std::thread(&FfmpegEngine::SubtitleLoop, this);
+        // ★ 同样是先置标志再构造。
+        //   这条线程尤其危险：它立刻就会调 ReadSubtitleEvent(session_,...)，
+        //   而"播放中启用字幕"这条路径紧接着就会重开会话并 Close(session_)。
+        //   一旦标志晚了，PrepareWithTracks 跳过 join，Close 就把正在被
+        //   这条线程使用的会话释放掉 —— 这正是真机上实测到的 SIGABRT。
         subtitleThreadStarted_ = true;
+        subtitleThread_ = std::thread(&FfmpegEngine::SubtitleLoop, this);
         LOGI("字幕线程已启动");
     }
 
@@ -1150,6 +1166,21 @@ bool FfmpegEngine::CanSwitchAudioTrack() const {
 }
 
 int32_t FfmpegEngine::SwitchAudioTrack(int32_t streamIndex) {
+    // 重入保护：重开会话的过程会停线程、关会话、重建三样东西，
+    // 期间绝不能让第二个重开请求插进来（会作用在半个状态上）。
+    // 用 CAS 而不是先 load 再 store，避免两次快速点击同时通过检查。
+    bool expected = false;
+    if (!reopening_.compare_exchange_strong(expected, true)) {
+        LOGW("已有一次轨道重开在进行中，忽略本次请求");
+        return -1;
+    }
+    // 用 RAII 保证任何 return 路径都会复位标志，
+    // 否则一次失败会把引擎永久锁死（后续再也切不了轨）
+    struct Guard {
+        std::atomic<bool> *f;
+        ~Guard() { f->store(false); }
+    } guard{&reopening_};
+
     // 目标必须真的存在，否则重开一次也只是白费功夫（还会把播放打断）
     bool found = false;
     for (const AudioTrackInfo &t : info_.audioTracks) {
@@ -1215,6 +1246,20 @@ int32_t FfmpegEngine::SetSubtitleTrack(int32_t streamIndex) {
     }
 
     // 打开某条字幕轨需要重开（解复用线程只在 Open 时才知道要投递哪条流）
+    //
+    // 重入保护：理由同 SwitchAudioTrack —— 重开过程绝不能并发。
+    // 字幕这条尤其要防：界面每 100ms 刷新一次字幕，用户连点两下
+    // "内嵌字幕"就可能把两次重开叠在一起。
+    bool expectedSub = false;
+    if (!reopening_.compare_exchange_strong(expectedSub, true)) {
+        LOGW("已有一次轨道重开在进行中，忽略本次字幕切换请求");
+        return -1;
+    }
+    struct Guard {
+        std::atomic<bool> *f;
+        ~Guard() { f->store(false); }
+    } guard{&reopening_};
+
     bool usable = false;
     for (const SubtitleTrackInfo &t : info_.subtitleTracks) {
         if (t.index == streamIndex) {

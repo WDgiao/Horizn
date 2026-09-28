@@ -516,6 +516,27 @@ struct DecoderSession {
     std::atomic<int64_t> pendingSeekMs{-1};
 
     /**
+     * seek 世代号（2026-09-29 新增）
+     *
+     * 由来：avcodec_flush_buffers 与 avcodec_send_packet / receive_frame
+     * **必须互斥**，否则会踩坏解码器内部状态导致 av_assert0 → abort
+     * （真机 SIGABRT，栈顶在 libavcodec）。
+     *
+     * 而"清理解码器缓冲"这件事原本由解复用线程代劳，它虽然持有 demuxMutex，
+     * 但解码线程并不持这个锁 —— 于是两者并发。修法就是让**拥有 context 的
+     * 那条线程**自己 flush：
+     *   · 解复用线程 seek 成功后把本计数器 +1；
+     *   · 视频/音频解码线程各自记住上次处理过的值，发现变了就先
+     *     avcodec_flush_buffers 自己的 context，再继续解包。
+     * 这样 flush 天然与解码串行（同一条线程），不需要任何跨线程协调。
+     */
+    std::atomic<int64_t> seekGeneration{0};
+    /** 视频解码线程已处理到的 seek 世代号 */
+    int64_t videoSeekGen = 0;
+    /** 音频解码线程已处理到的 seek 世代号 */
+    int64_t audioSeekGen = 0;
+
+    /**
      * 解复用线程的致命错误（av_read_frame 返回真错误时记下）
      * 0 表示无错。解码线程看到它就直接报错，避免静默卡死。
      */
@@ -1670,33 +1691,46 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
 }
 
 /**
- * 在解复用线程内部执行 seek
+ * 在解复用线程内部执行 seek（**只做解复用层的定位，不碰解码器**）
  *
  * 为什么必须是内部函数：av_seek_frame 会重置 fmtCtx 的读位置和内部缓冲，
  * 必须由独占 fmtCtx 的解复用线程来做。外部接口只写 pendingSeekMs，
  * 由本线程在每轮开头取走执行 —— 免除了「seek 与 read 并发」这个老问题
  * （之前靠 demuxMutex 串行，代价是 seek 期间两边互相等待、播放卡顿）。
  *
+ * ★★ 2026-09-29 关键修正：**avcodec_flush_buffers 绝不能在这里调** ★★
+ *
+ *   这是一个真实的崩溃（真机 SIGABRT，栈顶在 libavcodec，符号化后定位到
+ *   本函数），根因是**并发调用同一个 AVCodecContext**：
+ *     · 本函数跑在解复用线程上，持 demuxMutex；
+ *     · 视频解码线程在 DecodeVideoFrame 里调 avcodec_send_packet /
+ *       avcodec_receive_frame，而它**不持** demuxMutex；
+ *     · avcodec_flush_buffers 与解码操作必须互斥，否则会踩坏解码器内部
+ *       状态 → av_assert0 → abort。
+ *
+ *   之前没暴露，是因为"重开会话后立刻 seek"这条路径原本很少走；
+ *   新增"播放中换音轨/换字幕"（重开 + 恢复位置）之后，它变成每次切换
+ *   都必定走到，于是必然崩溃。
+ *
+ *   修法：把 flush 移到**各自解码线程**里做（谁拥有 context，谁负责 flush），
+ *   用 seekGeneration 计数器通知它们。解复用线程只负责 av_seek_frame。
+ *
  * @return 0 成功
  */
 int SeekInternal(DecoderSession *s, int64_t positionMs) {
+    if (s == nullptr || s->fmtCtx == nullptr) {
+        return AVERROR(EINVAL);
+    }
     const int64_t ts = av_rescale_q(positionMs, AVRational{1, 1000}, s->timeBase);
     // 必须往前找关键帧：不加 BACKWARD 会跳到目标之后，画面接不上
     const int ret = av_seek_frame(s->fmtCtx, s->videoStreamIndex, ts, AVSEEK_FLAG_BACKWARD);
     if (ret < 0) {
         return ret;
     }
-    // 三个缓冲都要清，否则 seek 后会先闪旧画面 / 先出残音
-    if (s->videoCtx != nullptr) {
-        avcodec_flush_buffers(s->videoCtx);
-    }
-    if (s->audioCtx != nullptr) {
-        avcodec_flush_buffers(s->audioCtx);
-    }
-    if (s->swr != nullptr) {
-        swr_close(s->swr);
-        swr_init(s->swr);
-    }
+    // ★ 通知两个解码线程"该 flush 了"。它们会在下次解包前各自清自己的
+    //   AVCodecContext（见 DecodeVideoFrame / DecodeAudioChunk 开头的处理）。
+    //   这里只递增计数器，不做任何跨线程的解码器操作 —— 这正是修复点。
+    s->seekGeneration.fetch_add(1);
     // 旧位置的包全部作废
     //
     // ★ 只清**包队列**，不清字幕缓存 —— 这是个必须讲清的取舍。
@@ -1728,6 +1762,18 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
     if (s == nullptr || s->videoCtx == nullptr) {
         errMsg = "会话无效或没有视频流";
         return kDecodeFailed;
+    }
+
+    // ★ 先处理 seek：如果解复用线程刚 seek 过，这里要清掉本线程这套
+    //   解码器里的旧帧。**必须由本线程做**（谁拥有 context 谁 flush），
+    //   原因见 seekGeneration 的说明与 SeekInternal 的注释。
+    //   放在循环之前而不是循环里：一次调用最多 flush 一次就够了。
+    {
+        const int64_t gen = s->seekGeneration.load();
+        if (gen != s->videoSeekGen) {
+            s->videoSeekGen = gen;
+            avcodec_flush_buffers(s->videoCtx);
+        }
     }
 
     // demux → decode 循环：一次调用可能吃掉多个 packet 才出一帧
@@ -1798,6 +1844,21 @@ int32_t DecodeAudioChunk(Session session, AudioChunk &chunk, std::string &errMsg
     if (s == nullptr || s->audioCtx == nullptr || s->swr == nullptr) {
         errMsg = "无音频轨或音频解码不可用";
         return kEof;
+    }
+
+    // ★ 音频侧的 seek 处理：清本线程的解码器与重采样器（同视频侧的理由）。
+    //   重采样器也要一起重置 —— 它内部有上一段残留的样本，
+    //   不清就会在 seek 后先吐出一小段旧音频（听感上是"跳回时有一声残音"）。
+    {
+        const int64_t gen = s->seekGeneration.load();
+        if (gen != s->audioSeekGen) {
+            s->audioSeekGen = gen;
+            avcodec_flush_buffers(s->audioCtx);
+            if (s->swr != nullptr) {
+                swr_close(s->swr);
+                swr_init(s->swr);
+            }
+        }
     }
 
     // demux → decode → resample 循环：一次调用可能吃掉多个 packet
