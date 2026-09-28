@@ -47,6 +47,18 @@
 *.mpg   binary
 *.m4v   binary
 *.avi   binary
+*.wav   binary
+*.mp3   binary
+*.aac   binary
+*.flac  binary
+*.ape   binary
+*.dts   binary
+*.tta   binary
+*.wv    binary
+*.mka   binary
+*.swf   binary
+*.mxf   binary
+*.dv    binary
 *.png   binary
 *.jpg   binary
 *.jpeg  binary
@@ -62,3 +74,7 @@
 # ---------- 语言统计（让 .so 不污染 GitHub 的语言占比条）----------
 entry/libs/** linguist-vendored
 entry/src/main/cpp/third_party/** linguist-vendored
+# 测试素材是数据不是代码，同样不该计入语言统计
+entry/src/main/resources/rawfile/codec/**  linguist-vendored
+entry/src/main/resources/rawfile/testset/** linguist-vendored
+entry/src/main/resources/rawfile/hdtest/**  linguist-vendored

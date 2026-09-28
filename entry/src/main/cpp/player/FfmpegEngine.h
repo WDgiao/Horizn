@@ -145,6 +145,22 @@ private:
     int32_t dropDbgCount_ = 0;
 
     /**
+     * 性能统计（诊断用，2026-09-28 加）
+     *
+     * 为什么要分开统计解码与上屏：
+     *   实测 720p 软解明显跟不上（前 30 帧花了约 4.7 秒），
+     *   但"慢"可能来自三个完全不同的地方：
+     *     ① FFmpeg 解码本身（rv20/av1 这类软解本来就重）
+     *     ② sws_scale 缩放（我们要把 1280x720 缩到 1084x610 并转 RGBA）
+     *     ③ RenderFrame 里拷进 surface buffer + 送显
+     *   不分开量就只能靠猜。decodeUs 覆盖 ①②（都在 DecodeVideoFrame 内），
+     *   renderUs 覆盖 ③。
+     */
+    int64_t perfDecodeUs_ = 0;
+    int64_t perfRenderUs_ = 0;
+    int64_t perfFrames_ = 0;
+
+    /**
      * surface 实际分配的 buffer 尺寸（显示区域尺寸，不是视频尺寸）
      *
      * 由 RenderFrame 首次拿到 buffer 时探得，之后解码线程据此缩放画面。

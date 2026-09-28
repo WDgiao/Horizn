@@ -26,6 +26,12 @@ int64_t NowMs() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+/** 取系统单调时钟微秒，用于性能统计（解码/上屏各占多少） */
+int64_t NowUs() {
+    using namespace std::chrono;
+    return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
 /** 帧队列深度：8 帧 ≈ 0.13 秒 @60fps，够平滑又不会让 seek 迟滞 */
 constexpr size_t kFrameQueueSize = 8;
 
@@ -545,7 +551,10 @@ void FfmpegEngine::DecodeLoop() {
                && queue->Size() < kFrameQueueSize) {
             VideoFrame frame;
             errMsg.clear();
+            // 统计单帧解码耗时（含 FFmpeg 解码 + sws 缩放，两者都在这个调用里）
+            const int64_t decodeT0 = NowUs();
             const int32_t ret = codecapi::DecodeVideoFrame(session_, frame, errMsg, tw, th);
+            perfDecodeUs_ += (NowUs() - decodeT0);
             if (ret == codecapi::kOk) {
                 queue->Push(frame);
                 burst++;
@@ -696,7 +705,23 @@ void FfmpegEngine::DecodeLoop() {
             break;
         }
 
+        const int64_t renderT0 = NowUs();
         RenderFrame(frame);
+        perfRenderUs_ += (NowUs() - renderT0);
+        perfFrames_++;
+        // 每 30 帧打一次性能汇总，用来定位"卡"到底卡在解码还是上屏
+        if ((perfFrames_ % 30) == 0) {
+            const int64_t df = perfFrames_ > 0 ? (perfDecodeUs_ / perfFrames_) : 0;
+            const int64_t rf = perfFrames_ > 0 ? (perfRenderUs_ / perfFrames_) : 0;
+            LOGI("perf: 帧数=%{public}lld 解码均=%{public}lld us 上屏均=%{public}lld us "
+                 "合计=%{public}lld us（%{public}lld fps 上限）丢帧=%{public}lld",
+                 static_cast<long long>(perfFrames_),
+                 static_cast<long long>(df),
+                 static_cast<long long>(rf),
+                 static_cast<long long>(df + rf),
+                 static_cast<long long>(df + rf > 0 ? 1000000 / (df + rf) : 0),
+                 static_cast<long long>(droppedFrames_.load()));
+        }
 
         // 位置按 pts 上报，而不是按解到第几帧 ——
         // 这样 seek 之后进度条能立刻跳到正确位置

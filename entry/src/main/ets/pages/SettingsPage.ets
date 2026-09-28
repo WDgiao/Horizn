@@ -166,6 +166,29 @@ struct SettingsPage {
   }
 
   /**
+   * 解包高分辨率压力测试素材到沙箱
+   *
+   * 素材随 HAP 打包在 rawfile/hdtest/ 下（共约 11 MB）。
+   * 为什么不能像普通文件那样用 hdc 推进沙箱：见 unpackHdSamples 的说明 ——
+   * 沙箱跨 uid，hdc 无法写入，只能由应用自己落盘。
+   */
+  private async unpackHdSamples(): Promise<void> {
+    this.testLog = '';
+    this.appendLog('解包高清测试素材（rawfile/hdtest → 沙箱）…');
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const list: string[] = await SurfacePlaybackTester.unpackHdSamples(ctx);
+      for (let i = 0; i < list.length; i++) {
+        this.appendLog('  ' + list[i]);
+      }
+      this.appendLog('完成。去「文件搜索」页点「重新扫描」即可看到。');
+      this.appendLog('用途：720p 样本判断真实播放负载；24bit/32bit 浮点 WAV 验证新补的 PCM 解码器。');
+    } catch (err) {
+      this.appendLog('解包失败：' + JSON.stringify(err));
+    }
+  }
+
+  /**
    * 跳转压力测试：程序化地极高频 push/back 播放页
    *
    * 为什么用程序化跳转而不是模拟点击：
@@ -589,6 +612,16 @@ struct SettingsPage {
               .padding(4)
               .onClick(() => {
                 this.publishTestset();
+              })
+
+            // 高分辨率压力测试素材：rawfile/hdtest 解包到沙箱
+            // 用途：内置样本全是 320x240 以下的小文件，判断不了"播放流畅不流畅"
+            Text('拉高清')
+              .fontSize(12)
+              .fontColor(Theme.ACCENT)
+              .padding(4)
+              .onClick(() => {
+                this.unpackHdSamples();
               })
           }
           .width('100%')

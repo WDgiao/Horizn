@@ -48,6 +48,15 @@ const UNPACK_DIR: string = 'codec-test';
  */
 const TESTSET_DIR: string = '测试素材';
 
+/**
+ * 高分辨率压力测试素材在沙箱里的目录名
+ *
+ * 单独一层是为了在搜索页里一眼认出它们。
+ * 这批素材存在的唯一理由：内置样本分辨率太低（≤320x240），
+ * 判断不了「播放流畅不流畅」，也验不了新补的音频格式。
+ */
+const HD_DIR: string = 'HD测试素材';
+
 /** 单个文件观察时长（毫秒） */
 const WATCH_MS: number = 2500;
 
@@ -355,5 +364,73 @@ export class SurfacePlaybackTester {
   static async ensureSamplePath(context: common.UIAbilityContext): Promise<string> {
     const dir: string = await SurfacePlaybackTester.unpackSamples(context);
     return dir + '/12_rv10.rm';
+  }
+
+  /**
+   * 把「高分辨率压力测试素材」从 rawfile/hdtest/ 解包到沙箱
+   *
+   * ★ 为什么必须打包进 HAP（2026-09-28 实测把路都试尽了）：
+   *   应用沙箱 /data/app/el2/100/base/<bundle>/haps/entry/files 归属应用 uid
+   *   （20020216），而 hdc 跑在 uid=2000(shell)，跨 uid 写入一律被拒：
+   *     · hdc file send 到沙箱      → permission denied
+   *     · hdc shell touch/cp 到沙箱 → permission denied
+   *     · 公共 Download 目录        → hdc 无权写（el2 目录归媒体服务所有）
+   *     · /data/local/tmp           → hdc 能写，但应用【看不到】它
+   *       （实测 accessSync 逐个精确路径都返回 false；沙箱隔离，
+   *        不是权限位问题 —— /data/local/tmp 是 drwxrwx--x，
+   *        others 可穿过，但应用进程根本不在那个挂载视图里）
+   *     · run-as / nsenter 切 uid  → 设备上没有 run-as
+   *   结论：外部注入沙箱这条路是死的，只能随 HAP 打包、由应用自己落盘。
+   *
+   * 为什么需要高分辨率素材：
+   *   内置的 12 个格式样本全是 320x240 以下的极低分辨率小文件，
+   *   软解后要放大到 1084x610 上屏，画面必然发糊；码率又极低，
+   *   压不出解码器的真实性能 —— 用它们判断「播放流畅不流畅」没有意义。
+   *
+   * 体积代价：本组 4 个文件共约 11 MB（已尽量只挑必要项）。
+   *   720p 的 VP9 / WMV2、1080p H.264、多音轨 MKV 这 4 个更大的样本
+   *   没有打进来 —— 需要时改本目录内容重新构建即可。
+   *
+   * @param context 上下文
+   * @returns 每个文件的解包结果描述
+   */
+  static async unpackHdSamples(context: common.UIAbilityContext): Promise<string[]> {
+    const dir: string = context.filesDir + '/' + HD_DIR;
+    if (!fileIo.accessSync(dir)) {
+      fileIo.mkdirSync(dir, true);
+    }
+    // 列目录而不是写死文件名：以后往 rawfile/hdtest/ 里换样本时不用改代码
+    const names: string[] = await context.resourceManager.getRawFileList('hdtest');
+    const done: string[] = [];
+    for (let i = 0; i < names.length; i++) {
+      const name: string = names[i];
+      const target: string = dir + '/' + name;
+      let need: boolean = true;
+      try {
+        if (fileIo.accessSync(target) && fileIo.statSync(target).size > 0) {
+          need = false;
+        }
+      } catch (err) {
+        need = true;
+      }
+      if (!need) {
+        done.push(name + '（已存在）');
+        continue;
+      }
+      try {
+        const bytes: Uint8Array = await context.resourceManager.getRawFileContent('hdtest/' + name);
+        const file = fileIo.openSync(target,
+          fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
+        try {
+          fileIo.writeSync(file.fd, bytes.buffer.slice(0, bytes.length));
+        } finally {
+          fileIo.closeSync(file);
+        }
+        done.push(name + '  ' + (bytes.length / 1024).toFixed(0) + ' KB');
+      } catch (err) {
+        done.push(name + ' 失败: ' + JSON.stringify(err));
+      }
+    }
+    return done;
   }
 }
