@@ -206,6 +206,113 @@ int InterruptCallback(void *opaque) {
 namespace {
 
 /**
+ * 采样实测「每秒码率」，用于给没有时长的裸流估时长
+ *
+ * 为什么不直接用常数（这是踩过的坑）：
+ *   DTS-HD MA 是**无损**编码，第一版按理论 PCM 码率算
+ *      声道数 × 位深 × 采样率
+ *   实测三个真实样本后发现有损 core 层是**叠加**在无损层上的额外开销，
+ *   真实码率与理论值的比值跨度极大：
+ *        MA 2.0 / 16bit : 1,776,507 / 1,536,000 = 1.16  （core 开销占主导）
+ *        MA 5.1 / 24bit : 4,055,242 / 6,912,000 = 0.59  （压缩明显）
+ *        MA 7.1 / 24bit : 7,662,835 / 9,216,000 = 0.83
+ *   任何一元常数都不可能同时拟合这三点，所以改成实测。
+ *
+ * 做法：另开一个解复用器读开头若干包，量出
+ *     「这段字节数」对应的「精确时长」
+ * 两者相除就是真实平均码率，再拿文件总大小外推总时长。
+ * 只读开头几百个包（不到一秒的 I/O），不会拖慢打开速度。
+ *
+ * @param path      文件路径
+ * @param maxProbe  最多读多少个包（取到就够了，不必读完整个文件）
+ * @return 实测码率（bps）；测不出来返回 0
+ */
+int64_t MeasureStreamBitRate(const std::string &path, int maxProbe) {
+    AVFormatContext *fmt = nullptr;
+    if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) {
+        return 0;
+    }
+    if (avformat_find_stream_info(fmt, nullptr) < 0) {
+        avformat_close_input(&fmt);
+        return 0;
+    }
+
+    // 找第一条音频流（纯音频文件场景，一般为 0 号流）
+    const int aIdx = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (aIdx < 0) {
+        avformat_close_input(&fmt);
+        return 0;
+    }
+    const AVRational tb = fmt->streams[aIdx]->time_base;
+    const int frameSize = fmt->streams[aIdx]->codecpar->frame_size;
+    const int sampleRate = fmt->streams[aIdx]->codecpar->sample_rate;
+
+    AVPacket *pkt = av_packet_alloc();
+    if (pkt == nullptr) {
+        avformat_close_input(&fmt);
+        return 0;
+    }
+
+    int64_t firstPos = -1;
+    int64_t lastPos = -1;
+    int64_t firstPts = AV_NOPTS_VALUE;
+    int64_t lastPts = AV_NOPTS_VALUE;
+    int64_t packets = 0;
+    // 时间戳缺失时用 frame_size 累加出来的时长兜底（dca 的 frame_size 是
+    // 「每帧样本数」，即 core 帧的 PCM 块数，对 DTS 通常是 512）
+    int64_t synthSamples = 0;
+
+    while (packets < maxProbe && av_read_frame(fmt, pkt) >= 0) {
+        if (pkt->stream_index == aIdx) {
+            if (firstPos < 0) {
+                firstPos = pkt->pos;
+            }
+            if (pkt->pos >= 0) {
+                lastPos = pkt->pos + pkt->size;
+            }
+            if (pkt->pts != AV_NOPTS_VALUE) {
+                if (firstPts == AV_NOPTS_VALUE) {
+                    firstPts = pkt->pts;
+                }
+                lastPts = pkt->pts;
+            }
+            if (frameSize > 0) {
+                synthSamples += frameSize;
+            }
+            packets++;
+        }
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+    avformat_close_input(&fmt);
+
+    if (packets <= 0) {
+        return 0;
+    }
+
+    // 字节跨度优先用实测的包位置差；拿不到就用「包数 × 平均包大小」不可靠，
+    // 这里直接退回失败，让调用方保持"时长未知"而不是给一个错得离谱的值
+    if (firstPos < 0 || lastPos <= firstPos) {
+        return 0;
+    }
+    const int64_t byteSpan = lastPos - firstPos;
+
+    int64_t durationMs = 0;
+    if (firstPts != AV_NOPTS_VALUE && lastPts != AV_NOPTS_VALUE
+        && lastPts > firstPts) {
+        durationMs = av_rescale_q(lastPts - firstPts, tb, AVRational{1, 1000});
+    } else if (synthSamples > 0 && sampleRate > 0) {
+        durationMs = synthSamples * 1000 / sampleRate;
+    }
+    if (durationMs <= 0) {
+        return 0;
+    }
+
+    // 每毫秒字节数 -> bps
+    return byteSpan * 8 * 1000 / durationMs;
+}
+
+/**
  * 统一的音频输出格式
  *
  * 为什么固定成 48kHz / 立体声 / S16LE：
@@ -832,6 +939,57 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
         out.durationMs = av_rescale_q(fmt->streams[vIdx]->duration,
                                       fmt->streams[vIdx]->time_base,
                                       AVRational{1, 1000});
+    }
+
+    // ---- 时长兜底：裸音频流容器里根本没有时长 ----
+    //
+    // 实测踩到：DTS-HD MA 的 .dtshd 纯音频文件能正常播（XLL 解出 6ch，
+    // 全程零欠载），但进度条显示 00:19 / 00:00 —— 总时长为 0。
+    // 后果不只是显示难看：PlayerPage 里滑块的上限写的是
+    //     max: this.durationMs > 0 ? this.durationMs : 1
+    // 于是 max=1，滑块永远贴在最右，**用户根本没法拖进度**。
+    //
+    // 根因：上面两个分支都取不到值。裸流（.dts/.dtshd/.ac3/.thd 这类）
+    // 没有容器层，fmt->duration 是 AV_NOPTS_VALUE；而 vIdx < 0（纯音频，
+    // 没有视频轨），第二个分支也不成立。
+    //
+    // 为什么只给纯音频（vIdx < 0）做兜底，而不给视频做：
+    //   视频缺时长的是 raw H.264/H.265 这类，码率跨度从几十 kbps 到几十 Mbps，
+    //   采样开头一小段外推整个文件同样不可靠，而且视频文件通常很大、
+    //   采样成本也高。纯音频则满足两个条件：文件通常不大，且码率在
+    //   整个文件里相对平稳，采样外推的可信度高得多。
+    if (out.durationMs <= 0 && vIdx < 0 && aIdx >= 0) {
+        // 文件总大小（avio_size 对 fd:// 与普通路径都有效）
+        const int64_t fileSize = (fmt->pb != nullptr) ? avio_size(fmt->pb) : -1;
+
+        if (fileSize > 0) {
+            // 一级：容器/流里声明的码率，有就直接用，最省事也最准
+            int64_t bitRate = fmt->bit_rate;
+            if (bitRate <= 0) {
+                bitRate = fmt->streams[aIdx]->codecpar->bit_rate;
+            }
+
+            // 二级：实测。读开头 800 个包量出「字节跨度 / 精确时长」得到真实码率。
+            // 为什么不用理论 PCM 码率：DTS-HD MA 是有损 core + 无损残差两层叠加，
+            // 真实码率与理论值的比值在实测样本里从 0.59 跨到 1.16
+            //（2.0/16bit 反而超理论值，因为 core 层是额外开销），
+            // 常数无法拟合，只能实测。详见 MeasureStreamBitRate 的注释。
+            bool measured = false;
+            if (bitRate <= 0) {
+                bitRate = MeasureStreamBitRate(path, 800);
+                measured = bitRate > 0;
+            }
+
+            if (bitRate > 0) {
+                out.durationMs = fileSize * 8 * 1000 / bitRate;
+                LOGI("容器未提供时长（裸流），%{public}s码率 %{public}lld bps × "
+                     "%{public}lld 字节 -> %{public}lld ms",
+                     measured ? "实测" : "声明",
+                     static_cast<long long>(bitRate),
+                     static_cast<long long>(fileSize),
+                     static_cast<long long>(out.durationMs));
+            }
+        }
     }
 
     // packet 是「解复用线程读包用」，audioPacket / videoPacket 分别是
