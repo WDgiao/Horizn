@@ -9,6 +9,7 @@ import { FolderCard } from '../view/FolderCard';
 import { FloatingNav } from '../view/FloatingNav';
 import { ToastView, TOAST_BOTTOM_OFFSET } from '../view/ToastView';
 import { showToast, initToast } from '../common/Toast';
+import { initStartupNotice, showStartupNotice } from '../common/StartupNotice';
 import { WatchHistory, WatchRecord } from '../model/WatchHistory';
 import { FolderRepository, MediaFolder } from '../model/FolderRepository';
 import { ThumbnailProvider, ThumbStats } from '../model/ThumbnailProvider';
@@ -80,6 +81,13 @@ struct Index {
   aboutToAppear(): void {
     // 把 UIContext 交给公共提示模块，使其可在任意页面调用系统 Toast
     initToast(this.getUIContext());
+    // 早期阶段提示：同一句话先跟使用者讲清楚，避免撞上各种粗糙之处
+    // 再以为软件坏了。用 setTimeout 0 让首页先完成首帧渲染，
+    // 否则在组件构建期间弹模态框容易出现"渲染未完成就弹窗"的时序问题。
+    initStartupNotice(this.getUIContext());
+    setTimeout(() => {
+      showStartupNotice();
+    }, 0);
     try {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       this.diag = new DiagLog(ctx);
