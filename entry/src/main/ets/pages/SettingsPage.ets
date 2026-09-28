@@ -736,6 +736,16 @@ struct SettingsPage {
               .borderRadius(14)
               .shadow({ radius: 10, color: 'rgba(0,0,0,0.05)', offsetX: 0, offsetY: 3 })
               .onClick(() => {
+                // 「网络流」已有独立页面（列表 / 增删改 / 持久化都可用），
+                // 它不再属于"功能待完善"那一类
+                if (item.title === '网络流') {
+                  this.getUIContext().getRouter()
+                    .pushUrl({ url: 'pages/NetworkStreamPage' })
+                    .catch(() => {
+                      showToast('无法打开网络流页');
+                    });
+                  return;
+                }
                 showToast(item.title + '：功能待完善');
               })
             }

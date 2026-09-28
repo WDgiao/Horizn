@@ -743,8 +743,14 @@ struct Index {
       return;
     }
     if (index === 2) {
-      // 添加视频 / 网络流：功能待实现
-      showToast('添加视频 / 网络流：功能待完善');
+      // 添加视频 / 网络流 → 网络流管理页
+      // 说明：底部这个「添加」目前在原型里就是「添加视频/网络流」的入口。
+      //   「添加视频」走的是系统文件选择器（SearchPage 的「从手机导入」），
+      //   「网络流」则是独立的管理页，所以这里直接进网络流列表，
+      //   由列表右上角的「+ 添加」去录地址。
+      this.getUIContext().getRouter().pushUrl({ url: 'pages/NetworkStreamPage' }).catch(() => {
+        showToast('无法打开网络流页');
+      });
       return;
     }
     this.openSettings();

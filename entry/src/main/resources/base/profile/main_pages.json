@@ -6,6 +6,8 @@
     "pages/SettingsPage",
     "pages/FolderCreatePage",
     "pages/RenamePage",
-    "pages/FileDetailPage"
+    "pages/FileDetailPage",
+    "pages/NetworkStreamPage",
+    "pages/StreamEditPage"
   ]
 }
