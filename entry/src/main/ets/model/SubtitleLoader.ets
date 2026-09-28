@@ -19,7 +19,8 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { picker } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
 import {
-  SubtitleCue, SubtitleLoadResult, decodeSubtitleBytes, parseSubtitleText, findActiveCueIndex
+  SubtitleCue, SubtitleLoadResult, SubtitleDecodeResult, decodeSubtitleBytesEx,
+  parseSubtitleText, findActiveCueIndex
 } from './SubtitleParser';
 
 /** 支持的外挂字幕扩展名（小写，不含点） */
@@ -117,8 +118,12 @@ export async function loadSubtitleFile(path: string): Promise<SubtitleLoadResult
     const buf: ArrayBuffer = new ArrayBuffer(stat.size);
     const read: number = fileIo.readSync(file.fd, buf, { offset: 0, length: stat.size });
     const bytes: Uint8Array = new Uint8Array(buf, 0, read);
-    const text: string = decodeSubtitleBytes(bytes);
-    const cues: SubtitleCue[] = parseSubtitleText(text, baseName(path));
+    // ★ 2026-09-29：改用带编码名的解码入口。
+    //   result.encoding 以前永远为空，界面上"字幕编码"一栏白占位，
+    //   而中文乱码时用户最需要知道的就是它到底按什么编码解的。
+    const decoded: SubtitleDecodeResult = decodeSubtitleBytesEx(bytes);
+    result.encoding = decoded.encoding;
+    const cues: SubtitleCue[] = parseSubtitleText(decoded.text, baseName(path));
     if (cues.length === 0) {
       result.error = '没能从文件里解析出字幕内容';
       return result;
@@ -128,6 +133,8 @@ export async function loadSubtitleFile(path: string): Promise<SubtitleLoadResult
     current.path = path;
     current.name = baseName(path);
     result.count = cues.length;
+    console.info('[Subtitle] 已加载 ' + baseName(path) + ' 共 ' + cues.length.toString()
+      + ' 条，编码 ' + decoded.encoding);
     return result;
   } catch (err) {
     const e = err as BusinessError;
@@ -138,7 +145,10 @@ export async function loadSubtitleFile(path: string): Promise<SubtitleLoadResult
       try {
         fileIo.closeSync(file);
       } catch (err) {
-        // 关闭失败无需上报
+        // ★ 2026-09-29：原先这里是空 catch。
+        //   关闭失败会漏 fd，长期反复选字幕可能耗尽句柄，
+        //   而"静默吞掉"让这种泄漏在日志里完全不可见。至少记一条。
+        console.warn('[Subtitle] 关闭字幕文件失败: ' + path);
       }
     }
   }
@@ -310,21 +320,31 @@ export async function pickSubtitleFile(context: common.UIAbilityContext,
   const targetPath: string = destDir + '/' + targetName;
   let src: fileIo.File | undefined = undefined;
   let dst: fileIo.File | undefined = undefined;
+  let copied: boolean = false;
   try {
     src = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
     dst = fileIo.openSync(targetPath,
       fileIo.OpenMode.WRITE_ONLY | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
     await fileIo.copyFile(src.fd, dst.fd);
+    copied = true;
   } catch (err) {
     const e = err as BusinessError;
     result.error = '复制字幕文件失败：' + (e.message !== undefined ? e.message : '未知错误');
     return result;
   } finally {
     if (src !== undefined) {
-      try { fileIo.closeSync(src); } catch (err) { }
+      try {
+        fileIo.closeSync(src);
+      } catch (err) {
+        console.warn('[Subtitle] 关闭源字幕失败');
+      }
     }
     if (dst !== undefined) {
-      try { fileIo.closeSync(dst); } catch (err) { }
+      try {
+        fileIo.closeSync(dst);
+      } catch (err) {
+        console.warn('[Subtitle] 关闭目标字幕失败');
+      }
     }
   }
 
@@ -334,11 +354,86 @@ export async function pickSubtitleFile(context: common.UIAbilityContext,
   // 界面要显示"xxx.srt"，显示 sub_1234_xxx.srt 会让人困惑
   if (loadResult.error.length === 0) {
     current.name = guessNameFromUri(uri);
+    // ★ 2026-09-29：清掉本模块以前复制进来、已经用不到的临时副本。
+    //   每选一次字幕就多一个 sub_<时间戳>_xxx 文件，且永远不再被引用 ——
+    //   反复换字幕会把沙箱 files 目录堆满。
+    //   安全边界：只删本函数自己命名的 `sub_<纯数字>_*`，且只在 destDir 内、
+    //   只保留最近几条，绝不触碰用户自己的字幕文件或其它目录。
+    pruneOldSubtitleCopies(destDir, targetName, copied);
   }
   return loadResult;
 }
 
-/** 从文档 URI 里猜出文件名（URI 末尾通常是编码过的文件名） */
+/** 保留的历史字幕副本条数（含最新一条） */
+const KEEP_SUBTITLE_COPIES: number = 3;
+
+/**
+ * 清理本模块自己复制进来的旧字幕副本
+ *
+ * 识别规则严格限定为 `sub_<纯数字>_<任意>`，这是 pickSubtitleFile 的命名格式；
+ * 用户自己的字幕文件（xxx.srt、movie.chs.ass 等）不会命中，因而绝不会被删。
+ *
+ * @param destDir 副本所在目录
+ * @param keepName 必须保留的文件名（刚写好的那条）
+ * @param didCopy 本次是否真的复制成功了；没成功就什么都别动
+ */
+function pruneOldSubtitleCopies(destDir: string, keepName: string, didCopy: boolean): void {
+  if (!didCopy) {
+    return;
+  }
+  try {
+    const names: string[] = fileIo.listFileSync(destDir);
+    const mine: string[] = [];
+    for (let i: number = 0; i < names.length; i++) {
+      const name: string = names[i];
+      if (name === keepName || !name.startsWith('sub_')) {
+        continue;
+      }
+      // sub_ 之后必须是时间戳（纯数字），再接一个下划线
+      const rest: string = name.substring(4);
+      const us: number = rest.indexOf('_');
+      if (us <= 0) {
+        continue;
+      }
+      const stamp: string = rest.substring(0, us);
+      if (!/^\d+$/.test(stamp)) {
+        continue;
+      }
+      mine.push(name);
+    }
+    if (mine.length <= KEEP_SUBTITLE_COPIES - 1) {
+      return;
+    }
+    // 时间戳越大越新，保留最新的若干条
+    mine.sort((a: string, b: string): number => b.localeCompare(a));
+    for (let i: number = KEEP_SUBTITLE_COPIES - 1; i < mine.length; i++) {
+      const full: string = destDir + '/' + mine[i];
+      // 双保险：绝不动当前生效的那条
+      if (full === current.path) {
+        continue;
+      }
+      try {
+        fileIo.unlinkSync(full);
+      } catch (err) {
+        console.warn('[Subtitle] 清理旧字幕副本失败: ' + full);
+      }
+    }
+  } catch (err) {
+    // 列目录失败说明沙箱异常，清理只是顺手做的事，忽略即可
+    console.warn('[Subtitle] 无法列出沙箱目录以清理字幕副本');
+  }
+}
+
+/**
+ * 从文档 URI 里猜出文件名（URI 末尾通常是编码过的文件名）
+ *
+ * ★ 2026-09-29 自检修正：这个函数的返回值会被用来拼沙箱内的写入路径，
+ *   而 decodeURIComponent 会把 %2F 还原成 '/'、%2E%2E 还原成 '..'。
+ *   也就是说一个精心构造的 URI 可以让 targetPath 逃出 destDir
+ *   （写入沙箱其它位置，甚至覆盖已有文件）。
+ *   在 URI 里出现转义的斜杠并不罕见，这不是纯理论问题。
+ *   现在解码之后必须再过一遍净化：只取最后一段、拒绝 '..'、去掉控制字符。
+ */
 function guessNameFromUri(uri: string): string {
   const slash: number = uri.lastIndexOf('/');
   let name: string = slash < 0 ? uri : uri.substring(slash + 1);
@@ -349,6 +444,30 @@ function guessNameFromUri(uri: string): string {
     name = decodeURIComponent(name);
   } catch (err) {
     // URI 里可能有非法转义，解不开就用原样
+    console.info('[Subtitle] URI 解码失败，按原样使用文件名');
+  }
+  // ---- 净化：解码之后才做，因为分隔符可能是转义进来的 ----
+  const lastSlash: number = name.lastIndexOf('/');
+  const lastBackslash: number = name.lastIndexOf('\\');
+  const cut: number = Math.max(lastSlash, lastBackslash);
+  if (cut >= 0) {
+    name = name.substring(cut + 1);
+  }
+  // 去掉控制字符（含换行、NUL 之类），它们在文件名里只会惹麻烦
+  let cleaned: string = '';
+  for (let i: number = 0; i < name.length; i++) {
+    const c: number = name.charCodeAt(i);
+    if (c >= 32 && c !== 127) {
+      cleaned += name.charAt(i);
+    }
+  }
+  name = cleaned;
+  // 开头的点：'..' 是目录穿越，'.' 开头是隐藏文件，一律去掉
+  while (name.startsWith('.')) {
+    name = name.substring(1);
+  }
+  if (name.length === 0 || name === '..') {
+    name = 'subtitle.srt';
   }
   return name;
 }

@@ -64,6 +64,16 @@ struct SearchPage {
   private importer: MediaImporter | undefined = undefined;
   /** 是否正在导入（复制大文件耗时，需要禁用按钮并提示） */
   @State importing: boolean = false;
+  /**
+   * 扫描代号：每次发起新扫描就自增，用来让上一轮自行退出
+   *
+   * ★ 2026-09-29 自检新增。原先 aboutToDisappear 里只有一句
+   *   `this.scanning = false;` —— 那句话只是**改了界面上的忙碌标记**，
+   *   正在跑的扫描循环看不到它，也不会停下来：它会继续遍历、继续占主线程，
+   *   结束后照旧往一个已经销毁的组件上写 @State 和弹 Toast。
+   *   现在把它换成一个真正的取消信号。
+   */
+  private scanSeq: number = 0;
   /** 文件夹仓库，用于「移动文件」的目标目录选择 */
   private folderRepo: FolderRepository | undefined = undefined;
   /** 当前被长按选中的文件（长按菜单需要它作为操作目标） */
@@ -107,6 +117,12 @@ struct SearchPage {
   }
 
   aboutToDisappear(): void {
+    // ★ 2026-09-29 自检修正：原先只有 `this.scanning = false;`，
+    //   那句只是把界面上的"正在扫描…"改掉，**并不能停止扫描**：
+    //   循环照样跑完、照样写 @State、照样弹 Toast。
+    //   现在自增代号，让正在跑的那一轮在下一个检查点退出；
+    //   scanning 仍然复位，保证下次进来按钮不是灰的。
+    this.scanSeq++;
     this.scanning = false;
   }
 
@@ -310,18 +326,48 @@ struct SearchPage {
       return;
     }
     this.scanning = true;
+    // 本轮代号；aboutToDisappear 自增它即可取消本轮
+    const token: number = ++this.scanSeq;
+    const cancelled = (): boolean => this.scanSeq !== token;
     const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
     try {
       this.publicGranted = await requestScanPermissions(ctx);
     } catch (err) {
       this.publicGranted = false;
     }
+    if (cancelled()) {
+      this.writeScanDiag('扫描已取消（权限申请返回后）');
+      return;
+    }
 
     // 沙箱目录无需权限，即使被拒也继续扫描
     // 有限定目录时只扫该目录，否则走全量候选扫描
-    const result: ScanResult = this.limitedDir.length > 0
-      ? this.repository.scanSingleDir(this.limitedDir)
-      : this.repository.scan();
+    //
+    // ★ 2026-09-29 自检修正：改用**协作式**（异步）扫描。
+    //   原先调的是同步版 scan / scanSingleDir，它们内部用
+    //   listFileSync + statSync 完成整棵树的遍历，全程占着 UI 线程：
+    //   目录一大界面就整块卡死，连"正在扫描…"这几个字都刷不出来。
+    //   协作版逻辑完全一致，只是每层目录之间让出一次主线程，
+    //   并且每步都检查取消标志。
+    let result: ScanResult = { files: [], probes: [] };
+    try {
+      result = this.limitedDir.length > 0
+        ? await this.repository.scanSingleDirCooperative(this.limitedDir, cancelled)
+        : await this.repository.scanCooperative(cancelled);
+    } catch (err) {
+      const e = err as BusinessError;
+      this.writeScanDiag('扫描异常: ' + e.code.toString() + ' ' + e.message);
+      if (!cancelled()) {
+        this.scanning = false;
+        showToast('扫描失败：' + (e.message !== undefined ? e.message : '未知错误'));
+      }
+      return;
+    }
+    // 页面已经切走：不要写 @State，也不要弹 Toast
+    if (cancelled()) {
+      this.writeScanDiag('扫描已取消（结果返回后丢弃 ' + result.files.length.toString() + ' 条）');
+      return;
+    }
     this.allFiles = result.files;
     this.probes = result.probes;
     this.scanned = true;
@@ -336,6 +382,11 @@ struct SearchPage {
     } else {
       showToast('扫描完成，共 ' + this.allFiles.length.toString() + ' 个媒体文件');
     }
+  }
+
+  /** 扫描相关的诊断（只在控制台留痕，不参与界面状态） */
+  private writeScanDiag(msg: string): void {
+    console.info('[Search] ' + msg);
   }
 
   /**
@@ -863,9 +914,13 @@ struct SearchPage {
         // List 显式给宽高（ArkTSCheck 会提示）：
         //   只设 layoutWeight 时宽度是隐式的，配合 scrollBar 会偶发滚动条位置不对。
         //   显式写 100% 宽 + layoutWeight(1) 高度，语义清楚也不会影响布局结果。
+        //
+        // ★ 2026-09-29 自检修正：这里原本连着写了两遍 `.width('100%')`
+        //   （第 917 行和第 919 行），纯属复制粘贴的残留 ——
+        //   第二次赋值覆盖第一次，结果虽然一样，但会让人误以为
+        //   两者含义不同而不敢删。去掉重复的那一行。
         .width('100%')
         .layoutWeight(1)
-        .width('100%')
         .padding({ left: Theme.PAGE_PADDING, right: Theme.PAGE_PADDING, bottom: 24 })
         .scrollBar(BarState.Off)
       } else {

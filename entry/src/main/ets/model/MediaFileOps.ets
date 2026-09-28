@@ -196,18 +196,27 @@ export class MediaFileOps {
     };
 
     // ---- 文件系统信息 ----
+    // ★ 2026-09-29 自检修正：详情页必须用「当场 stat 到的大小」
+    //
+    //   下面读媒体信息时原本传的是 file.size —— 那是**扫描时**记下的旧值。
+    //   文件被替换/追加过（例如刚下载完成、刚复制进来）之后，
+    //   旧值会偏小，fdSrc.length 截断文件，AVMetadataExtractor
+    //   解析到一半就失败，详情页的时长与分辨率直接空白。
+    //   这里把当场 stat 的结果单独存一份，供后续使用。
+    let freshSize: number = file.size;
     try {
       const stat = fileIo.statSync(file.path);
       detail.modifiedText = MediaFileOps.formatDate(new Date(stat.mtime * 1000));
       detail.size = stat.size;
       detail.sizeText = formatSize(stat.size);
+      freshSize = stat.size;
     } catch (err) {
       console.error('stat failed: ' + JSON.stringify(err));
     }
 
     // ---- 媒体信息（时长 / 分辨率），失败不影响其它字段 ----
     try {
-      const meta: MediaMeta = await MediaFileOps.readMediaMeta(file.path, file.size);
+      const meta: MediaMeta = await MediaFileOps.readMediaMeta(file.path, freshSize);
       detail.durationText = meta.durationText;
       detail.resolutionText = meta.resolutionText;
       detail.mimeText = meta.mimeText;
@@ -221,7 +230,7 @@ export class MediaFileOps {
    * 用 AVMetadataExtractor 读取时长、画面尺寸、MIME
    * 全部字段在 SDK 里都是 string 类型（duration 单位为毫秒的字符串）
    * @param path 视频路径
-   * @param fileSize 文件大小，用于填 fdSrc.length
+   * @param fileSize 文件大小（调用方已知的值），仅作为取不到真实大小时的兜底
    */
   private static async readMediaMeta(path: string, fileSize: number): Promise<MediaMeta> {
     let extractor: media.AVMetadataExtractor | undefined = undefined;
@@ -229,15 +238,32 @@ export class MediaFileOps {
     const out: MediaMeta = { durationText: '', resolutionText: '', mimeText: '' };
     try {
       f = fileIo.openSync(path, fileIo.OpenMode.READ_ONLY);
+      // ★ 2026-09-29：优先用自身 fd 的真实大小覆盖调用方的传参。
+      //   fileSize 无论来自扫描缓存还是调用方，都可能已经过期；
+      //   statSync 接受 fd（声明里是 string | number），拿到的一定是
+      //   此刻磁盘上的真实长度，不会截断文件。
+      let length: number = 0;
+      try {
+        length = fileIo.statSync(f.fd).size;
+      } catch (statErr) {
+        length = fileSize;
+      }
+      if (length <= 0) {
+        length = fileSize;
+      }
+      if (length <= 0) {
+        // 长度仍然未知：直接返回空结果，不去猜一个会截断文件的值
+        return out;
+      }
       extractor = await media.createAVMetadataExtractor();
-      extractor.fdSrc = { fd: f.fd, offset: 0, length: fileSize };
+      extractor.fdSrc = { fd: f.fd, offset: 0, length: length };
       const meta: media.AVMetadata = await extractor.fetchMetadata();
 
       const durationMs: string | undefined = meta.duration;
       if (durationMs !== undefined && durationMs.length > 0) {
         const ms: number = Number.parseInt(durationMs, 10);
         if (!Number.isNaN(ms)) {
-          out.durationText = MediaFileOps.formatDuration(ms);
+          out.durationText = MediaFileOps.formatDurationOrEmpty(ms);
         }
       }
       const w: string | undefined = meta.videoWidth;
@@ -271,8 +297,18 @@ export class MediaFileOps {
     return out;
   }
 
-  /** 毫秒 → mm:ss 或 hh:mm:ss */
-  private static formatDuration(ms: number): string {
+  /**
+   * 毫秒 → mm:ss 或 hh:mm:ss；**取不到时长时返回空串**
+   *
+   * ★ 2026-09-29 自检修正：原名叫 formatDuration，与
+   *   common/MediaData.formatDuration **同名但语义不同**：
+   *     · MediaData 版：0 → '00:00'（列表里总要显示点什么）
+   *     · 本函数：      0 → ''      （详情页"未知"不能写成 00:00，
+   *                                  那会被当成"时长真的是 0"）
+   *   两处都叫同一个名字，谁引用错了都不会报错，只会静默显示成
+   *   '00:00'。名字必须把差异写出来，故改名并保留原因。
+   */
+  private static formatDurationOrEmpty(ms: number): string {
     if (ms <= 0) {
       return '';
     }

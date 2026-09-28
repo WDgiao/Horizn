@@ -124,19 +124,83 @@ export class FolderRepository {
 
   /**
    * 删除文件夹（仅允许删除空文件夹，避免误删视频）
+   *
+   * ★ 2026-09-29 自检修正：补上**路径合法性校验**
+   *
+   *   原实现直接对传入路径 rmdirSync，唯一的护栏是 `countFiles > 0`。
+   *   而 createFolder 那边做了完整的名字校验（不允许分隔符、..），
+   *   删除侧却完全没有"必须在本应用的文件夹根目录之内"的判断 ——
+   *   调用方一旦传错（例如把文件路径当目录路径传来），
+   *   就可能删掉沙箱里别的空目录。
+   *   删除是不可逆操作，这一侧的校验反而必须更严，不能只依赖调用方自觉。
+   *
    * @param folderPath 绝对路径
    * @returns 失败原因，成功返回空串
    */
   removeFolder(folderPath: string): string {
+    // ---- ① 路径必须在本应用的文件夹根目录之内 ----
+    const root: string = this.getRootDir();
+    if (folderPath.length === 0) {
+      return '路径为空';
+    }
+    if (folderPath === root) {
+      return '不能删除根目录';
+    }
+    if (!folderPath.startsWith(root + '/')) {
+      return '不允许的路径';
+    }
+    // 拒绝任何形式的向上跳转（即使前缀匹配，"根/../别处" 也能逃出去）
+    if (folderPath.indexOf('/../') >= 0 || folderPath.endsWith('/..')
+        || folderPath.indexOf('..') >= 0) {
+      return '不允许的路径';
+    }
+    // ---- ② 目标必须是真实存在的目录 ----
+    //     countFiles 对不存在的路径会返回 0，那样会走进 rmdirSync 才报错，
+    //     用户看到的是含糊的"删除失败"。这里先判清楚。
     try {
-      if (this.countFiles(folderPath) > 0) {
-        return '文件夹内还有文件，请先清空';
+      if (!fileIo.accessSync(folderPath)) {
+        return '文件夹不存在';
       }
+      if (!fileIo.statSync(folderPath).isDirectory()) {
+        return '目标不是文件夹';
+      }
+    } catch (err) {
+      return '无法访问该路径';
+    }
+
+    // ---- ③ 必须真的为空（文件与子目录都算）----
+    //     原先只数"文件"，于是"只含子目录的文件夹"会被判成可以删，
+    //     然后 rmdirSync 必然失败，用户看到的是"删除失败"而不是真实原因。
+    const entries: number = this.countEntries(folderPath);
+    if (entries < 0) {
+      return '无法读取文件夹内容';
+    }
+    if (entries > 0) {
+      return '文件夹内还有内容，请先清空';
+    }
+
+    try {
       fileIo.rmdirSync(folderPath);
       return '';
     } catch (err) {
       console.error('rmdir failed: ' + JSON.stringify(err));
       return '删除失败';
+    }
+  }
+
+  /**
+   * 统计目录下的条目数（文件 + 子目录）
+   *
+   * 与 countFiles 的区别：这个把子目录也算进去，用于判断"目录是否真的为空"。
+   * （rmdir 要求目录完全为空，只含子目录同样删不掉。）
+   *
+   * @returns 条目数；读取失败返回 -1
+   */
+  private countEntries(dir: string): number {
+    try {
+      return fileIo.listFileSync(dir).length;
+    } catch (err) {
+      return -1;
     }
   }
 

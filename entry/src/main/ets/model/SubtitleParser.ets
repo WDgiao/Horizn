@@ -104,7 +104,22 @@ function detectBom(bytes: Uint8Array): BomInfo {
 }
 
 /**
- * 把字幕文件的字节解码成字符串
+ * 解码结果：文本 + 实际生效的编码名
+ *
+ * ★ 2026-09-29 自检修正：`SubtitleLoadResult.encoding` 字段一直存在，
+ *   但从来没有被赋过值 —— 界面上"字幕编码"永远是空的，
+ *   而中文乱码恰恰是最需要靠这个字段定位的问题。
+ *   解码函数顺手把生效的编码名带出来，成本为零。
+ */
+export interface SubtitleDecodeResult {
+  /** 解码后的文本 */
+  text: string;
+  /** 实际生效的编码名（小写），全部失败时为空串 */
+  encoding: string;
+}
+
+/**
+ * 把字幕文件的字节解码成字符串（同时返回生效的编码名）
  *
  * ★ 编码判断顺序（这一步决定了中文会不会变成乱码）：
  *   ① BOM          —— 最可靠，有就一定对
@@ -114,9 +129,9 @@ function detectBom(bytes: Uint8Array): BomInfo {
  *   ④ 兜底 UTF-8（哪怕有坏字节，也总比什么都不显示强）
  *
  * @param bytes 原始字节
- * @return 解码后的文本
+ * @return 文本 + 编码名
  */
-export function decodeSubtitleBytes(bytes: Uint8Array): string {
+export function decodeSubtitleBytesEx(bytes: Uint8Array): SubtitleDecodeResult {
   const bom: BomInfo = detectBom(bytes);
   const body: Uint8Array = bom.skip > 0 ? bytes.subarray(bom.skip) : bytes;
 
@@ -134,7 +149,7 @@ export function decodeSubtitleBytes(bytes: Uint8Array): string {
   if (bom.encoding.length > 0) {
     const s: string = tryDecode(bom.encoding);
     if (s.length > 0) {
-      return s;
+      return { text: s, encoding: bom.encoding };
     }
   }
 
@@ -144,7 +159,7 @@ export function decodeSubtitleBytes(bytes: Uint8Array): string {
   if (isLikelyUtf8(body)) {
     const s: string = tryDecode('utf-8');
     if (s.length > 0) {
-      return s;
+      return { text: s, encoding: 'utf-8' };
     }
   }
 
@@ -152,11 +167,23 @@ export function decodeSubtitleBytes(bytes: Uint8Array): string {
     const s: string = tryDecode(ENCODING_CANDIDATES[i]);
     // GBK 等编码对任意字节序列几乎都能解出东西，所以这里只能"取第一个成功的"
     if (s.length > 0) {
-      return s;
+      return { text: s, encoding: ENCODING_CANDIDATES[i] };
     }
   }
 
-  return tryDecode('utf-8');
+  return { text: tryDecode('utf-8'), encoding: 'utf-8' };
+}
+
+/**
+ * 把字幕文件的字节解码成字符串
+ *
+ * 保留这个签名是因为调用方只需要文本；需要编码名时用 decodeSubtitleBytesEx。
+ *
+ * @param bytes 原始字节
+ * @return 解码后的文本
+ */
+export function decodeSubtitleBytes(bytes: Uint8Array): string {
+  return decodeSubtitleBytesEx(bytes).text;
 }
 
 /** 解析出的一条字幕 */

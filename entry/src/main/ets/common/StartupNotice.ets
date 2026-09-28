@@ -7,15 +7,18 @@
  *   与其让使用者自己撞上各种粗糙之处再以为软件坏了，
  *   不如启动时先把话说清楚 —— 期望值先对齐，体验反而更好。
  *
- * 实现方式：复用 common/Toast.ets 里的 UIContext（PromptAction），
- *   用系统对话框而不是自绘弹窗 —— 系统的能自动适配深浅色/字号/无障碍，
- *   也不需要自己处理返回键与遮罩。
+ * 实现方式：用系统对话框而不是自绘弹窗 —— 系统的能自动适配深浅色/字号/
+ *   无障碍，也不需要自己处理返回键与遮罩。
+ *
+ * ★ 2026-09-29 自检修正：UI 上下文本模块不再自己存一份。
+ *   原先 common/Toast.ets 与这里各有一个 `let uiContext`，
+ *   各自靠 initToast / initStartupNotice 注入。同一个事实存两份，
+ *   调用顺序一乱（或以后某个入口只调其中一个）就会分叉。
+ *   现在统一从 Toast.ets 拿上下文（isPromptReady / showInfoDialog），
+ *   本模块只负责"文案 + 只弹一次"。
  */
 
-import { UIContext } from '@kit.ArkUI';
-
-/** 由首页在启动时注入的 UI 上下文 */
-let uiContext: UIContext | undefined = undefined;
+import { isPromptReady, showInfoDialog } from './Toast';
 
 /**
  * 本次进程内是否已经弹过
@@ -27,14 +30,6 @@ let uiContext: UIContext | undefined = undefined;
  * 这对"早期阶段"的说明是合适的（而不是"只提示一次就永不再提"）。
  */
 let shownThisSession: boolean = false;
-
-/**
- * 注入 UI 上下文
- * @param ctx 当前 UI 上下文（首页 getUIContext()）
- */
-export function initStartupNotice(ctx: UIContext): void {
-  uiContext = ctx;
-}
 
 /**
  * 早期阶段提示的正文
@@ -59,24 +54,14 @@ export async function showStartupNotice(): Promise<void> {
   if (shownThisSession) {
     return;
   }
-  const ctx: UIContext | undefined = uiContext;
-  if (ctx === undefined) {
+  if (!isPromptReady()) {
     // UI 上下文还没注入：说明调用时机不对。静默跳过而不是抛错 ——
     // 一句提示弹不出来不该影响应用启动
     return;
   }
   shownThisSession = true;
   try {
-    await ctx.getPromptAction().showDialog({
-      title: '关于本项目',
-      message: NOTICE_MESSAGE,
-      buttons: [
-        {
-          text: '我知道了',
-          color: '#007DFF'
-        }
-      ]
-    });
+    await showInfoDialog('关于本项目', NOTICE_MESSAGE, '我知道了');
   } catch (err) {
     // 对话框弹出失败不影响主流程；把标志还原，下次进首页还可以再试
     shownThisSession = false;

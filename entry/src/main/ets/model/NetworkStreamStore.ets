@@ -112,13 +112,23 @@ export class NetworkStreamStore {
 
   /**
    * 新增一条记录
+   *
+   * ★ 2026-09-29 自检修正：补上 validateUrl 校验。
+   *   之前 add() 只有"非空 + 不重复"两道判断，完全没调用 validateUrl，
+   *   于是 'abc'、'http://' 这类明显非法的地址也能存进列表，
+   *   列表里出现一条永远播不了的死记录。
+   *   （编辑页自己调了 validateUrl，所以问题只在直接调用 add 的入口暴露。）
+   *
    * @param name 显示名
    * @param url 地址
-   * @returns 新建的记录；地址重复时返回 undefined
+   * @returns 新建的记录；地址非法或重复时返回 undefined
    */
   add(name: string, url: string): NetworkStream | undefined {
     const trimmedUrl: string = url.trim();
     if (trimmedUrl.length === 0) {
+      return undefined;
+    }
+    if (NetworkStreamStore.validateUrl(trimmedUrl).length > 0) {
       return undefined;
     }
     if (this.existsUrl(trimmedUrl)) {
@@ -317,6 +327,16 @@ export class NetworkStreamStore {
    * 只做「格式」层面的校验，不联网探测 —— 添加时联网会导致
    * 每个地址都要等几秒，体验很差；真正的连通性判定放到播放时。
    *
+   * ★ 2026-09-29 自检修正：
+   *   ① 白名单漏了 rtmps。detectProtocol() 明确把 rtmps:// 识别成
+   *      RTMP 协议，这里却判定为"暂不支持"，两个函数互相矛盾 ——
+   *      同一个地址在不同入口得到不同结论。现已对齐。
+   *   ② 结尾两段 if 的**两个分支都 return ''**：
+   *      `if (scheme !== 'http' && scheme !== 'https') { return ''; }`
+   *      之后无论走哪个分支都是空串，注释里承诺的"明确提示"根本没写。
+   *      这段死代码删掉。提示改由调用方按协议自行展示
+   *      （编辑页已经会显示协议标签，不必在校验里重复）。
+   *
    * @param url 地址
    */
   static validateUrl(url: string): string {
@@ -332,8 +352,8 @@ export class NetworkStreamStore {
       return '缺少协议前缀（需要 http:// 或 https://）';
     }
     const scheme: string = s.substring(0, schemeEnd).toLowerCase();
-    if (scheme !== 'http' && scheme !== 'https' && scheme !== 'rtsp' && scheme !== 'rtmp') {
-      return '暂不支持 ' + scheme + ' 协议（可用 http / https / rtsp / rtmp）';
+    if (!NetworkStreamStore.isSupportedScheme(scheme)) {
+      return '暂不支持 ' + scheme + ' 协议（可用 http / https / rtsp / rtmp / rtmps）';
     }
     const rest: string = s.substring(schemeEnd + 3);
     if (rest.length === 0) {
@@ -344,12 +364,18 @@ export class NetworkStreamStore {
     if (host.length === 0) {
       return '缺少主机名';
     }
-    // http/https 之外的协议目前只是「先存着」，明确提示，
-    // 免得用户以为添加成功就能播
-    if (scheme !== 'http' && scheme !== 'https') {
-      return '';
-    }
     return '';
+  }
+
+  /**
+   * 支持的协议白名单
+   *
+   * 单独抽出来，保证 validateUrl 与 detectProtocol 用的是同一份事实，
+   * 不会再出现"能识别却通不过校验"这种自相矛盾。
+   */
+  private static isSupportedScheme(scheme: string): boolean {
+    return scheme === 'http' || scheme === 'https'
+      || scheme === 'rtsp' || scheme === 'rtmp' || scheme === 'rtmps';
   }
 
   /** 取内存缓存；首次访问时从磁盘加载 */

@@ -9,7 +9,7 @@ import { FolderCard } from '../view/FolderCard';
 import { FloatingNav } from '../view/FloatingNav';
 import { ToastView, TOAST_BOTTOM_OFFSET } from '../view/ToastView';
 import { showToast, initToast } from '../common/Toast';
-import { initStartupNotice, showStartupNotice } from '../common/StartupNotice';
+import { showStartupNotice } from '../common/StartupNotice';
 import { WatchHistory, WatchRecord } from '../model/WatchHistory';
 import { FolderRepository, MediaFolder } from '../model/FolderRepository';
 import { ThumbnailProvider, ThumbStats } from '../model/ThumbnailProvider';
@@ -78,13 +78,41 @@ struct Index {
   /** 诊断日志：把关键事件写进沙箱文件，便于用实际数据定位问题 */
   private diag: DiagLog | undefined = undefined;
 
+  // ==================== 后台封面任务的调度状态（2026-09-29 自检新增） ====================
+  //
+  // 背景：一次进入首页会**触发两次**封面任务 ——
+  //   aboutToAppear→refreshData→loadWatchData→attachThumbnails，
+  //   紧接着 onPageShow 又走一遍同样的链（ArkUI 首次进入时两者接连发生）；
+  //   下拉刷新那次更直接：loadWatchData 里一次 + onPullRefresh 里显式再一次。
+  //   两次任务同时遍历同一批记录，ThumbnailProvider 的 inFlight 去重会把
+  //   后一次直接判成"提取失败"，日志里刷出一片假的 THUMB FAIL，
+  //   真正失败的原因反而被淹没；两次都结束还会各自重建一次列表。
+  //   所以这里做**单飞 + 合并**：正在跑就只记一个"跑完再来一轮"的标记。
+  /**
+   * 页面当前是否不活跃（被别的页面盖住，或已经销毁）
+   *
+   * 为什么不叫 disposed：ArkUI 里 `aboutToDisappear` 在"页面被 push 覆盖"
+   * 和"页面真的被销毁"两种情况下都可能触发，而**重新回到前台时
+   * 只会走 onPageShow、不会重走 aboutToAppear**。
+   * 如果把它当成"已销毁"一次性标志，返回首页后封面任务就再也不会启动了。
+   * 所以它的真实语义是"现在别在后台干活"，并在 onPageShow 里复位。
+   */
+  private pageSuspended: boolean = false;
+  /** 封面任务是否正在执行 */
+  private thumbJobRunning: boolean = false;
+  /** 执行期间又被请求过一次：跑完再来一轮，确保覆盖最新记录 */
+  private thumbRerunRequested: boolean = false;
+  /** 任务代号；递增即让在跑的任务自行退出（用于取消） */
+  private thumbJobSeq: number = 0;
+
   aboutToAppear(): void {
-    // 把 UIContext 交给公共提示模块，使其可在任意页面调用系统 Toast
+    // 把 UIContext 交给公共提示模块，使其可在任意页面调用系统 Toast/对话框。
+    // ★ 2026-09-29：StartupNotice 也不再自己存上下文了，它就复用这一份，
+    //   所以这里不需要再单独注入一次（见 common/StartupNotice.ets 的说明）。
     initToast(this.getUIContext());
     // 早期阶段提示：同一句话先跟使用者讲清楚，避免撞上各种粗糙之处
     // 再以为软件坏了。用 setTimeout 0 让首页先完成首帧渲染，
     // 否则在组件构建期间弹模态框容易出现"渲染未完成就弹窗"的时序问题。
-    initStartupNotice(this.getUIContext());
     setTimeout(() => {
       showStartupNotice();
     }, 0);
@@ -107,6 +135,21 @@ struct Index {
   /** 从播放页返回时重新加载，保证进度与记录是最新的 */
   onPageShow(): void {
     this.writeDiag('Index onPageShow');
+    // ★ 2026-09-29：回到前台即解除挂起。
+    //   必须放在这里而不是 aboutToAppear —— 从播放页返回时只走 onPageShow，
+    //   不复位的话封面任务会一直被 aboutToDisappear 立的标志挡住，
+    //   表现为"从播放页回来后所有卡片都没有封面"。
+    this.pageSuspended = false;
+    this.thumbRerunRequested = false;
+    // ★ 2026-09-29 自检修正：把底部导航的高亮复位回「首页」。
+    //
+    //   FloatingNav 的 onClick 会先 `this.activeIndex = index`（@Link 直通本页的
+    //   activeNavIndex），再由 onNavSelect 跳去搜索/网络流/设置页。
+    //   而跳走之后本页并没有把高亮改回来 —— 从搜索页返回首页时，
+    //   底部胶囊里亮着的仍然是「🔍」，可用户眼前明明是首页，
+    //   看起来像"导航卡在了另一个页面"。
+    //   Index 永远是第 0 项（首页），回到前台就该复位。
+    this.activeNavIndex = 0;
     // 播放页的 aboutToDisappear 可能与本次回调几乎同时执行，
     // 而 WatchHistory 有内存缓存，直接读会拿到旧数据。
     // 因此这里先让缓存失效，强制从磁盘重读，保证拿到最终进度。
@@ -158,6 +201,14 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    // ★ 2026-09-29：先立标志再清定时器。
+    //   封面任务可能正卡在一次抽帧上（软解抽帧几百毫秒起步），
+    //   用户这时切走，它醒来后仍会继续遍历并写 @State ——
+    //   对已销毁组件赋值属于未定义行为。
+    //   序号自增让在跑的那一轮在下一个检查点立刻退出。
+    this.pageSuspended = true;
+    this.thumbJobSeq++;
+    this.thumbRerunRequested = false;
     this.clearToastTimer();
     this.clearRefreshTimer();
   }
@@ -362,8 +413,28 @@ struct Index {
   /**
    * 为记录异步提取内置封面
    * 已提取过的路径直接命中缓存，不会重复解码
+   *
+   * ★ 2026-09-29 自检修正：加了**单飞 + 合并 + 可取消**三件事。
+   *   原因见 pageSuspended / thumbJobRunning 那段说明：
+   *   一次进入首页本就会触发两轮相同任务，两轮并发会让
+   *   ThumbnailProvider 的 inFlight 去重把后一轮判成失败，
+   *   日志里刷出一片假的 THUMB FAIL，真正的失败原因被淹没。
    */
   private async attachThumbnails(records: WatchRecord[], hero: WatchRecord | undefined): Promise<void> {
+    // ---- 单飞：已经在跑就只登记"跑完再来一轮"，不并发第二轮 ----
+    if (this.thumbJobRunning) {
+      this.thumbRerunRequested = true;
+      this.writeDiag('THUMB 已有任务在跑，本次合并为跑完后重跑一轮');
+      return;
+    }
+    if (this.pageSuspended) {
+      this.writeDiag('THUMB 页面不在前台，跳过本轮');
+      return;
+    }
+    this.thumbJobRunning = true;
+    // 本轮代号；aboutToDisappear 会自增它来取消本轮
+    const token: number = ++this.thumbJobSeq;
+
     // 整个方法包在 try 里：封面只是锦上添花，
     // 任何异常都不能连带影响已经加载好的列表数据
     try {
@@ -372,8 +443,17 @@ struct Index {
         return;
       }
       for (let i = 0; i < records.length; i++) {
+        // 每个记录之间检查一次：页面切走/被取消就立刻停手
+        if (this.pageSuspended || token !== this.thumbJobSeq) {
+          this.writeDiag('THUMB 任务被取消，已处理 ' + i.toString() + ' 条');
+          return;
+        }
         const record: WatchRecord = records[i];
         const thumbFile: string = await provider.generate(record.path);
+        if (this.pageSuspended || token !== this.thumbJobSeq) {
+          this.writeDiag('THUMB 任务被取消（抽帧返回后）');
+          return;
+        }
         if (thumbFile.length === 0) {
           // 抓帧失败必须留下原因，否则界面上只会看到"没有封面"而无从排查
           const st = provider.stats();
@@ -401,6 +481,21 @@ struct Index {
       this.rebuildWithThumbs();
     } catch (err) {
       console.error('attachThumbnails failed: ' + JSON.stringify(err));
+    } finally {
+      this.thumbJobRunning = false;
+      // 执行期间又来过请求：用最新记录再跑一轮，保证不丢更新
+      if (this.thumbRerunRequested && !this.pageSuspended) {
+        this.thumbRerunRequested = false;
+        this.writeDiag('THUMB 执行期间的请求，重跑一轮');
+        // 本方法内部已完整 try/catch，不会产生 unhandled rejection；
+        // 这里仍显式接住，避免将来改动引入未处理异常
+        this.attachThumbnails(this.loadRecordsForRefresh(), this.currentHeroRecord())
+          .catch((err: BusinessError) => {
+            console.error('thumb rerun failed: ' + JSON.stringify(err));
+          });
+      } else {
+        this.thumbRerunRequested = false;
+      }
     }
   }
 
@@ -409,6 +504,11 @@ struct Index {
    * toVideoItem / toHeroItem 内部会通过 thumbPathOf 读到已缓存的文件 URI
    */
   private rebuildWithThumbs(): void {
+    // ★ 2026-09-29：页面已切走/销毁就不要再写 @State
+    if (this.pageSuspended) {
+      this.writeDiag('THUMB 页面不在前台，跳过重建');
+      return;
+    }
     const provider: ThumbnailProvider | undefined = this.thumbs;
     if (provider === undefined) {
       return;
@@ -542,12 +642,20 @@ struct Index {
    * 内容比较为"相同"时跳过赋值，界面就失去了重绘的机会。
    * 封面属于"迟到的数据"，必须强制让列表项重新挂载一次。
    *
+   * ★ 2026-09-29 自检修正：删掉了「先 this.videos = [] 再赋新数组」。
+   *
+   *   原注释说"把数组引用彻底换掉，避免 ArkUI 认为还是同一个数组"，
+   *   但 ForEach 的键是 `item.path + '|' + item.thumbPath` ——
+   *   thumbPath 变了键就变，ArkUI 本来就会重新挂载对应条目，
+   *   不需要把数组清空一次。
+   *   而"先清空"的副作用是实打实的：清空的瞬间列表里一行都没有，
+   *   紧接着又全部重建 —— 用户看到整列闪一下、滚动位置被顶回顶部，
+   *   而这个重建在封面补齐时必然发生一次。
+   *
    * @param next 新列表
    */
   private forceRebuildVideos(next: VideoItem[]): void {
-    // 先清空再赋新数组：把数组引用彻底换掉，
-    // 避免 ArkUI 认为"还是同一个数组"而跳过重建
-    this.videos = [];
+    // 直接赋新数组即可：引用已经变了，ForEach 会按 key 差异重新挂载
     this.videos = next;
     this.renderReportCount = 0;
     this.writeDiag('FORCE 重建列表 count=' + next.length.toString());

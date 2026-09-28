@@ -306,15 +306,6 @@ struct PlayerPage {
    * 通常是因为内嵌字幕语言不对或者质量差。这时如果还让内嵌字幕盖在上面，
    * 等于无视用户的明确意图。
    */
-  /**
-   * 刷新当前该显示的字幕
-   *
-   * 两条来源的优先级：**外挂优先于内嵌**。
-   *
-   * 为什么外挂优先：用户主动去选一个外挂字幕，就是明确表示"我要用这个"，
-   * 通常是因为内嵌字幕语言不对或者质量差。这时如果还让内嵌字幕盖在上面，
-   * 等于无视用户的明确意图。
-   */
   private refreshSubtitle(): void {
     const sc: SoftPlayerController | undefined = this.softCtl;
     const extReady: boolean = this.usingExternalSubtitle && externalSubtitle.loaded;
@@ -772,7 +763,7 @@ struct PlayerPage {
       this.positionMs = snap.positionMs;
     }
 
-    // ★ 轨道状态每次都跟着快照同步，不要只在打开面板时才刷新。
+    // ★ 轨道状态跟着快照同步，不要只在打开面板时才刷新。
     //
     //   踩过的坑：底部那两个按钮的文字（"音轨 1/3"、"字幕 2"）是从
     //   audioTracks / subtitleTracks / currentXxxIndex 算出来的，
@@ -780,10 +771,21 @@ struct PlayerPage {
     //   结果是"进了播放页但没打开过面板"时，按钮永远显示"字幕 -"
     //   —— 因为 subtitleTracks 是空数组，findIndex 返回 -1。
     //   把同步放到快照更新里，按钮文字在任何时刻都是准的。
-    if (snap.audioTracks.length > 0 && this.audioTracks.length === 0) {
+    //
+    //   ★ 2026-09-29 自检修正：原注释写的是"每次都同步"，代码却是
+    //     `&& this.audioTracks.length === 0` —— 只填一次。注释与实现不符，
+    //     下一个人照着注释改就会引入无谓的重绘。这里把真实意图写清楚：
+    //       · **下标**每次都同步（它决定按钮文案，必须实时）；
+    //       · **列表**只在"当前为空或长度对不上"时才赋值 ——
+    //         数组每次重建会让 @State 认为变了，整个列表跟着重绘，
+    //         而这个循环是每 100ms 跑一次的，白白耗电。
+    //     长度比对保留了"重新探测后轨道数变了"这条路径的正确性，
+    //     代价只是一次 length 读取。
+    if (snap.audioTracks.length > 0 && this.audioTracks.length !== snap.audioTracks.length) {
       this.audioTracks = snap.audioTracks;
     }
-    if (snap.subtitleTracks.length > 0 && this.subtitleTracks.length === 0) {
+    if (snap.subtitleTracks.length > 0
+        && this.subtitleTracks.length !== snap.subtitleTracks.length) {
       this.subtitleTracks = snap.subtitleTracks;
     }
     if (snap.currentAudioIndex !== this.currentAudioIndex) {
@@ -871,9 +873,21 @@ struct PlayerPage {
         //      对它们 seek 行为未定义，贸然调用可能让播放卡住。
         if (!this.isNetworkUrl(this.videoPath)
           && this.startPositionMs > 0 && this.durationMs > 0) {
-          p.seek(this.startPositionMs, media.SeekMode.SEEK_CLOSEST);
+          // ★ 2026-09-29：seek 的声明返回 void（不是 Promise，拿不到 .catch），
+          //   抛错只能是同步的，所以用 try/catch 兜。
+          //   之前完全没有任何处理：跳转失败（超出可跳范围、流不支持）
+          //   会直接变成一次未捕获异常，表现为"点了没反应"且日志无痕。
+          try {
+            p.seek(this.startPositionMs, media.SeekMode.SEEK_CLOSEST);
+          } catch (err) {
+            const e = err as BusinessError;
+            this.writeDiag('续播跳转失败: ' + e.code.toString() + ' ' + e.message);
+          }
         }
-        p.play();
+        // play() 返回 Promise，失败会走 rejected，必须 catch
+        p.play().catch((err: BusinessError) => {
+          this.writeDiag('自动播放失败: ' + err.code.toString() + ' ' + err.message);
+        });
       } else if (state === 'playing') {
         this.playing = true;
         this.preparing = false;
@@ -1040,6 +1054,36 @@ struct PlayerPage {
   /** 画面垂直居中所需的顶部偏移 */
   private computeVideoY(): number {
     return (this.areaHeight - this.computeVideoHeight()) / 2;
+  }
+
+  /**
+   * 字幕层相对自身布局位置的下移量（像素）
+   *
+   * ★ 2026-09-29：这个函数已经**不再被使用** —— 字幕层已改为
+   *   放在与画面同尺寸的 Stack 里、用 alignContent(Alignment.Bottom) 贴底，
+   *   不需要任何像素偏移（见 build() 里视频层的说明）。
+   *   保留在这里是为了把"为什么那条路走不通"写清楚：
+   *
+   *   360 是在**参考机型**（铺满容器高 2412px）上靠截图对照试出来的，
+   *   而真机布局转储复核后发现字幕实际停在 y=603..765（画面是 y=901..1511）——
+   *   那组实测值对应的是更早一版布局，改版之后没人复核，于是"看起来正确"。
+   *   等比换算（areaHeight × 360 ÷ 2412）也只是把这个错误按比例放大/缩小。
+   *   根子在于 offset 是相对自身布局位置的固定位移，而它所在父容器的
+   *   文档流起点随布局而变 —— 任何写死的像素值都会漂。
+   */
+  private subtitleOffsetY(): number {
+    const refHeight: number = 2412;
+    const refOffset: number = 360;
+    const h: number = this.areaHeight > 0 ? this.areaHeight : refHeight;
+    const v: number = Math.round(h * refOffset / refHeight);
+    // 兜底：异常尺寸下也别推出可视区，夹在一个实测可用的区间内
+    if (v < 120) {
+      return 120;
+    }
+    if (v > 900) {
+      return 900;
+    }
+    return v;
   }
 
   /**
@@ -1707,21 +1751,77 @@ struct PlayerPage {
       //   它只负责「按比例约束尺寸」，不负责居中，且与百分比宽高组合时
       //   在不同屏幕比例下表现不确定（实测出现不居中、横屏画面超出屏幕）。
       // 改为自己算「装得下」的尺寸，再用 .position() 精确居中，结果完全确定。
+      //
+      // ★★ 2026-09-29 自检修正：字幕层从"铺满整屏的控制层"里搬到这里 ★★
+      //
+      //   这个 Stack 的尺寸**就是视频画面矩形**（1084x610，居中），
+      //   于是字幕只要 alignContent 到底部，就天然落在"画面下沿"，
+      //   不需要任何像素偏移量 —— 这是本次修正的核心。
+      //
+      //   为什么要推翻之前那套 .offset() 方案：
+      //     之前的做法是把字幕放在铺满整屏的控制 Column 里，再用实测出来的
+      //     像素值 offset 往下推。真机实测（1084x2412，布局转储）显示：
+      //       字幕层不偏移时文本在 y=243..405，offset=360 后落在 y=603..765 ——
+      //       而视频画面是 y=901..1511。也就是说字幕**停在画面上方那片黑边里**，
+      //       根本没到画面下沿；当视频铺满全屏（没有黑边）时，
+      //       这个位置就变成了"压在画面中上部"。
+      //       换句话说，那套"360 已实测正确"的结论在本版布局下并不成立
+      //       （它记录的是更早一版布局的测量值，布局改过之后没人复核）。
+      //
+      //   为什么这样就不会再错：
+      //     offset 是相对自身布局位置的固定位移，画面高度一变（横屏、换视频比例）
+      //     它就不对了；而"字幕的父容器 = 视频矩形"这个关系是结构性的，
+      //     与分辨率、DPI、横竖屏、视频比例全部无关。
       if (this.computeVideoWidth() > 0) {
-        XComponent({
-          type: XComponentType.SURFACE,
-          controller: this.surfaceController
-        })
-          .width(this.computeVideoWidth())
-          .height(this.computeVideoHeight())
-          // position 以父容器左上角为原点，算出居中偏移
-          .position({ x: this.computeVideoX(), y: this.computeVideoY() })
-          .onLoad(() => {
-            this.onSurfaceCreated();
+        Stack({ alignContent: Alignment.Bottom }) {
+          XComponent({
+            type: XComponentType.SURFACE,
+            controller: this.surfaceController
           })
-          .onClick(() => {
-            this.showControls = !this.showControls;
-          })
+            .width(this.computeVideoWidth())
+            .height(this.computeVideoHeight())
+            .onLoad(() => {
+              this.onSurfaceCreated();
+            })
+            .onClick(() => {
+              this.showControls = !this.showControls;
+            })
+
+          // ===== 字幕层（贴画面下沿） =====
+          //
+          // 历史坑（保留记录，说明为什么不再用那些写法）：
+          //   ① Column + Blank().layoutWeight(4) + .height('100%')
+          //      → 弹性把整个 100% 高度吃光，后面的控制栏被挤成 0 高度
+          //        （布局转储里控制栏那两个子节点高度为 0，看着像状态问题）
+          //   ② .position({ y: '100%' }) → 100% 正好等于父高，元素起点落在
+          //      父容器之外，节点干脆不出现（不报错也不显示）
+          //   ③ 在铺满整屏的父容器里用 .offset() → 只能靠实测像素值硬凑
+          //
+          //   现在的写法没有任何魔法数字：父容器就是画面矩形，
+          //   alignContent(Bottom) 就是"贴底"，余量用 margin 给。
+          if (this.subtitleText.length > 0) {
+            Text(this.subtitleText)
+              .fontSize(18)
+              .fontColor(Color.White)
+              .maxLines(3)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .textAlign(TextAlign.Center)
+              .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+              // 半透明底衬：白色字幕压在亮画面上会看不清，
+              // 而描边在 ArkUI 里要配多个 Text 叠放，代价大于收益
+              .backgroundColor('rgba(0,0,0,0.45)')
+              .borderRadius(6)
+              .width('92%')
+              // 离画面底边留一点距离，避免紧贴边缘
+              .margin({ bottom: 18 })
+              // 字幕不吃点击：否则会挡住"点屏幕唤出控制栏"
+              .hitTestBehavior(HitTestMode.Transparent)
+          }
+        }
+        .width(this.computeVideoWidth())
+        .height(this.computeVideoHeight())
+        // position 以父容器左上角为原点，算出居中偏移
+        .position({ x: this.computeVideoX(), y: this.computeVideoY() })
       }
 
       // ---------- 2. 控制层：顶栏 ⟶ Blank 撑开 ⟶ 底栏 ----------
@@ -1778,83 +1878,17 @@ struct PlayerPage {
 
         // ===== 2.2 字幕层 =====
         //
-        // ★ 这里踩过一次坑，记下来避免重犯：
-        //   第一版写成 Column { Blank().layoutWeight(4); Text(字幕); Blank().height(150) }
-        //   并且给这个 Column 设了 .height('100%')。
-        //   结果 layoutWeight 的弹性把整个 100% 高度吃光了，
-        //   紧跟其后的 Blank 与底部控制栏被挤成 0 高度 —— 实测布局转储里
-        //   控制栏那两个子节点是 `Blank [[0,2205][1084,2412]]`（高度为 0），
-        //   也就是"控制栏整个消失了"。而它的 if (this.showControls) 明明是 true，
-        //   极容易误判成状态问题去查半天。
+        // ★ 2026-09-29：字幕层已搬到上面的「视频层 Stack」里（与画面同尺寸、
+        //   alignContent(Bottom)），这里不再重复渲染。
         //
-        //   正确做法：用 Stack + .position() 把字幕层**绝对定位**在底部固定高度里。
-        //   绝对定位不参与父级的高度分配，挤压问题从根上消失。
-        //
-        //   ★ 第二版又踩了一个小坑：写成 .position({ x: 0, y: '100%' })，
-        //     想用"父高度的 100%"把元素压到底边。但 100% 正好等于父高，
-        //     元素起点落在父容器之外，实测布局转储里这个节点干脆不出现
-        //     （既不报错也不显示，最难查）。改成用 .alignContent(Alignment.Bottom)
-        //     做定位锚点，再用 padding 给控制栏留位置 —— 全部是确定值，
-        //     不依赖百分比解析。
-        Stack() {
-          if (this.subtitleText.length > 0) {
-            Text(this.subtitleText)
-              .fontSize(18)
-              .fontColor(Color.White)
-              .maxLines(3)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .textAlign(TextAlign.Center)
-              .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-              // 半透明底衬：白色字幕压在亮画面上会看不清，
-              // 而描边在 ArkUI 里要配多个 Text 叠放，代价大于收益
-              .backgroundColor('rgba(0,0,0,0.45)')
-              .borderRadius(6)
-              .width('92%')
-          }
-        }
-        .width('100%')
-        // ★★ 这里连着调了四版，把最终结论和排除过程都写清楚，别再试错 ★★
-        //
-        //   需求：字幕落在**画面下沿**（视频区 y≈901..1511，进度条在 y≈1976），
-        //        既不能压住控制栏，也不能跑到标题栏底下。
-        //
-        //   试过并排除的三条路：
-        //     ① Column + Blank().layoutWeight(4) + .height('100%')
-        //        → 弹性占满全部高度，把后面的控制栏挤成 0 高度（控制栏整个消失）
-        //     ② .position({y:'100%'}) → 100% 等于父高，元素起点落在父容器之外，
-        //        布局转储里这个节点干脆不出现（不报错也不显示，最难查）
-        //     ③ .offset({y:负值}) → offset 是相对**自身布局位置**的位移，
-        //        而本层本身就在屏幕中下部，负值继续往上推，越调越靠上
-        //     ④ .position({y:固定值}) → 实测反而完全不显示；同时 .position 会
-        //        让元素脱离文档流，而父容器（铺满 Column）的滚动/裁剪行为
-        //        在这里不可预测
-        //
-        //   ★ 最终做法：**按实测值用 .offset() 下移**。
-        //
-        //     实测（onAreaChange 读 globalPosition）这一层不偏移时
-        //     y=0..270，字幕文字在 y=135..189 —— 也就是**贴在屏幕顶端**。
-        //     原因：它的父容器是那个"铺满整屏"的 Column，不是我以为的
-        //     "排在视频区之后的那一段"。父容器是全屏的，文档流就从屏幕顶部
-        //     开始排，视频区只是叠在上面的另一个子节点。这一条纠正了我前
-        //     三次调位置时的核心误解（我一直按"父高 = 屏高 − 顶栏高"推算，
-        //     于是所有推算全偏）。
-        //
-        //     实测校正过程（三次截图对照）：
-        //       offset  700 → 字幕落在 y≈2370（屏幕最底边，压到手势条，太低）
-        //       offset 1330 → 字幕**完全不显示**（父容器有裁剪，推出可见区就没了）
-        //       offset  620 → 字幕落在 y≈2290，**压住了播放按钮行**（实测截图确认）
-        //       offset  360 → 字幕上移到 y≈2010 附近，正好在进度条上方、
-        //                     视频区下沿之外，不与控制栏任何一行重叠
-        //
-        //     ★ 关键结论一：offset 是相对自身布局位置的位移，而本层在父
-        //       Column 里位于顶部（实测布局 y=0..270），所以 offset 是在
-        //       这个基础上往下推。想往上就减小它。
-        //     ★ 关键结论二：父容器会**裁剪**超出内容 —— offset 太大时字幕
-        //       凭空消失（不报错、不显示，最难查的一类现象）。可用区间
-        //       大约在 300~800 之间，别超出。
-        .offset({ x: 0, y: 360 })
-        // 字幕层不吃点击：否则会在字幕区域挡住"点屏幕唤出控制栏"
-        .hitTestBehavior(HitTestMode.Transparent)
+        //   为什么必须搬走（而不是继续在这里调 offset）：
+        //     本层所在的父容器是"铺满整屏的控制 Column"，它的文档流从屏幕顶部
+        //     开始排，所以字幕天然停在画面上方那片黑边里。之前靠实测像素值
+        //     offset 往下推，但那组实测值对应的是更早一版布局 ——
+        //     真机布局转储核对后发现字幕实际停在 y=603..765，
+        //     而画面是 y=901..1511，两者根本没对上。
+        //     结构性地把字幕放进画面矩形里，才是唯一不会随布局漂移的做法。
+        //   （历史踩坑记录见上面视频层里的注释，保留以免有人再试那几条路。）
 
         // ===== 2.3 弹性空隙：吃掉全部剩余高度，把底栏推到底部 =====
         Blank()

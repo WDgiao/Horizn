@@ -115,7 +115,15 @@ struct StreamEditPage {
     }
     const created: NetworkStream | undefined = s.add(this.inputName, url);
     if (created === undefined) {
-      showToast('添加失败');
+      // ★ 2026-09-29：add() 现在还会因"地址非法"而返回 undefined
+      //   （上面已校验过，这里是并发/竞态兜底），
+      //   所以不能再一律说"添加失败" —— 分情况给出真实原因，
+      //   否则用户拿着一条合法地址反复点、只看到一句无从下手的提示。
+      if (s.existsUrl(url)) {
+        showToast('该地址已经添加过了');
+      } else {
+        showToast('添加失败：地址未通过校验');
+      }
       return;
     }
     showToast('已添加：' + created.name);

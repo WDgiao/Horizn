@@ -20,6 +20,17 @@ const THUMB_WIDTH: number = 320;
 const THUMB_HEIGHT: number = 180;
 
 /**
+ * 缩略图落盘文件的保留上限
+ *
+ * ★ 2026-09-29 自检修正：原先没有任何清理机制。
+ *   每成功生成一张就等于永久多一个 JPEG 文件，
+ *   而且缓存键变化后（见 identityOf）旧文件还会变成孤儿。
+ *   缓存目录虽由系统托管，但长期累积同样会占满配额。
+ *   超过这个数量就按最后修改时间淘汰最旧的，直到降回上限。
+ */
+const MAX_CACHE_FILES: number = 400;
+
+/**
  * 依次尝试的截帧时间点（微秒）
  * 0.5 秒通常已越过片头黑场；若取不到再往后退，
  * 有些视频的首个关键帧并不在 0 秒处。
@@ -109,14 +120,46 @@ export class ThumbnailProvider {
   /**
    * 由视频路径推出缩略图文件路径
    * 用路径的哈希命名，避免文件名里的空格/中文/特殊字符引发问题
+   *
+   * ★ 2026-09-29 自检修正：哈希输入必须包含「文件身份」而不只是路径。
+   *
+   *   原先只用路径做哈希，于是发生这件事：
+   *     用户把 a.rm 换成另一个同名视频（或就地重新下载、被其他程序覆盖），
+   *     缓存键没变 -> 直接复用磁盘上那张旧 JPEG -> 首页封面永远是上一个视频的画面。
+   *     更糟的是同一次运行内 cache Map 也命中，连重新抽帧都不会做。
+   *   现在把 mtime + size 一并纳入哈希：
+   *     文件内容一变，键就变，自然走重新抽帧；
+   *     文件没变，键稳定，缓存照常命中。
+   *
    * @param src 视频绝对路径
    */
   private thumbPathOf(src: string): string {
+    const key: string = this.identityOf(src);
     let hash: number = 0;
-    for (let i = 0; i < src.length; i++) {
-      hash = (hash * 31 + src.charCodeAt(i)) % 2147483647;
+    for (let i = 0; i < key.length; i++) {
+      // ★ 用超大质数做模，配合 32 位内的乘法，
+      //   把碰撞概率压到可以忽略；同时保持结果非负，
+      //   避免 '/' + ('-123') 生成带负号的怪异文件名。
+      hash = (hash * 31 + key.charCodeAt(i)) % 2147483647;
     }
     return this.cacheDir + '/' + hash.toString() + '.jpg';
+  }
+
+  /**
+   * 计算「路径 + 文件身份」组成的缓存键
+   *
+   * mtime 取到秒（部分文件系统精度有限），size 取字节数；
+   * 两者取不到时退化为纯路径，行为与修正前一致（至少不会更差）。
+   *
+   * @param src 视频绝对路径
+   */
+  private identityOf(src: string): string {
+    try {
+      const st = fileIo.statSync(src);
+      return src + '|' + st.mtime.toString() + '|' + st.size.toString();
+    } catch (err) {
+      return src + '|0|0';
+    }
   }
   /** 最近一次提取的尝试明细 */
   private lastAttempts: ThumbAttempt[] = [];
@@ -297,11 +340,15 @@ export class ThumbnailProvider {
   /**
    * 同步取缓存的缩略图文件路径（已提取过才有值）
    * 返回空串表示无缓存
+   *
+   * ★ 2026-09-29：缓存键已升级为「路径 + 文件身份」，
+   *   对外仍收视频路径，这里统一换算成身份键再查，
+   *   调用方（首页封面）无需感知键的变化。
    * @param key 视频绝对路径
    */
   peek(key: string): string {
     try {
-      const v: string | undefined = this.cache.get(key);
+      const v: string | undefined = this.cache.get(this.identityOf(key));
       return v === undefined ? '' : v;
     } catch (err) {
       return '';
@@ -311,7 +358,7 @@ export class ThumbnailProvider {
   /** 该路径是否已经尝试提取过（无论成功或失败） */
   hasTried(key: string): boolean {
     try {
-      return this.cache.has(key);
+      return this.cache.has(this.identityOf(key));
     } catch (err) {
       return false;
     }
@@ -326,7 +373,7 @@ export class ThumbnailProvider {
     let hit: number = 0;
     let miss: number = 0;
     for (let i = 0; i < keys.length; i++) {
-      const v: string | undefined = this.cache.get(keys[i]);
+      const v: string | undefined = this.cache.get(this.identityOf(keys[i]));
       if (v === undefined || v.length === 0) {
         miss++;
       } else {
@@ -398,10 +445,13 @@ export class ThumbnailProvider {
    */
   async generate(src: string): Promise<string> {
     const attempts: ThumbAttempt[] = [];
+    // ★ 2026-09-29：内存缓存同样按「路径 + 文件身份」索引。
+    //   否则文件被替换后，同一次运行内仍会命中旧条目，连重新抽帧都不会触发。
+    const key: string = this.identityOf(src);
     try {
-      if (this.cache.has(src)) {
+      if (this.cache.has(key)) {
         // 缓存里存的已经是 URI
-        const cached: string | undefined = this.cache.get(src);
+        const cached: string | undefined = this.cache.get(key);
         return cached === undefined ? '' : cached;
       }
       // 已有另一次调用在解码同一路径：本次直接放弃，
@@ -421,7 +471,7 @@ export class ThumbnailProvider {
         const e = err as BusinessError;
         attempts.push({ timeUs: -1, mode: 'open', ok: false, error: e.code + ':' + e.message });
         this.lastAttempts = attempts;
-        this.cache.set(src, '');
+        this.cache.set(key, '');
         this.inFlight.delete(src);
         return '';
       }
@@ -537,13 +587,15 @@ export class ThumbnailProvider {
 
       this.lastAttempts = attempts;
       if (filePath.length === 0) {
-        this.cache.set(src, '');
+        this.cache.set(key, '');
         this.inFlight.delete(src);
         return '';
       }
-      this.cache.set(src, filePath);
+      this.cache.set(key, filePath);
       this.successCount++;
       this.inFlight.delete(src);
+      // 写盘成功后按上限清理历史缩略图（只清本模块自己生成的 jpg）
+      this.pruneCache();
       return filePath;
     } catch (err) {
       // 兜底：任何未预料的异常都转成 undefined，绝不向上抛
@@ -551,7 +603,7 @@ export class ThumbnailProvider {
       attempts.push({ timeUs: -1, mode: 'unexpected', ok: false, error: e.code + ':' + e.message });
       this.lastAttempts = attempts;
       try {
-        this.cache.set(src, '');
+        this.cache.set(key, '');
       } catch (inner) {
         console.error('cache set failed');
       }
@@ -559,4 +611,71 @@ export class ThumbnailProvider {
       return '';
     }
   }
+
+  /**
+   * 按数量上限清理缩略图缓存（只删本模块自己生成的 .jpg）
+   *
+   * 安全边界（很重要，宁可少删也不能误删）：
+   *   ① 只在 this.cacheDir（应用沙箱 cache/thumbs）内操作 —— 这是系统随时可回收的目录；
+   *   ② 文件名必须是「纯数字 + .jpg」，本模块的命名规则；任何不符合的条目一律跳过；
+   *   ③ 只按 mtime 从旧到新淘汰，直到降到上限，绝不清空整个目录。
+   * 也就是说：即使目录里混进了别的东西（用户放的、别的模块放的），也不会被这里删掉。
+   *
+   * 整个方法不抛异常：清理失败只是浪费一点空间，不能影响封面展示。
+   */
+  private pruneCache(): void {
+    try {
+      const names: string[] = fileIo.listFileSync(this.cacheDir);
+      if (names.length <= MAX_CACHE_FILES) {
+        return;
+      }
+      const mine: ThumbCacheEntry[] = [];
+      for (let i = 0; i < names.length; i++) {
+        const name: string = names[i];
+        if (!name.endsWith('.jpg')) {
+          continue;
+        }
+        const stem: string = name.substring(0, name.length - 4);
+        if (stem.length === 0 || !/^\d+$/.test(stem)) {
+          continue;
+        }
+        const full: string = this.cacheDir + '/' + name;
+        try {
+          mine.push({ path: full, mtime: fileIo.statSync(full).mtime });
+        } catch (err) {
+          // 单个条目读不到就跳过，不影响其它条目
+          continue;
+        }
+      }
+      if (mine.length <= MAX_CACHE_FILES) {
+        return;
+      }
+      // 最旧的排在最前
+      mine.sort((a: ThumbCacheEntry, b: ThumbCacheEntry): number => a.mtime - b.mtime);
+      const dropCount: number = mine.length - MAX_CACHE_FILES;
+      let dropped: number = 0;
+      for (let i = 0; i < dropCount; i++) {
+        try {
+          fileIo.unlinkSync(mine[i].path);
+          dropped++;
+        } catch (err) {
+          // 删不掉（可能正被 Image 组件占用）就留着，下次再试
+          continue;
+        }
+      }
+      if (dropped > 0) {
+        console.info('[Thumb] 清理缩略图缓存 ' + dropped.toString() + ' 个');
+      }
+    } catch (err) {
+      // 目录不存在/无权限：忽略
+    }
+  }
+}
+
+/** 缩略图缓存目录里的一个候选淘汰项 */
+interface ThumbCacheEntry {
+  /** 文件绝对路径 */
+  path: string;
+  /** 最后修改时间（秒） */
+  mtime: number;
 }

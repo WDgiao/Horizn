@@ -110,11 +110,32 @@ int32_t FfmpegEngine::PrepareWithTracks(const std::string &path,
     //   就应该老老实实保持原样继续播，而不是把正在播的东西弄没。
     //
     //   所以这里先用同一组参数做一次"试打开"：确认能开，再走不可逆的清理。
-    //   代价是一次轻量的打开+关闭（实测换轨总耗时本来就有几百毫秒，
-    //   这点开销可以忽略）；收益是**失败路径彻底消失**。
-    {
+    //
+    // ★★ 2026-09-29 自检修正：上面这段预检上一版有两个错，导致
+    //    **软解路径首次播放必然失败**（真机复现：点开 SubCover_vp9.mkv
+    //    直接显示"软解失败：prepare 返回错误码 -101"）。
+    //
+    //    错误一：预检传的是成员 path_，而不是传进来的 path。
+    //      而 path_ 是在下面清理阶段末尾（"path_ = path;"）才赋值的 ——
+    //      也就是说**首次打开时它还是空的**：
+    //        avformat_open_input("") -> "No such file or directory"
+    //        -> 预检返回失败 -> 整个 Prepare 带着这个错误码退出，
+    //        真实的 Open 根本没机会执行。
+    //      顺带一提，换成第二个文件时 path_ 还是"上一个文件"：
+    //      旧文件若已删除，新文件也会被同一个错拦住。
+    //
+    //    错误二：**本来就没有会话时也做预检**。
+    //      预检的全部意义是"别把正在播的旧会话拆掉、结果又开不起来"。
+    //      首次打开 / 换文件时若 session_ 为空，没有任何东西需要保护，
+    //      预检纯属白跑一趟（多一次 open+close），还要承担上面那个错。
+    //
+    //    现在的规则：**有会话才预检，且预检的是即将打开的那个 path。**
+    //      · 换音轨 / 换字幕：path 与当前文件相同 -> 正是要保护的场景
+    //      · 换文件：path 是新文件 -> 提前验证新文件可开
+    //      · 首次打开：session_ 为空 -> 跳过，直接走正常流程
+    if (session_ != nullptr) {
         std::string probeErr;
-        const int32_t probe = codecapi::ProbeTracks(path_, audioStreamIndex,
+        const int32_t probe = codecapi::ProbeTracks(path, audioStreamIndex,
                                                      subtitleStreamIndex, probeErr);
         if (probe != codecapi::kOk) {
             const std::string reason = "换轨被拒绝（新轨道无法打开）：" + probeErr;

@@ -17,8 +17,6 @@ import { showToast, initToast } from '../common/Toast';
 struct FolderCreatePage {
   /** 用户输入的名称 */
   @State folderName: string = '';
-  /** 是否正在提交，避免重复点击 */
-  @State submitting: boolean = false;
   /** 已存在的文件夹名，用于实时提示重名 */
   @State existingNames: string[] = [];
 
@@ -63,11 +61,24 @@ struct FolderCreatePage {
     return '';
   }
 
-  /** 提交创建 */
+  /**
+   * 提交创建
+   *
+   * ★ 2026-09-29 自检修正：删掉了原先的 `submitting` 状态。
+   *
+   *   它写着"避免重复点击"，但用法是：
+   *     this.submitting = true;
+   *     const result = r.createFolder(...);   // 同步调用
+   *     this.submitting = false;
+   *   整个 true→false 发生在一个同步函数体里，中间没有让出主线程，
+   *   所以 `if (this.submitting) return;` **永远不可能命中** ——
+   *   第二次点击根本插不进来。而且它也没有接到按钮的 enabled 上，
+   *   界面完全看不到它。留着它只会让人以为"这里已经防重复了"，
+   *   从而不再考虑真正的异步场景（比如以后把创建改成异步操作）。
+   *   createFolder 是同步的，ArkUI 的事件回调也不会重入，
+   *   防重复点击在这一层本来就不需要。
+   */
   private submit(): void {
-    if (this.submitting) {
-      return;
-    }
     const error: string = this.validate();
     if (error.length > 0) {
       showToast(error);
@@ -78,9 +89,7 @@ struct FolderCreatePage {
       showToast('存储不可用');
       return;
     }
-    this.submitting = true;
     const result: string = r.createFolder(this.folderName);
-    this.submitting = false;
     if (result.length > 0) {
       showToast(result);
       return;

@@ -2,9 +2,14 @@
  * 媒体库数据层
  *
  * 首页的「最近播放 / 继续观看 / 我的文件夹」三类内容现在都由真实数据驱动：
- *   - 视频来自 model/WatchHistory（观看记录，持久化在 Preferences）
+ *   - 视频来自 model/WatchHistory（观看记录）
  *   - 文件夹来自 model/FolderRepository（应用沙箱 files 目录下的真实目录）
  * 因此这里只保留「数据结构定义」与「底部导航配置」等纯静态内容。
+ *
+ * ★ 2026-09-29 自检修正：上一句原先写的是「观看记录持久化在 Preferences」，
+ *   这是早期用 @ohos.data.preferences 时的说法。后来为了能原子写、能校验、
+ *   损坏可留档，已经改成沙箱内 JSON 文件（见 model/JsonStore.ets），
+ *   但注释没跟着改 —— 照着它去 Preferences 里找记录只会一无所获。
  */
 
 /** 视频卡片数据 */

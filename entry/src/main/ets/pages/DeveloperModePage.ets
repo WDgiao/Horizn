@@ -56,7 +56,22 @@ struct DeveloperModePage {
   /** 取 surfaceId 用的 XComponent 控制器 */
   private testSurfaceController: XComponentController = new XComponentController();
 
+  /**
+   * 页面是否已经销毁
+   *
+   * ★ 2026-09-29 自检新增：本页有好几个"几秒到几十秒才跑完"的异步任务
+   *   （跳转压测 40 轮 ≈ 10 秒、真解码实测十几秒）。用户中途返回时，
+   *   这些任务还在跑，结束时会去写 @State 并读 this.getUIContext() ——
+   *   对一个已销毁的页面做这两件事都属于未定义行为。
+   *   所有长任务在循环里都要检查它，销毁了就立刻停手。
+   *
+   *   注意：不能写成 @State，它不参与渲染，只是普通标志。
+   */
+  private disposed: boolean = false;
+
   aboutToDisappear(): void {
+    // 先立标志：后面所有长任务的循环都会看到它并退出
+    this.disposed = true;
     // 必须释放：否则原生线程与定时器会残留
     const c: SoftPlayerController | undefined = this.testCtl;
     if (c !== undefined) {
@@ -174,31 +189,64 @@ struct DeveloperModePage {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       const path: string = await SurfacePlaybackTester.ensureSamplePath(ctx);
       const router = this.getUIContext().getRouter();
+      let done: number = 0;
       for (let i = 0; i < rounds; i++) {
-        router.pushUrl({
-          url: 'pages/PlayerPage',
-          params: { path: path, title: '12_rv10.rm' }
-        }).catch((err: BusinessError) => {
-          console.error('pushUrl failed: ' + JSON.stringify(err));
-        });
-        // 极短间隔：不等待 push 完成就发下一个动作，
-        // 这正是"连点"的时序特征，也是竞态最容易出现的窗口
+        // ★ 2026-09-29 自检修正：原实现在这里**不 await** pushUrl 就直接
+        //   往下走，120ms 后无条件 router.back()。两个后果：
+        //     ① push 慢一点时 back() 会作用在**本页自己**身上 ——
+        //        开发者模式页被弹掉，测试静默中止，却仍然打印"未崩溃"。
+        //        这是最坏的一种假通过：什么都没测，报告说通过了。
+        //     ② back() 返回的 Promise 没有 catch，失败时是 unhandled rejection。
+        //   现在两边都 await 并各自捕获失败，每一轮的"上去了/下来了"
+        //   都是确定的。120ms 的间隔保持不变 —— 每秒约 4 次页面切换，
+        //   与原实现想复现的"高频切换"强度一致。
+        let pushed: boolean = false;
+        try {
+          await router.pushUrl({
+            url: 'pages/PlayerPage',
+            params: { path: path, title: '12_rv10.rm' }
+          });
+          pushed = true;
+        } catch (err) {
+          const e = err as BusinessError;
+          this.appendLog('第 ' + (i + 1).toString() + ' 轮 push 失败：' + e.code.toString());
+        }
+        if (this.disposed) {
+          console.info('[Diag] 页面已销毁，跳转压测提前结束');
+          return;
+        }
         await new Promise<void>((resolve: () => void) => {
           setTimeout(resolve, 120);
         });
-        router.back();
+        // 只有确实推上去了才回退，否则会把本页弹掉
+        if (pushed) {
+          try {
+            await router.back();
+          } catch (err) {
+            const e = err as BusinessError;
+            this.appendLog('第 ' + (i + 1).toString() + ' 轮 back 失败：' + e.code.toString());
+          }
+        }
+        if (this.disposed) {
+          console.info('[Diag] 页面已销毁，跳转压测提前结束');
+          return;
+        }
         await new Promise<void>((resolve: () => void) => {
           setTimeout(resolve, 120);
         });
+        done = i + 1;
         if (i % 10 === 9) {
-          this.appendLog('  已完成 ' + (i + 1).toString() + ' 轮');
+          this.appendLog('  已完成 ' + done.toString() + ' 轮');
         }
       }
-      this.appendLog('✅ 跳转压力测试完成 ' + rounds.toString() + ' 轮，未崩溃');
+      this.appendLog('✅ 跳转压力测试完成 ' + done.toString() + ' 轮，未崩溃');
     } catch (err) {
       this.appendLog('测试异常：' + JSON.stringify(err));
     } finally {
-      this.navTesting = false;
+      // 页面已销毁时不要再写 @State
+      if (!this.disposed) {
+        this.navTesting = false;
+      }
     }
   }
 
@@ -423,15 +471,22 @@ struct DeveloperModePage {
   /**
    * 追加一行日志（保留最近 14 行）
    * 各测试共用同一块显示区，避免页面堆积多张日志卡片。
+   *
+   * ★ 2026-09-29：页面销毁后只写 console，不再碰 @State ——
+   *   对已销毁页面赋值 @State 是未定义行为（轻则无效，重则崩溃）。
+   *   日志仍然留在 hilog 里，排查时看得到。
    */
   private appendLog(line: string): void {
+    console.info('[Diag] ' + line);
+    if (this.disposed) {
+      return;
+    }
     const lines: string[] = this.testLog.length > 0 ? this.testLog.split('\n') : [];
     lines.push(line);
     while (lines.length > 14) {
       lines.shift();
     }
     this.testLog = lines.join('\n');
-    console.info('[Diag] ' + line);
   }
 
   /**
