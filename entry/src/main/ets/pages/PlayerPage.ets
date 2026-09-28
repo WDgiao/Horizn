@@ -194,7 +194,8 @@ struct PlayerPage {
     // 去操作一个已经释放的播放器
     this.clearVideoWatchdog();
     // 退出前补记一次进度，保证「继续观看」拿到的是最新位置
-    if (this.durationMs > 0) {
+    // 网络流不写 —— 观看历史是「沙箱内路径 + 进度」的语义，URL 不属于它
+    if (this.durationMs > 0 && !this.isNetworkUrl(this.videoPath)) {
       this.persistProgress(this.positionMs, this.durationMs);
     }
     this.releasePlayer();
@@ -246,9 +247,34 @@ struct PlayerPage {
     });
   }
 
+  /**
+   * 判断这个地址是不是网络流
+   *
+   * 为什么必须单独判定：
+   *   AVPlayer 的 url 只接受 fd:// 或 http(s):// 形式，
+   *   而 fdSrc 只接受本地文件描述符 —— 两条通道互斥，走错就必然失败。
+   *
+   * @param path 播放地址
+   */
+  private isNetworkUrl(path: string): boolean {
+    const lower: string = path.trim().toLowerCase();
+    return lower.startsWith('http://') || lower.startsWith('https://')
+      || lower.startsWith('rtsp://') || lower.startsWith('rtmp://')
+      || lower.startsWith('rtmps://');
+  }
+
   /** 创建 AVPlayer 并注册回调 */
   private createPlayer(): void {
-    // ---- 第零步：先看后缀要不要直接走软解 ----
+    // ---- 第零步：网络流单独一条通道 ----
+    //   必须在 mediaTierOf 之前判断：那是按【文件后缀】分级的，
+    //   对 http://... 这种地址没有意义（后缀会变成一串查询串）。
+    if (this.isNetworkUrl(this.videoPath)) {
+      this.writeDiag('网络流地址，走 AVPlayer 的 url 通道：' + this.videoPath);
+      this.createNetworkPlayer();
+      return;
+    }
+
+    // ---- 第零点五步：先看后缀要不要直接走软解 ----
     // 实测「系统解不开」的后缀直接交给软解，不让用户先看到一次格式不支持的错误
     const tier: MediaTier = mediaTierOf(this.videoPath);
     this.writeDiag('tier=' + tier.toString() + ' for ' + this.videoPath);
@@ -290,6 +316,35 @@ struct PlayerPage {
       p.fdSrc = { fd: opened.fd, offset: 0, length: this.mediaFileSize };
     }).catch((err: BusinessError) => {
       this.errorMsg = '播放器创建失败：' + err.message;
+      this.preparing = false;
+    });
+  }
+
+  /**
+   * 创建网络流播放器（走 AVPlayer 的 url 通道）
+   *
+   * 与本地文件的关键区别：
+   *   本地：fdSrc = { fd, offset, length } —— 需要先打开文件拿到描述符
+   *   网络：url = 'http(s)://...'       —— 由系统自己去请求
+   *   两者互斥，设置错了会直接报「401 Invalid Parameter:
+   *   not fd:// or network address」。
+   *
+   * 为什么不做 URL 预检（先 HEAD 一下看是不是媒体）：
+   *   预检会给每个地址凭空加上一次网络往返，而且很多 CDN 不支持 HEAD；
+   *   真正的判定交给 AVPlayer 的错误回调，它给的信息比预检更准。
+   *   代价是用户会等一次失败 —— 所以错误文案要把「可能的原因」说清楚，
+   *   尤其是「贴的是网页而不是视频地址」这个最常见的情况。
+   */
+  private createNetworkPlayer(): void {
+    this.preparing = true;
+    this.errorMsg = '';
+    media.createAVPlayer().then((p: media.AVPlayer) => {
+      this.player = p;
+      this.registerCallbacks(p);
+      // url 通道：直接交给系统去请求
+      p.url = this.videoPath;
+    }).catch((err: BusinessError) => {
+      this.errorMsg = '网络播放器创建失败：' + err.message;
       this.preparing = false;
     });
   }
@@ -535,7 +590,13 @@ struct PlayerPage {
         // 已经真正准备好，清掉此前累积的错误信息
         this.errorMsg = '';
         // 有续播起点则先跳转再播（此时已在 prepared 态，可以 seek）
-        if (this.startPositionMs > 0 && this.durationMs > 0) {
+        //
+        // ★ 网络流不做续播 seek：
+        //   ① 从网络流页进入时本来就没带起点（没有进度记录）；
+        //   ② 更要紧的是实时流（RTSP / 直播 HLS）没有总时长，
+        //      对它们 seek 行为未定义，贸然调用可能让播放卡住。
+        if (!this.isNetworkUrl(this.videoPath)
+          && this.startPositionMs > 0 && this.durationMs > 0) {
           p.seek(this.startPositionMs, media.SeekMode.SEEK_CLOSEST);
         }
         p.play();
@@ -544,14 +605,20 @@ struct PlayerPage {
         this.preparing = false;
         this.errorMsg = '';
         // 一进入播放就落盘一次：保证该视频的 updatedAt 立刻变成"最新"，
-        // 首页据此把它认定为"最近观看"，不会串到别的视频上
-        if (this.durationMs > 0) {
+        // 首页据此把它认定为"最近观看"，不会串到别的视频上。
+        // 网络流不写观看历史 —— 那份记录是「沙箱内绝对路径 + 进度」的语义，
+        // URL 混进去会让首页的续播逻辑拿到它无意义的数据（见 NetworkStreamStore 的说明）。
+        if (this.durationMs > 0 && !this.isNetworkUrl(this.videoPath)) {
           this.lastSavedAt = Date.now();
           this.persistProgress(this.positionMs, this.durationMs);
         }
         // ★ 启动「播放中却一直没有画面」的看门狗。
         //   有一类失败不报错误码（容器能开、音频正常、就是没画面），
         //   只能这样兜住，见 startVideoWatchdog 的说明。
+        //
+        //   ★ 网络流不启看门狗：它的兜底动作是「回退到内置软解」，
+        //     而内置 FFmpeg 是 --disable-network 构建的，根本打不开 URL ——
+        //     回退必然失败，只会把一个清晰的网络错误变成一次更慢的失败。
         this.startVideoWatchdog();
       } else if (state === 'paused') {
         this.playing = false;
@@ -606,6 +673,13 @@ struct PlayerPage {
 
     p.on('error', (err: BusinessError) => {
       this.writeDiag('AVPlayer error code=' + err.code.toString() + ' msg=' + err.message);
+      // ★ 网络流不回退软解：内置 FFmpeg 是 --disable-network 构建的，
+      //   打不开 URL —— 回退必然失败，只会把清晰的网络错误变成更慢的失败。
+      if (this.isNetworkUrl(this.videoPath)) {
+        this.preparing = false;
+        this.errorMsg = this.networkErrorText(err);
+        return;
+      }
       // ★ 系统不支持这个格式时，自动换软解再试一次。
       //   只对「格式不支持」这一类回退：其它错误（权限、文件损坏）软解也救不了，
       //   盲目回退只会把真实错误掩盖成一个更慢的失败。
@@ -616,6 +690,49 @@ struct PlayerPage {
       this.preparing = false;
       this.errorMsg = '播放失败（' + err.code.toString() + '）：' + err.message;
     });
+  }
+
+  /**
+   * 网络流失败时的用户可读文案
+   *
+   * ★ 为什么要专门写这一段，而不是直接抛系统错误码：
+   *   实测最常见的情况是「用户贴的是网页地址而不是视频地址」
+   *   （例如 https://www.bilibili.com/video/BVxxxx）。
+   *   那种地址返回的是一整页 HTML，播放器只会报一个笼统的解封装错误，
+   *   用户完全不知道自己错在哪 —— 会反复重试同一个地址。
+   *   所以这里必须把「网页 ≠ 视频地址」这件事直接说出来。
+   *
+   * 其余原因（鉴权 / 防盗链 / 时效签名 / 网络）也一并列出，
+   * 因为播放器给不出区分它们的信息。
+   *
+   * @param err 系统错误
+   */
+  private networkErrorText(err: BusinessError): string {
+    const u: string = this.videoPath.toLowerCase();
+    const looksLikePage: boolean = u.indexOf('.html') >= 0
+      || u.indexOf('/video/') >= 0
+      || u.indexOf('/watch') >= 0
+      || u.indexOf('bilibili.com') >= 0
+      || u.indexOf('youtube.com') >= 0
+      || u.indexOf('youku.com') >= 0
+      || u.indexOf('iqiyi.com') >= 0
+      || u.indexOf('douyin.com') >= 0;
+    let head: string = '网络播放失败（' + err.code.toString() + '）';
+    if (looksLikePage) {
+      head = '这个地址看起来是一个【网页】，不是视频地址';
+    }
+    return head
+      + '\n\n常见原因：'
+      + '\n· 贴的是网页地址 —— 视频网站页面上是播放器界面，'
+      + '真正的视频流地址需要从页面/接口里解析出来，不能直接用'
+      + '\n· 需要登录或鉴权（会员内容、私有链接）'
+      + '\n· 防盗链限制（要求特定 Referer / User-Agent）'
+      + '\n· 链接有时效签名，已过期'
+      + '\n· 网络不通或服务器拒绝'
+      + '\n\n建议：换一个【直接指向媒体文件】的地址试试，'
+      + '例如以 .mp4 / .m3u8 / .flv 结尾的链接。'
+      + '\n\n地址：' + this.videoPath
+      + '\n系统信息：' + err.message;
   }
 
   /**
@@ -653,10 +770,27 @@ struct PlayerPage {
 
   /**
    * 把当前进度写入观看记录
+   *
+   * ★ 网络流不写 —— 这个判断放在这里（函数的单一咽喉点），
+   *   不要散在调用点。
+   *
+   *   为什么：本函数有 6 个调用点（timeUpdate 每秒一次、prepared 的
+   *   seek 之后、playing 首次、completed、aboutToDisappear、看门狗），
+   *   逐个加 if 一定会漏 —— 实测就漏了 4 处，日志里网络流照样
+   *   出现了 "persist OK"。
+   *
+   *   为什么不该写：观看历史的键是「沙箱内绝对路径」，首页的
+   *   「继续观看」是从媒体库里按路径匹配的 —— URL 记录永远不会被
+   *   匹配到，只会白占条目；而且它的 duration 非 0 时还会被
+   *   listUnfinished 判成「未播完」，混进首页焦点位。
+   *
    * @param position 播放位置（毫秒）
    * @param duration 总时长（毫秒）
    */
   private persistProgress(position: number, duration: number): void {
+    if (this.isNetworkUrl(this.videoPath)) {
+      return;   // 静默跳过，不必写诊断日志刷屏
+    }
     if (this.history === undefined) {
       this.writeDiag('persist SKIPPED: history undefined, pos=' + position.toString());
       return;

@@ -4,6 +4,18 @@ import { showToast, initToast, confirmDialog } from '../common/Toast';
 import { NetworkStream, NetworkStreamStore, StreamProtocol } from '../model/NetworkStreamStore';
 
 /**
+ * 传给播放页的路由参数
+ *
+ * 字段名必须与 PlayerPage 的 PlayerParams 完全一致，
+ * 否则播放页读不到（那边是按名字取的）。
+ */
+interface NetworkPlayParams {
+  path: string;
+  title: string;
+  startMs?: number;
+}
+
+/**
  * 网络流管理页
  *
  * 当前阶段：**UI 框架**。
@@ -78,11 +90,12 @@ struct NetworkStreamPage {
   }
 
   /**
-   * 点击条目：目前只做可达性提示
+   * 点击条目：交给播放页
    *
-   * ★ 这里是接播放的唯一入口。接通时把 showToast 换成
-   *   pushUrl('pages/PlayerPage', { path: item.url, ... }) 即可 ——
-   *   PlayerPage 只要识别出 http(s):// 就改走 AVPlayer 的 url 通道。
+   * 播放页会识别出 http(s):// 并改走 AVPlayer 的 url 通道
+   * （见 PlayerPage.createNetworkPlayer）。
+   *
+   * 不可播的协议不进播放页 —— 让用户进去看一眼再弹错，不如当场说明。
    */
   private onItemClick(item: NetworkStream): void {
     if (!NetworkStreamStore.isPlayable(item.protocol)) {
@@ -90,14 +103,24 @@ struct NetworkStreamPage {
         + ' 暂不支持播放，地址已保存');
       return;
     }
-    // 地址已具备播放条件，但播放链路本阶段尚未接通 —— 明确说明，
-    // 不要让用户以为点了没反应是卡住了
+    // 记一次使用时间，列表里能看到"上次使用"
     const s: NetworkStreamStore | undefined = this.store;
     if (s !== undefined) {
       s.update(item.id, '', true);
-      this.reload();
     }
-    showToast('地址可用，网络播放功能待接通（本阶段只做了界面与存储）');
+    this.getUIContext().getRouter().pushUrl({
+      url: 'pages/PlayerPage',
+      params: {
+        path: item.url,
+        title: item.name,
+        // 网络流没有续播起点：一是没有进度记录，
+        // 二是实时流没有总时长，seek 行为未定义。
+        // 显式传 0，与 PlayerParams.startMs 的可选语义保持一致。
+        startMs: 0
+      } as NetworkPlayParams
+    }).catch(() => {
+      showToast('无法打开播放页');
+    });
   }
 
   /** 删除一条（带确认） */
