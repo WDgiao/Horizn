@@ -181,7 +181,7 @@ int32_t FfmpegEngine::Start() {
         return -1;
     }
 
-    if (!threadStarted_) {
+    if (!threadStarted_ && info_.hasVideo) {
         quitting_.store(false);
         // 从 READY 起步时，时钟基准必须重置，
         // 否则首帧会按一个陈旧的 lastFrameSysMs_ 去算等待，导致开头卡住
@@ -189,6 +189,18 @@ int32_t FfmpegEngine::Start() {
         lastFrameSysMs_ = 0;
         decodeThread_ = std::thread(&FfmpegEngine::DecodeLoop, this);
         threadStarted_ = true;
+    } else if (!threadStarted_ && !info_.hasVideo) {
+        // ★ 纯音频文件（没有视频轨）不能启动视频解码线程。
+        //
+        //   实测踩到：5.1 的 .dts 音频文件走软解通道后，
+        //   DecodeLoop 因为拿不到 videoCtx 立刻返回
+        //   "会话无效或没有视频流" 并把状态置为 ERROR_STATE，
+        //   于是整个播放（包括本来正常的音频）一起失败 ——
+        //   日志表现为「解码失败(-104) → 音频线程也退出」。
+        //
+        //   上面的音频线程本来就是条件启动的（audioReady_），
+        //   视频这边之前漏了同样的判断。纯音频走软解时只需要音频线程。
+        LOGI("该文件没有视频轨，不启动视频解码线程（仅音频播放）");
     }
 
     // 音频输出：启动失败不算致命（有些设备/权限下拿不到音频流），
@@ -760,6 +772,38 @@ void FfmpegEngine::AudioLoop() {
     int64_t lastPosMs = 0;
 
     while (!quitting_.load()) {
+        // ---------- ① 处理 seek ----------
+        //
+        // ★ 纯音频文件（没有视频轨）时，seek 必须由音频线程处理。
+        //   原因：seek 的处理逻辑原本只在视频 DecodeLoop 里（见那边的①），
+        //   而纯音频文件的视频线程根本不会启动（Play 里按 hasVideo 判断），
+        //   于是 pendingSeekMs_ 永远不会被取走 —— 表现就是
+        //   音频文件拖进度条无效、续播起点也失效。
+        //   这里补上：只有当视频线程没在跑时才由本线程处理，
+        //   避免两边同时抢同一个 seek 请求。
+        if (!threadStarted_) {
+            const int64_t seekTarget = pendingSeekMs_.exchange(-1);
+            if (seekTarget >= 0) {
+                std::string seekErr;
+                const int32_t sret = codecapi::Seek(session_, seekTarget, seekErr);
+                if (sret != codecapi::kOk) {
+                    LOGE("音频线程 seek 失败(%{public}d): %{public}s",
+                         sret, seekErr.c_str());
+                }
+                audioEof_.store(false);
+                positionMs_.store(seekTarget);
+                // ★ 与 SeekTo 的约定保持一致：audioWrittenMs_ 是【相对】基准。
+                //   SeekTo 里已把它清零（注释说明：用绝对目标会让画面等一个
+                //   "已经过去很久"的时钟）。所以这里把累加器也归零，
+                //   绝对位置靠 seekTargetMs_ 这个偏移量还原。
+                lastPosMs = 0;
+                audioWrittenMs_.store(0);
+                seekTargetMs_ = seekTarget;
+                audioLastReportMs_ = seekTarget;
+                Emit(PlayerEvent::POSITION, seekTarget, 0, "");
+            }
+        }
+
         AudioOutput *out = audio_.get();
         if (out == nullptr) {
             break;
@@ -820,6 +864,33 @@ void FfmpegEngine::AudioLoop() {
         const int64_t advanced = lastPosMs - before;
         if (advanced > 0) {
             audioWrittenMs_.store(lastPosMs);
+        }
+
+        // ★ 位置上报（音频侧）。
+        //
+        // 为什么音频线程也要上报：视频线程是位置上报的主力，但**纯音频文件
+        // 没有视频轨**，视频线程不会启动（见 Play 里 hasVideo 的判断），
+        // 那时 positionMs_ 将永远停在 0 —— 进度条不动、续播也记不住位置。
+        //
+        // 上限保护：音频线程可能一次解出很多数据，positionMs_ 直接写会让
+        // 进度条跑到"比实际听到的更靠前"。这里用「已写入 − 缓冲里还没播的」
+        // 得到音频时钟（与解码线程判断等待用的是同一个基准），
+        // 它反映的是扬声器真实播到的位置。
+        if (audio_ != nullptr) {
+            const int64_t bytesPerMs = static_cast<int64_t>(codecapi::AudioSampleRate())
+                                       * codecapi::AudioChannels() * 2 / 1000;
+            const int64_t notYetPlayedMs = (bytesPerMs > 0)
+                ? (static_cast<int64_t>(audio_->BufferedBytes()) / bytesPerMs) : 0;
+            // lastPosMs 是相对量（seek 后会归零），加上 seekTargetMs_ 才是绝对位置
+            const int64_t clockMs = lastPosMs - notYetPlayedMs + seekTargetMs_;
+            if (clockMs > 0) {
+                positionMs_.store(clockMs);
+                if (clockMs - audioLastReportMs_ >= 500
+                    || clockMs < audioLastReportMs_) {
+                    audioLastReportMs_ = clockMs;
+                    Emit(PlayerEvent::POSITION, clockMs, 0, "");
+                }
+            }
         }
     }
 

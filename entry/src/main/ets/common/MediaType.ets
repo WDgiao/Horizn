@@ -59,7 +59,10 @@ export const AUDIO_CONTAINERS: string[] = [
   'ac3', 'eac3', 'dts', 'mlp', 'wma', 'mid', 'midi', 'mpc', 'amr',
   'm4a', 'mka', 'opus', 'ra', 'au', 'caf', 'wv', 'tta',
   // MPC 的另外两个常见后缀，同一个 mpc8 解封装器认
-  'mp+', 'mpp'
+  'mp+', 'mpp',
+  // raw DTS-HD（dtshd 解封装器 → AV_CODEC_ID_DTS → dca 解码器）
+  // 和 HD-DVD/蓝光的 TrueHD 裸流（thd 解封装器）
+  'dtshd', 'thd'
 ];
 
 /** 视频流编码格式（写在这里是为了显示与后续扩展，非后缀） */
@@ -108,7 +111,10 @@ const TIER_NEEDS_SOFT: string[] = [
   // 2026-09-26 补充：这五个系统同样不认，且内嵌解封装器+解码器已实测编入
   // （AIFF 需 pcm_s16be、WavPack 解码器名为 wavpack、Musepack 为 mpc8），
   // 归到 NEEDS_SOFT 可直接走软解，不必先让 AVPlayer 失败一次。
-  'aiff', 'aif', 'wv', 'tta', 'mpc', 'mp+', 'mpp'
+  'aiff', 'aif', 'wv', 'tta', 'mpc', 'mp+', 'mpp',
+  // 2026-09-27：.dtshd / .thd 系统同样不认，直接走软解。
+  // （dtshd / thd 两个解封装器已确认编入，见下方 DTS-HD 更正说明）
+  'dtshd', 'thd'
 ];
 
 /**
@@ -154,6 +160,37 @@ const AUDIO_PLAYABLE: string[] = ['aac', 'm4a', 'mp3', 'amr', 'flac', 'wav'];
  *
  * 上面的缺口已在 v1.1 之后重编补齐，但**尚未在真机验证实际解码效果**
  * （验证受阻：模拟器是 x86_64 装不上，真机当时不可用）。
+ *
+ * ⚠️⚠️ 2026-09-27 再更正：此前写的「dca 只能解 DTS core，DTS-HD 拿不到」是**错的**。
+ * 逐行核对 FFmpeg 7.1 源码后的真实结论（三条都是硬证据，不是推测）：
+ *
+ *   1) libavcodec/dcadec.c:203    if (!s->core_only) { ... }
+ *      → 非 core 分支里会依次调 ff_dca_exss_parse（EXSS 扩展子流）、
+ *        ff_dca_xll_parse（XLL，即 DTS-HD MA 的无损扩展）、
+ *        ff_dca_lbr_parse（LBR，即 DTS-HD HRA 的低码率扩展）
+ *   2) libavcodec/dcadec.c:384    { "core_only", ..., { .i64 = 0 }, 0, 1, PARAM }
+ *      → core_only **默认值就是 0**，也就是说扩展解码默认是打开的。
+ *        （解码器侧没有把它设成 1，全工程也搜不到设置处。）
+ *   3) libavcodec/dcadec.c:251-283  过滤阶段：XLL 可用就走 ff_dca_xll_filter_frame
+ *      输出无损；XLL 出错则**回退**到 ff_dca_core_filter_frame 输出 core。
+ *
+ * 也就是说 dca 解码器对 DTS-HD 是「能解就出无损、不能解就出 core」，
+ * 而不是「只有 core」。**DTS-HD 在编码能力上从来不是缺口。**
+ *
+ * 那么 .dtshd / .thd 原先为什么打不开？因为缺口在【白名单/后缀层】，不在解码器：
+ *   libavformat/dtshddec.c  .p.extensions = "dtshd"  （已编入 CONFIG_DTSHD_DEMUXER=1）
+ *   libavformat/mlpdec.c    .p.extensions = "thd"    （已编入 CONFIG_TRUEHD_DEMUXER=1）
+ * 两个解封装器都真的在 .so 里，输出 codec_id 分别是 AV_CODEC_ID_DTS / AV_CODEC_ID_TRUEHD，
+ * 正好对得上 dca / truehd 解码器。可是这两个后缀原先根本没写进
+ * AUDIO_CONTAINERS，于是 mediaTierOf() 直接返回 NOT_MEDIA，
+ * 文件在列表里就显示「不在白名单」，连播放页都进不去。
+ *
+ * 已修：把 dtshd / thd 加进 AUDIO_CONTAINERS，并列进 TIER_NEEDS_SOFT 直接走软解
+ * （不让 AVPlayer 先失败一次）。**这一处不需要重编 FFmpeg。**
+ *
+ * 遗留的诚实结论：仍然**没有真正的 DTS-HD MA 样本可在真机验证**——
+ * FFmpeg 的 dca 编码器只有 core（没有 XLL 编码器），造不出带 XLL 的文件。
+ * 所以「源码路径成立」是确证的，「你的某个具体 .dtshd 文件一定出声」没有实测背书。
  */
 
 /** 可解码后缀集合：容器白名单 + 音频白名单 */
