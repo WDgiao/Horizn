@@ -550,6 +550,20 @@ struct DecoderSession {
     int64_t audioPacketGen = 0;
 
     /**
+     * 视频解码器是否在等第一个关键帧（seek 之后置位）
+     *
+     * 为什么需要：flush 之后解码器处于"要从关键帧重新开始"的状态，
+     * 此时若送进去一个非关键帧，VP9 会直接拒绝并报 AVERROR_INVALIDDATA
+     * （真机实测：换轨后连续多个包被拒，正是这个原因 —— 那些包
+     *  size≈17~18KB、pts 7000/7280/7600…，全是非关键帧）。
+     *
+     * 虽然被拒后可以 flush 重发来自愈（见 DecodeVideoFrame 里的兜底），
+     * 但那等于每个非关键帧都要白折腾一次。正确做法是**主动跳过**：
+     * seek 之后一直丢包，直到遇到带 AV_PKT_FLAG_KEY 的那个再开始送。
+     */
+    bool videoWaitKeyframe = true;
+
+    /**
      * 解复用线程的致命错误（av_read_frame 返回真错误时记下）
      * 0 表示无错。解码线程看到它就直接报错，避免静默卡死。
      */
@@ -1808,6 +1822,8 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
         if (gen != s->videoSeekGen) {
             s->videoSeekGen = gen;
             avcodec_flush_buffers(s->videoCtx);
+            // flush 之后解码器要从关键帧重开，置位让下面的循环跳过非关键帧
+            s->videoWaitKeyframe = true;
         }
     }
 
@@ -1865,7 +1881,46 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
         s->dbgLastSize = vpkt->size;
         s->dbgLastPts = vpkt->pts;
         s->dbgLastFlags = vpkt->flags;
+
+        // ★ 等关键帧：seek 之后解码器要求从关键帧重开，
+        //   非关键帧送进去必被拒（VP9 尤其严格）。
+        //   这里主动跳过，比"送进去被拒再 flush 重发"省一次无谓的往返。
+        if (s->videoWaitKeyframe) {
+            if ((vpkt->flags & AV_PKT_FLAG_KEY) == 0) {
+                av_packet_unref(vpkt);
+                continue;
+            }
+            s->videoWaitKeyframe = false;
+            // 只在诊断需要时看这条：换轨时每次都会打一条，属正常现象
+            LOGI("seek 后已等到关键帧（pts=%{public}lld），恢复送包",
+                 static_cast<long long>(vpkt->pts));
+        }
         int rret = avcodec_send_packet(s->videoCtx, vpkt);
+        // ★ 被解码器拒绝时先尝试自愈，而不是直接把整个播放判失败。
+        //
+        //   背景（真机实测）：换音轨/换字幕会走"重开会话 + seek 回原位"，
+        //   期间视频解码器会被 flush。这个过程中偶尔会有一个包被 VP9
+        //   拒绝（AVERROR_INVALIDDATA），日志形如：
+        //     send_packet 失败: size=73670 pts=5640 / size=8714 pts=560
+        //   包本身是好的（73KB 像关键帧）—— 是**解码器状态**处于
+        //   "等关键帧"而收到的不是它预期的那个包。
+        //
+        //   对这种情况：flush 一次、把同一个包重发一遍。
+        //   VP9 的包是自包含的，清空解码器后重发通常就能接上；
+        //   接不上也只是这一帧丢，后面从下一个关键帧自然恢复 ——
+        //   这比"整段播放直接失败、用户只能返回"好得多。
+        //
+        //   只重试一次（用局部标志），避免坏流导致死循环。
+        if (rret == AVERROR_INVALIDDATA) {
+            LOGW("视频包被拒（可能是换轨后解码器状态未就绪），"
+                 "flush 后重发一次: size=%{public}d pts=%{public}lld",
+                 vpkt->size, static_cast<long long>(vpkt->pts));
+            avcodec_flush_buffers(s->videoCtx);
+            rret = avcodec_send_packet(s->videoCtx, vpkt);
+            if (rret == 0 || rret == AVERROR(EAGAIN)) {
+                LOGI("flush 后重发成功，播放继续");
+            }
+        }
         av_packet_unref(vpkt);
         if (rret < 0 && rret != AVERROR(EAGAIN)) {
             // 诊断：只在失败时打印（原先逐包打印会刷屏）。
