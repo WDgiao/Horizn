@@ -41,7 +41,12 @@ extern "C" {
 
 #include <cstring>
 #include <cmath>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <thread>
 
 #endif  // SOFT_PLAYER_WITH_FFMPEG
 
@@ -57,6 +62,146 @@ namespace softplayer {
 namespace codecapi {
 
 #ifdef SOFT_PLAYER_WITH_FFMPEG
+
+/**
+ * 有界包队列（解复用线程 → 解码线程 的单向通道）
+ *
+ * ★ 为什么要引入它（2026-09-29 的架构性修复）：
+ *
+ *   FFmpeg 官方明确说明 AVFormatContext **不是线程安全的**。
+ *   而在此之前，视频解码线程和音频解码线程各自调用 av_read_frame()
+ *   读同一个 fmtCtx —— 这是违背设计的用法。之前靠 demuxMutex + 包副本
+ *   打了两层补丁，仍然出问题：
+ *
+ *     实测：720p VP9 + Opus（.webm）→ 第 10 个包就被解码器拒绝，
+ *           报 AVERROR_INVALIDDATA，一帧都上不了屏；
+ *           而把**同一份 VP9 帧数据**去掉音轨后 → 完美播放（19 fps）。
+ *           VP8 + Opus 却完全正常 —— 也就是只有「VP9 + 有音频」会炸。
+ *
+ *   改成「单解复用线程 + 双队列」之后，av_read_frame 全进程只被
+ *   一条线程调用，从根上消除了这类竞态 —— 不再依赖锁的粒度正确。
+ *
+ * 为什么要限制容量：解复用远比解码快，不设上限会把整个文件读进内存。
+ * 队列满时解复用线程阻塞等待，天然形成背压。
+ *
+ * 注意：本类型定义在匿名命名空间【之外】—— 因为 DecoderSession
+ * 也定义在命名空间之外，它要按值持有本类型；放进去会「未声明」。
+ */
+struct PacketQueue {
+    std::mutex mutex;
+    std::condition_variable notEmpty;
+    std::condition_variable notFull;
+    /** 队列中的包（每个都是独立引用） */
+    std::deque<AVPacket *> packets;
+    /** 容量上限 */
+    size_t limit = 512;
+    /** 生产者已结束（到达文件尾） */
+    bool eof = false;
+    /** 会话正在关闭：唤醒所有等待者并让它们退出 */
+    bool abort = false;
+
+    ~PacketQueue() {
+        for (AVPacket *p : packets) {
+            av_packet_free(&p);
+        }
+        packets.clear();
+    }
+
+    /**
+     * 生产者放入一个包（会拷贝 src，调用方随后可自由 unref src）
+     * 队列满时阻塞等待消费者腾出空间
+     * @return false 表示会话中止，应停止生产
+     */
+    bool Push(AVPacket *src) {
+        AVPacket *copy = av_packet_alloc();
+        if (copy == nullptr) {
+            return false;
+        }
+        if (av_packet_ref(copy, src) < 0) {
+            av_packet_free(&copy);
+            return false;
+        }
+        std::unique_lock<std::mutex> lock(mutex);
+        notFull.wait(lock, [this] { return abort || packets.size() < limit; });
+        if (abort) {
+            lock.unlock();
+            av_packet_free(&copy);
+            return false;
+        }
+        packets.push_back(copy);
+        lock.unlock();
+        notEmpty.notify_one();
+        return true;
+    }
+
+    /** 标记生产者结束 */
+    void SetEof() {
+        std::lock_guard<std::mutex> lock(mutex);
+        eof = true;
+        notEmpty.notify_all();
+    }
+
+    /** 中止：唤醒所有等待者 */
+    void Abort() {
+        std::lock_guard<std::mutex> lock(mutex);
+        abort = true;
+        notEmpty.notify_all();
+        notFull.notify_all();
+    }
+
+    /** 清空（seek 后调用，丢弃旧位置的包） */
+    void Clear() {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (AVPacket *p : packets) {
+            av_packet_free(&p);
+        }
+        packets.clear();
+        eof = false;
+        notFull.notify_all();
+    }
+
+    /**
+     * 消费者取一个包；内部把包的引用转移给 out，并释放队列里那个壳
+     * @param timeoutMs 队列为空时最多等待多久
+     * @return kOk 取到；kAgain 超时/被中止且队列空；kEof 生产结束且已取空
+     */
+    int32_t Pop(AVPacket *out, int timeoutMs) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (packets.empty()) {
+            notEmpty.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                              [this] { return abort || eof || !packets.empty(); });
+        }
+        if (!packets.empty()) {
+            AVPacket *p = packets.front();
+            packets.pop_front();
+            av_packet_unref(out);
+            av_packet_move_ref(out, p);
+            av_packet_free(&p);
+            lock.unlock();
+            notFull.notify_one();
+            return kOk;
+        }
+        if (abort) {
+            return kAgain;
+        }
+        if (eof) {
+            return kEof;
+        }
+        return kAgain;
+    }
+};
+
+/**
+ * 中断回调：让阻塞中的 av_read_frame 能被打断
+ *
+ * FFmpeg 约定：回调返回非 0 表示「请中止当前 I/O」。
+ * 用途见 DecoderSession::demuxAbort —— Close 时要 join 解复用线程，
+ * 而它可能正卡在文件 I/O 上，没有中断回调就会一直等。
+ */
+int InterruptCallback(void *opaque) {
+    auto *flag = static_cast<std::atomic<bool> *>(opaque);
+    return (flag != nullptr && flag->load()) ? 1 : 0;
+}
 
 namespace {
 
@@ -108,6 +253,28 @@ struct DecoderSession {
     AVPacket *packet = nullptr;
     /** 音频线程专用的包（与 packet 分开，避免互相覆盖） */
     AVPacket *audioPacket = nullptr;
+    /**
+     * 视频解码专用的私有副本
+     *
+     * ★ 为什么还要再来一份（2026-09-29 定位到的 bug）：
+     *   上面的注释说「不保证拷贝包数据」，但当时的修法只做到
+     *   「视频/音频各用一个 packet 对象」—— 这还不够，因为
+     *   【送包发生在 demuxMutex 锁外】：
+     *     视频线程：锁内 av_read_frame 写入 packet → 解锁
+     *               → 锁外 avcodec_send_packet(packet)
+     *     音频线程：此刻拿到锁，av_read_frame 可能复用同一块底层缓冲
+     *   FFmpeg 的 avcodec_send_packet 不保证拷贝，解码器返回后仍在读它，
+     *   于是解码器读到的是被音频线程改写过的数据。
+     *
+     *   实测证据：
+     *     · 带音轨的 720p VP9（.webm）→ 第 10 个包被解码器拒绝，
+     *       报 AVERROR_INVALIDDATA(-1094995529)，一帧都上不了屏
+     *     · 同一编码、同分辨率、**去掉音轨** → 完美播放，已上屏 120 帧
+     *     唯一差别就是有没有第二条线程在读同一个 AVFormatContext。
+     *
+     *   修法：锁内 av_packet_ref 拷一份到这里，锁外只操作这份副本。
+     */
+    AVPacket *videoPacket = nullptr;
 
     /** 解码器输出的原始帧 */
     AVFrame *rawFrame = nullptr;
@@ -162,6 +329,59 @@ struct DecoderSession {
      * 那些本来就该并行，锁住反而会拖慢解码。
      */
     std::mutex demuxMutex;
+
+    // ---------- 单解复用线程 + 双队列（2026-09-29 架构修复）----------
+    /**
+     * 视频包队列 / 音频包队列
+     *
+     * 由 demuxThread 独占生产，分别由视频解码线程、音频解码线程消费。
+     * 这样 av_read_frame 全进程只被一条线程调用 —— 从根上满足
+     * 「AVFormatContext 不是线程安全的」这条约束，不再依赖锁的粒度。
+     * 详见 PacketQueue 的说明。
+     */
+    std::unique_ptr<PacketQueue> videoQueue;
+    std::unique_ptr<PacketQueue> audioQueue;
+    /** 专职解复用线程 */
+    std::thread demuxThread;
+    /** 线程对象是否已创建（决定要不要 join） */
+    std::atomic<bool> demuxThreadStarted{false};
+
+    /**
+     * 待执行的 seek 目标（毫秒），-1 表示没有
+     *
+     * seek 不能在调用线程里直接做 —— av_seek_frame 会重置 fmtCtx 的
+     * 读位置与内部缓冲，必须由独占 fmtCtx 的解复用线程执行。
+     * 这里只是个「请求信箱」，解复用线程每轮开头取走。
+     */
+    std::atomic<int64_t> pendingSeekMs{-1};
+
+    /**
+     * 解复用线程的致命错误（av_read_frame 返回真错误时记下）
+     * 0 表示无错。解码线程看到它就直接报错，避免静默卡死。
+     */
+    std::atomic<int32_t> demuxError{0};
+
+    /**
+     * 关闭标志：置位后中断回调会让阻塞中的 av_read_frame 立即返回
+     *
+     * 为什么必须有它：Close 时要 join 解复用线程，而那条线程可能正卡在
+     * 文件 I/O 上（首次读盘、网络文件、慢速存储都可能阻塞较久）。
+     * 没有中断回调的话 join 会一直等 —— 表现为「退出播放页卡住」。
+     */
+    std::atomic<bool> demuxAbort{false};
+
+    /**
+     * 诊断用：已打印的视频包个数（只打前几个，避免刷屏）
+     *
+     * 定位「VP9 拒绝包」那个问题时，正是靠把「正常包」与「被拒包」
+     * 的 size / pts / 首字节放在一起对照，才确认码流本身没问题、
+     * 问题出在帧数据被并发改写。
+     */
+    int32_t dbgPacketCount = 0;
+    /** 诊断用：最近一个视频包的快照（unref 后字段就没了） */
+    int32_t dbgLastSize = 0;
+    int64_t dbgLastPts = 0;
+    int32_t dbgLastFlags = 0;
 
     // ---------- 时间戳兜底用 ----------
     /**
@@ -400,6 +620,17 @@ bool IsIntegrated() {
     return true;
 }
 
+/**
+ * 在解复用线程内部执行 seek（定义见 Open 之后）
+ *
+ * ★ 前置声明的位置是有讲究的：必须与定义【同处一个作用域】。
+ *   匿名命名空间在 RotateYuv420 之后就结束了，而 Open / SeekInternal
+ *   都定义在它外面（codecapi 命名空间下）。
+ *   把声明放进匿名命名空间会让它变成另一个符号，
+ *   链接期报 undefined symbol: ...(anonymous namespace)::SeekInternal。
+ */
+int SeekInternal(DecoderSession *s, int64_t positionMs);
+
 int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
              std::string &errMsg) {
     outSession = nullptr;
@@ -411,10 +642,19 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
         errMsg = "avformat_open_input: " + AvErr(ret);
         return kOpenFailed;
     }
+
+    // 会话要提前建出来：中断回调需要拿到 demuxAbort 标志的地址
+    // （见 InterruptCallback 与 demuxAbort 的说明）。
+    auto *s = new DecoderSession();
+    s->fmtCtx = fmt;
+    fmt->interrupt_callback.callback = InterruptCallback;
+    fmt->interrupt_callback.opaque = &s->demuxAbort;
+
     ret = avformat_find_stream_info(fmt, nullptr);
     if (ret < 0) {
         errMsg = "avformat_find_stream_info: " + AvErr(ret);
         avformat_close_input(&fmt);
+        delete s;
         return kOpenFailed;
     }
 
@@ -427,11 +667,9 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
     if (vIdx < 0 && aIdx < 0) {
         errMsg = "没有找到任何音视频流";
         avformat_close_input(&fmt);
+        delete s;
         return kNoStream;
     }
-
-    auto *s = new DecoderSession();
-    s->fmtCtx = fmt;
 
     if (vIdx >= 0) {
         if (vdec == nullptr) {
@@ -596,17 +834,130 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
                                       AVRational{1, 1000});
     }
 
+    // packet 是「解复用线程读包用」，audioPacket / videoPacket 分别是
+    // 音频、视频解码线程从自己队列取包用的容器
     s->packet = av_packet_alloc();
     s->audioPacket = av_packet_alloc();
+    s->videoPacket = av_packet_alloc();
     s->rawFrame = av_frame_alloc();
-    if (s->packet == nullptr || s->audioPacket == nullptr || s->rawFrame == nullptr) {
+    if (s->packet == nullptr || s->audioPacket == nullptr
+        || s->videoPacket == nullptr || s->rawFrame == nullptr) {
         errMsg = "av_packet_alloc / av_frame_alloc 失败";
+        delete s;
+        return kDecoderOpenFailed;
+    }
+
+    // ---------- 启动单解复用线程 ----------
+    // 队列容量 512 个包：解复用远快于解码，不设上限会把整个文件读进内存；
+    // 512 大约相当于十几秒的数据，足够吸收解码抖动，又不会占太多内存。
+    s->videoQueue = std::make_unique<PacketQueue>();
+    s->audioQueue = std::make_unique<PacketQueue>();
+    s->videoQueue->limit = 512;
+    s->audioQueue->limit = 512;
+    try {
+        // 线程体直接内联写在 lambda 里，不抽成独立函数。
+        //  抽成 DemuxLoop() 会有个坑：本函数在匿名命名空间内、而 DemuxLoop
+        //  定义在本函数之后，前置声明与定义若跨了命名空间边界就会变成
+        //  两个不同符号，链接期报 undefined。内联写法没有这个风险。
+        s->demuxThread = std::thread([s]() {
+            AVPacket *pkt = av_packet_alloc();
+            if (pkt == nullptr) {
+                s->demuxError.store(AVERROR(ENOMEM));
+                s->videoQueue->SetEof();
+                s->audioQueue->SetEof();
+                return;
+            }
+            while (true) {
+                // ① 先处理 seek 请求（av_seek_frame 必须由独占 fmtCtx 的
+                //    本线程执行，见 Seek() 与 SeekInternal() 的说明）
+                const int64_t target = s->pendingSeekMs.exchange(-1);
+                if (target >= 0) {
+                    const int sret = SeekInternal(s, target);
+                    if (sret < 0) {
+                        LOGE("解复用线程 seek 失败: %{public}s", AvErr(sret).c_str());
+                        s->demuxError.store(sret);
+                        break;
+                    }
+                    LOGI("解复用线程已 seek 到 %{public}lld ms 并清空队列",
+                         static_cast<long long>(target));
+                }
+                // ② 读一个包
+                av_packet_unref(pkt);
+                const int rret = av_read_frame(s->fmtCtx, pkt);
+                if (rret == AVERROR_EOF) {
+                    // 正常结束：标记两个队列 EOF，让解码线程冲刷完缓冲的帧
+                    s->videoQueue->SetEof();
+                    s->audioQueue->SetEof();
+                    break;
+                }
+                if (rret < 0) {
+                    LOGE("解复用失败: %{public}s", AvErr(rret).c_str());
+                    s->demuxError.store(rret);
+                    s->videoQueue->SetEof();
+                    s->audioQueue->SetEof();
+                    break;
+                }
+                // ③ 按流索引分流；其它流（字幕等）直接丢弃
+                bool pushed = true;
+                if (pkt->stream_index == s->videoStreamIndex) {
+                    pushed = s->videoQueue->Push(pkt);
+                } else if (s->audioStreamIndex >= 0
+                           && pkt->stream_index == s->audioStreamIndex) {
+                    pushed = s->audioQueue->Push(pkt);
+                }
+                if (!pushed) {
+                    break;   // 队列被中止（会话正在关闭）
+                }
+            }
+            av_packet_free(&pkt);
+            LOGI("解复用线程退出");
+        });
+        s->demuxThreadStarted.store(true);
+        LOGI("解复用线程已启动（单线程独占 av_read_frame）");
+    } catch (...) {
+        // 线程创建失败：不是致命错误，退化为「解码线程自己读包」不可行，
+        // 所以这里直接报失败，让上层给出明确提示而不是静默卡死
+        errMsg = "创建解复用线程失败";
         delete s;
         return kDecoderOpenFailed;
     }
 
     outSession = s;
     return kOk;
+}
+
+/**
+ * 在解复用线程内部执行 seek
+ *
+ * 为什么必须是内部函数：av_seek_frame 会重置 fmtCtx 的读位置和内部缓冲，
+ * 必须由独占 fmtCtx 的解复用线程来做。外部接口只写 pendingSeekMs，
+ * 由本线程在每轮开头取走执行 —— 免除了「seek 与 read 并发」这个老问题
+ * （之前靠 demuxMutex 串行，代价是 seek 期间两边互相等待、播放卡顿）。
+ *
+ * @return 0 成功
+ */
+int SeekInternal(DecoderSession *s, int64_t positionMs) {
+    const int64_t ts = av_rescale_q(positionMs, AVRational{1, 1000}, s->timeBase);
+    // 必须往前找关键帧：不加 BACKWARD 会跳到目标之后，画面接不上
+    const int ret = av_seek_frame(s->fmtCtx, s->videoStreamIndex, ts, AVSEEK_FLAG_BACKWARD);
+    if (ret < 0) {
+        return ret;
+    }
+    // 三个缓冲都要清，否则 seek 后会先闪旧画面 / 先出残音
+    if (s->videoCtx != nullptr) {
+        avcodec_flush_buffers(s->videoCtx);
+    }
+    if (s->audioCtx != nullptr) {
+        avcodec_flush_buffers(s->audioCtx);
+    }
+    if (s->swr != nullptr) {
+        swr_close(s->swr);
+        swr_init(s->swr);
+    }
+    // 旧位置的包全部作废
+    s->videoQueue->Clear();
+    s->audioQueue->Clear();
+    return 0;
 }
 
 int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg,
@@ -634,32 +985,45 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
             return kDecodeFailed;
         }
 
-        // 送一个包（视频）
-        // ★ 必须持锁：av_read_frame 会改动 fmtCtx 的内部读状态，
-        //   而音频线程也在读同一个 fmtCtx —— 不加锁就是上面注释里那次崩溃
-        // ★ 必须用视频自己的 packet：与音频共用会让解码器读到被覆盖的数据
-        int rret = 0;
-        {
-            std::lock_guard<std::mutex> lock(s->demuxMutex);
-            rret = av_read_frame(s->fmtCtx, s->packet);
-        }
-        if (rret == AVERROR_EOF) {
-            // 输入结束：送一个空包冲刷解码器里缓冲的帧
+        // 送一个包（视频）—— 从队列取，不再自己读 fmtCtx
+        //
+        // ★ 架构修复（2026-09-29）：这里原来是
+        //     「锁内 av_read_frame + av_packet_ref → 锁外 send_packet」，
+        //   也就是视频/音频两条线程各自读同一个 AVFormatContext。
+        //   现在 av_read_frame 只由 DemuxLoop 一条线程调用，
+        //   本函数只从队列取已经独立成包的 AVPacket —— 不存在并发读，
+        //   连「包数据被覆盖」这类问题的土壤都没有了。
+        av_packet_unref(s->videoPacket);
+        const int32_t qret = s->videoQueue->Pop(s->videoPacket, 20);
+        if (qret == kEof) {
+            // 队列已空且解复用结束：送空包冲刷解码器里缓冲的帧
             avcodec_send_packet(s->videoCtx, nullptr);
             continue;
         }
-        if (rret < 0) {
-            errMsg = "av_read_frame: " + AvErr(rret);
-            return kDecodeFailed;
+        if (qret != kOk) {
+            // 超时或会话中止：让上层稍后重试（引擎那边会处理暂停/退出）
+            const int32_t de = s->demuxError.load();
+            if (de != 0) {
+                errMsg = "解复用失败: " + AvErr(de);
+                return kDecodeFailed;
+            }
+            return kAgain;
         }
-        if (s->packet->stream_index != s->videoStreamIndex) {
-            // 音频/字幕包先丢掉（音频由另一条线程单独解）
-            av_packet_unref(s->packet);
-            continue;
-        }
-        rret = avcodec_send_packet(s->videoCtx, s->packet);
-        av_packet_unref(s->packet);
+        AVPacket *vpkt = s->videoPacket;
+        // 先留一份包的关键信息 —— unref 之后这些字段就没了，
+        // 而失败日志要靠它们说明「被拒的是哪个包」
+        s->dbgLastSize = vpkt->size;
+        s->dbgLastPts = vpkt->pts;
+        s->dbgLastFlags = vpkt->flags;
+        int rret = avcodec_send_packet(s->videoCtx, vpkt);
+        av_packet_unref(vpkt);
         if (rret < 0 && rret != AVERROR(EAGAIN)) {
+            // 诊断：只在失败时打印（原先逐包打印会刷屏）。
+            // 这个日志是定位 VP9 拒绝包问题的关键：它说明解码器从哪个包开始失败。
+            LOGE("avcodec_send_packet 失败: ret=%{public}d (%{public}s) "
+                 "size=%{public}d pts=%{public}lld flags=%{public}d",
+                 rret, AvErr(rret).c_str(),
+                 s->dbgLastSize, static_cast<long long>(s->dbgLastPts), s->dbgLastFlags);
             errMsg = "avcodec_send_packet: " + AvErr(rret);
             return kDecodeFailed;
         }
@@ -742,25 +1106,24 @@ int32_t DecodeAudioChunk(Session session, AudioChunk &chunk, std::string &errMsg
             return kDecodeFailed;
         }
 
-        // 送一个包（音频）—— 必须持锁读 fmtCtx，且必须用音频自己的 packet
-        int rret = 0;
-        {
-            std::lock_guard<std::mutex> lock(s->demuxMutex);
-            rret = av_read_frame(s->fmtCtx, s->audioPacket);
-        }
-        if (rret == AVERROR_EOF) {
+        // 送一个包（音频）—— 从队列取，不再自己读 fmtCtx
+        // 与视频同理：av_read_frame 只由 DemuxLoop 调用
+        av_packet_unref(s->audioPacket);
+        const int32_t qret = s->audioQueue->Pop(s->audioPacket, 20);
+        if (qret == kEof) {
+            // 队列已空且解复用结束：送空包冲刷音频解码器
             avcodec_send_packet(s->audioCtx, nullptr);
             continue;
         }
-        if (rret < 0) {
-            errMsg = "av_read_frame(audio): " + AvErr(rret);
-            return kDecodeFailed;
+        if (qret != kOk) {
+            const int32_t de = s->demuxError.load();
+            if (de != 0) {
+                errMsg = "解复用失败(音频): " + AvErr(de);
+                return kDecodeFailed;
+            }
+            return kAgain;
         }
-        if (s->audioPacket->stream_index != s->audioStreamIndex) {
-            av_packet_unref(s->audioPacket);
-            continue;
-        }
-        rret = avcodec_send_packet(s->audioCtx, s->audioPacket);
+        const int rret = avcodec_send_packet(s->audioCtx, s->audioPacket);
         av_packet_unref(s->audioPacket);
         if (rret < 0 && rret != AVERROR(EAGAIN)) {
             errMsg = "avcodec_send_packet(audio): " + AvErr(rret);
@@ -1120,32 +1483,25 @@ int32_t Seek(Session session, int64_t positionMs, std::string &errMsg) {
         errMsg = "会话无效";
         return kSeekFailed;
     }
-    const int64_t ts = av_rescale_q(positionMs, AVRational{1, 1000}, s->timeBase);
-    // ★ 持锁做 seek：av_seek_frame 会重置 fmtCtx 的读位置与内部缓冲，
-    //   而此刻音频线程可能正在 av_read_frame —— 并发同样是崩溃来源。
-    //   这也是为什么 seek 期间播放会短暂卡顿：两边在抢同一把锁，必须串行。
-    int ret = 0;
-    {
-        std::lock_guard<std::mutex> lock(s->demuxMutex);
-        // 必须往前找关键帧：不加 BACKWARD 会跳到目标之后，画面接不上
-        ret = av_seek_frame(s->fmtCtx, s->videoStreamIndex, ts, AVSEEK_FLAG_BACKWARD);
+    if (positionMs < 0) {
+        positionMs = 0;
     }
-    if (ret < 0) {
-        errMsg = "av_seek_frame: " + AvErr(ret);
-        return kSeekFailed;
+    // ★ 架构修复后这里只是「投递请求」：
+    //   av_seek_frame 会重置 fmtCtx 的读位置与内部缓冲，必须由独占 fmtCtx 的
+    //   解复用线程执行（见 DemuxLoop / SeekInternal）。
+    //   旧实现是在调用线程里直接 seek，靠 demuxMutex 与解码线程串行 ——
+    //   代价是 seek 期间两边互相等待、播放明显卡顿。
+    //   新实现是异步的：投递后立即返回，解复用线程在下一轮开头执行。
+    //
+    //   注意：因为是异步，调用方在 seek 之后应清掉自己队列里已解出的帧
+    //   （引擎侧 DoSeek 里的 frameQueue_->Clear() 就是这个作用）。
+    s->pendingSeekMs.store(positionMs);
+    // 唤醒可能正阻塞在「队列满」上的解复用线程，让它尽快处理 seek
+    if (s->videoQueue != nullptr) {
+        s->videoQueue->notFull.notify_all();
     }
-    if (s->videoCtx != nullptr) {
-        // 不清解码器缓冲的话，seek 之后会先闪几帧旧画面
-        avcodec_flush_buffers(s->videoCtx);
-    }
-    // 音频同样要清：否则 seek 后会先播出跳转前的残音
-    if (s->audioCtx != nullptr) {
-        avcodec_flush_buffers(s->audioCtx);
-    }
-    if (s->swr != nullptr) {
-        // swr 内部也缓存了样本，必须一并丢弃
-        swr_close(s->swr);
-        swr_init(s->swr);
+    if (s->audioQueue != nullptr) {
+        s->audioQueue->notFull.notify_all();
     }
     return kOk;
 }
@@ -1155,6 +1511,23 @@ void Close(Session session) {
     if (s == nullptr) {
         return;
     }
+
+    // ---------- ① 先停解复用线程，再释放任何它可能用到的资源 ----------
+    //
+    // 顺序是决定性的：解复用线程持有 fmtCtx、并且可能正阻塞在
+    // av_read_frame 的文件 I/O 上。如果先释放 fmtCtx 再 join，
+    // 就是「一边用一边释放」—— 直接段错误。
+    s->demuxAbort.store(true);            // 让中断回调把 av_read_frame 打断
+    if (s->videoQueue != nullptr) {
+        s->videoQueue->Abort();           // 唤醒可能阻塞在「队列满」上的生产者
+    }
+    if (s->audioQueue != nullptr) {
+        s->audioQueue->Abort();
+    }
+    if (s->demuxThreadStarted.load() && s->demuxThread.joinable()) {
+        s->demuxThread.join();
+    }
+
     // ---- 音频资源 ----
     if (s->resampleBuf != nullptr) {
         av_freep(&s->resampleBuf);
@@ -1178,19 +1551,27 @@ void Close(Session session) {
     if (s->rawFrame != nullptr) {
         av_frame_free(&s->rawFrame);
     }
-    // 两个包各自释放：视频与音频不共用 AVPacket
+    // 三个包各自释放：读包用、音频解码用、视频解码用
     if (s->packet != nullptr) {
         av_packet_free(&s->packet);
     }
     if (s->audioPacket != nullptr) {
         av_packet_free(&s->audioPacket);
     }
+    if (s->videoPacket != nullptr) {
+        av_packet_free(&s->videoPacket);
+    }
     if (s->videoCtx != nullptr) {
         avcodec_free_context(&s->videoCtx);
     }
+    // 队列必须在 fmtCtx 之后释放（队列析构会 av_packet_free 里面的包，
+    // 而那些包是 fmtCtx 解出来的 —— 虽然包本身自带引用计数、
+    // 顺序其实无所谓，但保持「先关输入、再清缓存」更符合直觉）
     if (s->fmtCtx != nullptr) {
         avformat_close_input(&s->fmtCtx);
     }
+    s->videoQueue.reset();
+    s->audioQueue.reset();
     delete s;
 }
 
