@@ -28,6 +28,17 @@
 *.csr
 *.keystore
 
+# hvigor 解密 build-profile.json5 里签名密码所用的密钥材料
+#
+# ★ 2026-09-29 补上。原先以为它是构建缓存，读了 hvigor 源码才弄明白：
+#   hvigor-ohos-plugin/src/utils/decipher-util.js 的 DecipherUtil.getKey()
+#   会从 <storeFile 所在目录>/material 下读三个组件（cf、salt、workmaterial）
+#   派生根密钥，再 AES-128-GCM 解出 storePassword / keyPassword。
+#   也就是说：build-profile.json5（要入库，里面是加密后的密码）配上这个
+#   material/ 目录，等于把 keystore 密码原样交出去 —— 它等同于密钥本身。
+#   两个都进仓库就等于没加密，所以这里必须排除。
+material/
+
 # ---------- 编辑器与系统文件 ----------
 .vscode/
 *.iml

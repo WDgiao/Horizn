@@ -15,41 +15,40 @@
         "name": "ohos.permission.INTERNET",
         "reason": "$string:module_desc",
         "usedScene": {
+          "when": "inuse",
           "abilities": [
             "EntryAbility"
-          ],
-          "when": "inuse"
+          ]
         }
       },
       {
         "name": "ohos.permission.GET_NETWORK_INFO",
         "reason": "$string:module_desc",
         "usedScene": {
+          "when": "inuse",
           "abilities": [
             "EntryAbility"
-          ],
-          "when": "inuse"
+          ]
         }
       },
-      // 扫描公共媒体目录（下载/文档）所需的运行时权限，属 user_grant，首次进搜索页时申请
       {
         "name": "ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY",
         "reason": "$string:permission_reason_media_scan",
         "usedScene": {
+          "when": "inuse",
           "abilities": [
             "EntryAbility"
-          ],
-          "when": "inuse"
+          ]
         }
       },
       {
         "name": "ohos.permission.READ_WRITE_DOCUMENTS_DIRECTORY",
         "reason": "$string:permission_reason_media_scan",
         "usedScene": {
+          "when": "inuse",
           "abilities": [
             "EntryAbility"
-          ],
-          "when": "inuse"
+          ]
         }
       }
     ],
@@ -86,7 +85,7 @@
             "name": "ohos.extension.backup",
             "resource": "$profile:backup_config"
           }
-        ],
+        ]
       }
     ]
   }
