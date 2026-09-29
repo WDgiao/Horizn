@@ -883,7 +883,11 @@ struct Index {
             // ---------- 顶部导航 (对应 .header) ----------
             Row() {
               Column({ space: 4 }) {
-                Text('媒体库')
+                // ★ 2026-09-29：这里原来是「媒体库」（页面标题的写法）。
+                //   应用名已定为「Horizn|视界」，首页是这个软件的门面，
+                //   标题跟着用应用名，用户在应用内也能看到自己的软件叫什么。
+                //   副标题「发现你的精彩视界」保持不变 —— 它是标语，不是名字。
+                Text('Horizn|视界')
                   .fontSize(32)
                   .fontWeight(FontWeight.Bold)
                   .fontColor(Theme.TEXT_MAIN)

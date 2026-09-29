@@ -1,7 +1,21 @@
 {
   "app": {
-    "bundleName": "com.example.myapplication",
-    "vendor": "example",
+    // ★ 2026-09-29：包名已从模板默认的 com.example.myapplication 改为本项目的
+    //   唯一包名。原来的名字是 DevEco 新建工程的模板默认值（每个空工程都叫这个），
+    //   com.example 又是保留示例前缀，上架时不可用。
+    //
+    //   ⚠️ 改成新包名后必须重新生成一次自动签名（File → Project Structure →
+    //      Signing Configs → 勾选 Automatically generate signature）。
+    //      原因：签名 profile 是华为 AppGallery 按包名签发、并用华为 CA 签过名的，
+    //      里面写死了 "bundle-name"，本地无法伪造。
+    //
+    //   另外 2026-09-29 15:01 那次自动签名把 ~/.ohos/config 下的密钥材料重新
+    //   生成过，却没有同步更新 build-profile.json5 里的 storePassword/
+    //   keyPassword，导致签名时直接报
+    //   "11014003 Init keystore failed: keystore password was incorrect"。
+    //   也就是说**无论包名用哪个，签名都必须重新生成一次**才能构建出可安装的包。
+    "bundleName": "com.wdgiao.horizn",
+    "vendor": "WDgiao",
     "versionCode": 1000000,
     "versionName": "1.0.0",
     "buildVersion": "1",

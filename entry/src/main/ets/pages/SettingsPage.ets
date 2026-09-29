@@ -46,7 +46,10 @@ struct SettingsPage {
     { icon: '🎛️', title: '手势与快捷键', summary: '亮度 · 音量 · 快进' },
     { icon: '🌐', title: '网络流', summary: 'HTTP / RTSP 地址管理' },
     { icon: '🎨', title: '外观', summary: '浅色 · 深色 · 跟随系统' },
-    { icon: 'ℹ️', title: '关于', summary: '版本 1.0.0' },
+    // ★ 2026-09-29：应用名定为「Horizn|视界」，这里原来只有一个版本号，
+    //   用户在设置里看不到软件叫什么。补上名字（版本号仍来自 app.json5 的
+    //   versionName，目前是 1.0.0；两边改动时要一起改）。
+    { icon: 'ℹ️', title: '关于', summary: 'Horizn|视界 · 版本 1.0.0' },
     // 开发期自测工具整页搬去了 DeveloperModePage，
     // 这里只留一个入口 —— 设置页不该被开发工具占据显眼位置
     { icon: '🛠️', title: '开发者模式', summary: '解码能力诊断 · 自测工具' }

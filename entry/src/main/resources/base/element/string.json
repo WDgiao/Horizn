@@ -2,15 +2,15 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "媒体库主模块"
+      "value": "Horizn 视界主模块"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "Harmony Player 优雅媒体库"
+      "value": "Horizn 视界 · 内置软解引擎的本地媒体播放器"
     },
     {
       "name": "EntryAbility_label",
-      "value": "媒体库"
+      "value": "Horizn|视界"
     },
     {
       "name": "permission_reason_media_scan",
