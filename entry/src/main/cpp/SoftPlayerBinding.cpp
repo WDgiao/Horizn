@@ -295,6 +295,82 @@ napi_value SoftPlayerBinding::JsSeekTo(napi_env env, napi_callback_info info)
     return ret;
 }
 
+/**
+ * setColorAdjust(brightness, contrast, saturation, hue, rGain, gGain, bGain)
+ *
+ * 七个参数都是百分比（-100 ~ +100），见 IPlayerEngine 的说明。
+ * 参数缺省按 0 处理（= 不改），这样 JS 侧即使只传一部分也不会报错。
+ */
+napi_value SoftPlayerBinding::JsSetColorAdjust(napi_env env, napi_callback_info info)
+{
+    size_t argc = 7;
+    napi_value argv[7] = {nullptr};
+    SoftPlayerBinding *self = Unwrap(env, info, &argc, argv);
+    if (self == nullptr) {
+        return ThrowError(env, "player object is invalid");
+    }
+    if (self->released_.load() || !self->engine_) {
+        return ThrowError(env, "player already released");
+    }
+    int32_t v[7] = {0, 0, 0, 0, 0, 0, 0};
+    for (size_t i = 0; i < argc && i < 7; i++) {
+        int64_t t = 0;
+        if (GetInt64Arg(env, argv[i], t)) {
+            v[i] = static_cast<int32_t>(t);
+        }
+    }
+    self->engine_->SetColorAdjust(v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+    napi_value undef = nullptr;
+    napi_get_undefined(env, &undef);
+    return undef;
+}
+
+/**
+ * setAudioEq(enabled, gainsDb[])
+ *
+ * gainsDb 是长度 10 的数组（60/170/310/600/1k/3k/6k/12k/14k/16kHz 的 dB 增益）。
+ * 数组缺失时按全 0（平坦）处理，不会抛异常 —— UI 侧只关心"能不能调"。
+ */
+napi_value SoftPlayerBinding::JsSetAudioEq(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    SoftPlayerBinding *self = Unwrap(env, info, &argc, argv);
+    if (self == nullptr) {
+        return ThrowError(env, "player object is invalid");
+    }
+    if (self->released_.load() || !self->engine_) {
+        return ThrowError(env, "player already released");
+    }
+    bool enabled = false;
+    if (argc >= 1) {
+        napi_get_value_bool(env, argv[0], &enabled);
+    }
+    int32_t gains[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (argc >= 2) {
+        bool isArray = false;
+        napi_is_array(env, argv[1], &isArray);
+        if (isArray) {
+            uint32_t len = 0;
+            napi_get_array_length(env, argv[1], &len);
+            for (uint32_t i = 0; i < len && i < 10; i++) {
+                napi_value item = nullptr;
+                if (napi_get_element(env, argv[1], i, &item) != napi_ok) {
+                    continue;
+                }
+                int64_t t = 0;
+                if (GetInt64Arg(env, item, t)) {
+                    gains[i] = static_cast<int32_t>(t);
+                }
+            }
+        }
+    }
+    self->engine_->SetAudioEq(enabled, gains, 10);
+    napi_value undef = nullptr;
+    napi_get_undefined(env, &undef);
+    return undef;
+}
+
 napi_value SoftPlayerBinding::JsRelease(napi_env env, napi_callback_info info)
 {
     size_t argc = 0;
@@ -539,6 +615,8 @@ napi_value SoftPlayerBinding::Init(napi_env env, napi_value exports)
         { "setSubtitleTrack", nullptr, JsSetSubtitleTrack, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "getActiveSubtitle", nullptr, JsGetActiveSubtitle, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "canSwitchAudioTrack", nullptr, JsCanSwitchAudioTrack, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setColorAdjust", nullptr, JsSetColorAdjust, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setAudioEq", nullptr, JsSetAudioEq, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "pollEvents", nullptr, JsPollEvents, nullptr, nullptr, nullptr, napi_default, nullptr }
     };
     napi_value cls = nullptr;

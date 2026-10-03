@@ -419,6 +419,11 @@ int32_t FfmpegEngine::Start() {
         LOGI("该文件没有视频轨，不启动视频解码线程（仅音频播放）");
     }
 
+    // ★ 看门狗起搏：开始播放时就算"刚出过帧"，这样即使一帧都还没解出来，
+    //   kStallDetectMs 之后也能被检测到（见 DecodeLoop ①.5）
+    lastDecodeOkMs_ = NowMs();
+    stallRecoverCount_ = 0;
+
     // 音频输出：启动失败不算致命（有些设备/权限下拿不到音频流），
     // 静音继续播视频比整个播放失败更合理
     if (audioReady_ && audio_ != nullptr && !audioThreadStarted_) {
@@ -478,6 +483,309 @@ void FfmpegEngine::SetStartPositionMs(int64_t positionMs) {
     startPositionMs_.store(positionMs < 0 ? -1 : positionMs);
 }
 
+/**
+ * 清空帧队列，并把每帧的缓冲**还回解码器的缓冲池**
+ *
+ * 为什么不能直接用 FrameQueue::Clear()：
+ *   它只把长度清零，帧结构体里那块 3.7MB 的 RGBA 缓冲就此失联 ——
+ *   池子（上限 8 块）被抽干后，每一帧都要现场 malloc + 清零 3.7MB，
+ *   真机实测单帧转换耗时从 ~12ms 涨到 ~93ms（其中分配 80ms），
+ *   表现就是"拖几次进度条之后越来越卡"。
+ *
+ * 只在解码线程里调用（seek 处理段）：那里是队列唯一的消费者，
+ * 不会有别的线程同时在 Pop。
+ */
+void FfmpegEngine::DrainFrameQueueRecycling() {
+    if (frameQueue_ == nullptr || session_ == nullptr) {
+        return;
+    }
+    VideoFrame stale;
+    int32_t recycled = 0;
+    // waitMs=0：只是把队列里现有的帧取干净，绝不等待
+    while (frameQueue_->Pop(stale, 0)) {
+        codecapi::RecycleFrameBuffer(session_, stale);
+        recycled++;
+    }
+    if (recycled > 0) {
+        LOGI("seek 清队列：已回收 %{public}d 帧缓冲（避免抽干缓冲池）", recycled);
+    }
+    frameQueue_->Clear();
+}
+
+/* ============================================================
+   色调调整（画面）
+   ============================================================ */
+
+void FfmpegEngine::SetColorAdjust(int32_t brightness, int32_t contrast, int32_t saturation,
+                                  int32_t hue, int32_t rGain, int32_t gGain, int32_t bGain) {
+    auto clampPercent = [](int32_t v) { return v < -100 ? -100 : (v > 100 ? 100 : v); };
+    colBrightness_.store(clampPercent(brightness));
+    colContrast_.store(clampPercent(contrast));
+    colSaturation_.store(clampPercent(saturation));
+    colHue_.store(clampPercent(hue));
+    colRGain_.store(clampPercent(rGain));
+    colGGain_.store(clampPercent(gGain));
+    colBGain_.store(clampPercent(bGain));
+    // 只改版本号：真正的矩阵合并在渲染线程做（见 RebuildColorMatrix 的说明）
+    colRev_.fetch_add(1);
+}
+
+/**
+ * 把七个参数合成一个 3x3 矩阵 + 3 个常数偏移
+ *
+ * 运算顺序（与常见播放器一致，从"像素本身"到"观感"）：
+ *   ① 对比度 + 亮度：v1 = (v - 128) * c + 128 + B
+ *   ② 通道增益：      v2 = v1 * g_c
+ *   ③ 饱和度：        v3 = L + s * (v2 - L)，L = 0.299R + 0.587G + 0.114B（灰度）
+ *   ④ 色彩度（色相旋转）：v4 = H * v3
+ * ①②③ 全是线性映射，④ 是线性矩阵，所以整体就是
+ *   out = M * in + O      （M 由 c、g、s、H 依次相乘得到，O 是 B 经过①之后的偏移再被②③④搬运）
+ * 这正是每像素只做 9 次乘加的前提。
+ *
+ * 定点：所有系数乘 65536 存 int32（16.16），像素运算在 int32 里做，
+ * 最后右移 16 位并夹到 0~255 —— 精度足够（误差 < 1/256），比浮点快得多。
+ */
+void FfmpegEngine::RebuildColorMatrix() {
+    const double bri = colBrightness_.load() / 100.0;
+    const double con = 1.0 + colContrast_.load() / 100.0;
+    const double sat = 1.0 + colSaturation_.load() / 100.0;
+    const double hueDeg = colHue_.load() / 100.0 * 180.0;
+    const double gr = 1.0 + colRGain_.load() / 100.0;
+    const double gg = 1.0 + colGGain_.load() / 100.0;
+    const double gb = 1.0 + colBGain_.load() / 100.0;
+
+    const bool isIdentity = (colBrightness_.load() == 0 && colContrast_.load() == 0
+                             && colSaturation_.load() == 0 && colHue_.load() == 0
+                             && colRGain_.load() == 0 && colGGain_.load() == 0
+                             && colBGain_.load() == 0);
+    if (isIdentity) {
+        // 恒等：显式写回单位矩阵，渲染时走原来的 memcpy 快路
+        const int32_t identity[9] = {65536, 0, 0, 0, 65536, 0, 0, 0, 65536};
+        for (int i = 0; i < 9; i++) {
+            colM_[i] = identity[i];
+        }
+        colO_[0] = colO_[1] = colO_[2] = 0;
+        colIdentity_ = true;
+        return;
+    }
+
+    // ---- ① + ②：对比度/亮度 → 通道增益 ----
+    // 亮度偏移量：±100% 对应 ±128（0~255 量程的一半），这是实测"全黑/全白"的边界，
+    // 再大就只剩纯色块，没有可用性。
+    const double brightOffset = bri * 128.0;
+    const double gain[3] = {gr, gg, gb};
+    double m[9] = {0};
+    double off[3] = {0};
+    for (int c = 0; c < 3; c++) {
+        // v2 = ((v - 128) * con + 128 + brightOffset) * gain[c]
+        m[c * 3 + c] = con * gain[c];
+        off[c] = ((128.0 - 128.0 * con) + brightOffset) * gain[c];
+    }
+
+    // ---- ③ 饱和度：把每个通道朝灰度靠或推远 ----
+    const double lw[3] = {0.299, 0.587, 0.114};
+    double sm[9];
+    for (int c = 0; c < 3; c++) {
+        for (int k = 0; k < 3; k++) {
+            sm[c * 3 + k] = (c == k ? sat : 0.0) + (1.0 - sat) * lw[k];
+        }
+    }
+
+    // ---- ④ 色彩度：色相旋转矩阵（在亮度/色度空间里旋转色度分量）----
+    const double rad = hueDeg * 3.14159265358979323846 / 180.0;
+    const double hc = std::cos(rad);
+    const double hs = std::sin(rad);
+    const double hm[9] = {
+        0.213 + 0.787 * hc - 0.213 * hs, 0.715 - 0.715 * hc - 0.715 * hs, 0.072 - 0.072 * hc + 0.928 * hs,
+        0.213 - 0.213 * hc + 0.143 * hs, 0.715 + 0.285 * hc + 0.140 * hs, 0.072 - 0.072 * hc - 0.283 * hs,
+        0.213 - 0.213 * hc - 0.787 * hs, 0.715 - 0.715 * hc + 0.715 * hs, 0.072 + 0.928 * hc + 0.072 * hs
+    };
+
+    // M = H * S * (① ② 的对角阵)
+    double t1[9];   // S * diag
+    for (int c = 0; c < 3; c++) {
+        for (int k = 0; k < 3; k++) {
+            t1[c * 3 + k] = sm[c * 3 + k] * m[k * 3 + k];
+        }
+    }
+    for (int c = 0; c < 3; c++) {
+        for (int k = 0; k < 3; k++) {
+            double acc = 0.0;
+            for (int j = 0; j < 3; j++) {
+                acc += hm[c * 3 + j] * t1[j * 3 + k];
+            }
+            m[c * 3 + k] = acc;
+        }
+    }
+    // 偏移：① ② 的偏移 → ③ → ④（逐级搬运，都是 3x3 乘 3 向量）
+    double off12[3];
+    for (int c = 0; c < 3; c++) {
+        off12[c] = ((128.0 - 128.0 * con) + brightOffset) * gain[c];
+    }
+    double offS[3];
+    for (int c = 0; c < 3; c++) {
+        double acc = 0.0;
+        for (int k = 0; k < 3; k++) {
+            acc += sm[c * 3 + k] * off12[k];
+        }
+        offS[c] = acc;
+    }
+    double offH[3];
+    for (int c = 0; c < 3; c++) {
+        double acc = 0.0;
+        for (int k = 0; k < 3; k++) {
+            acc += hm[c * 3 + k] * offS[k];
+        }
+        offH[c] = acc;
+    }
+
+    for (int i = 0; i < 9; i++) {
+        // +0.5 / -0.5 是为了四舍五入而不是截断（截断会让整体偏暗一点点）
+        const double v = m[i] * 65536.0;
+        colM_[i] = static_cast<int32_t>(v >= 0 ? v + 0.5 : v - 0.5);
+    }
+    for (int c = 0; c < 3; c++) {
+        const double v = offH[c] * 65536.0;
+        colO_[c] = static_cast<int32_t>(v >= 0 ? v + 0.5 : v - 0.5);
+    }
+    colIdentity_ = false;
+}
+
+void FfmpegEngine::RefreshColorMatrixIfNeeded() {
+    const int32_t rev = colRev_.load();
+    if (rev == colSeenRev_) {
+        return;
+    }
+    colSeenRev_ = rev;
+    RebuildColorMatrix();
+}
+
+/* ============================================================
+   均衡器（声音）
+   ============================================================ */
+
+void FfmpegEngine::SetAudioEq(bool enabled, const int32_t *gainsDb, int32_t count) {
+    if (gainsDb != nullptr) {
+        for (int32_t i = 0; i < 10; i++) {
+            const int32_t v = (i < count) ? gainsDb[i] : 0;
+            eqGainDb_[i].store(v < -12 ? -12 : (v > 12 ? 12 : v));
+        }
+    }
+    eqEnabled_.store(enabled);
+    eqRev_.fetch_add(1);
+}
+
+/**
+ * 按当前各段增益重建双二阶系数
+ *
+ * 用 RBJ cookbook 的 peaking EQ：
+ *   A = 10^(gain/40)，w0 = 2πf/fs，alpha = sin(w0)/(2Q)
+ *   b0 = 1 + alpha*A, b1 = -2cos(w0), b2 = 1 - alpha*A
+ *   a0 = 1 + alpha/A, a1 = -2cos(w0), a2 = 1 - alpha/A
+ * 全部除以 a0 归一化，之后每样本 5 次乘加。
+ *
+ * Q 取 1.0：这个 .rmvb 的音频是 44.1kHz 的 cook，10 段要覆盖 60Hz~16kHz，
+ * Q 太大各段会互相"打洞"（听感是忽大忽小声），Q 太小又变成整体音量变化。
+ * 1.0 是听感上最接近"图形均衡器"的取值。
+ *
+ * 只在音频线程里调用：滤波器状态（eqX1_ 等）也只有音频线程读写。
+ */
+void FfmpegEngine::RebuildEqCoeffs() {
+    // 采样率以输出设备为准（AudioOutput 固定 48kHz 立体声 S16）
+    const double fs = static_cast<double>(codecapi::AudioSampleRate());
+    const double freqs[10] = {60, 170, 310, 600, 1000, 3000, 6000, 12000, 14000, 16000};
+    const double q = 1.0;
+    int32_t active = 0;
+    for (int b = 0; b < 10; b++) {
+        const double gainDb = static_cast<double>(eqGainDb_[b].load());
+        if (gainDb > -0.4 && gainDb < 0.4) {
+            // 平坦段：写成直通（b0=1，其余 0），省下乘加也避免数值噪声
+            eqB0_[b] = 1.0; eqB1_[b] = 0.0; eqB2_[b] = 0.0;
+            eqA1_[b] = 0.0; eqA2_[b] = 0.0;
+            continue;
+        }
+        active++;
+        const double a = std::pow(10.0, gainDb / 40.0);
+        const double w0 = 2.0 * 3.14159265358979323846 * freqs[b] / fs;
+        const double cosW = std::cos(w0);
+        const double alpha = std::sin(w0) / (2.0 * q);
+        const double a0 = 1.0 + alpha / a;
+        eqB0_[b] = (1.0 + alpha * a) / a0;
+        eqB1_[b] = (-2.0 * cosW) / a0;
+        eqB2_[b] = (1.0 - alpha * a) / a0;
+        eqA1_[b] = (-2.0 * cosW) / a0;
+        eqA2_[b] = (1.0 - alpha / a) / a0;
+    }
+    eqActiveBands_ = active;
+    for (int i = 0; i < 20; i++) {
+        eqX1_[i] = 0.0; eqX2_[i] = 0.0; eqY1_[i] = 0.0; eqY2_[i] = 0.0;
+    }
+    // 把曲线本身也打出来：只报"几段非平坦"在排查时不够用 ——
+    // 曾经出现过"日志说 0 段、但界面曲线明显不平"的疑点，
+    // 有这 10 个数就能一眼看出是"上层没传下来"还是"系数算错了"。
+    LOGI("均衡器系数已更新：%{public}d 段非平坦 | 曲线=%{public}d,%{public}d,%{public}d,%{public}d,"
+         "%{public}d,%{public}d,%{public}d,%{public}d,%{public}d,%{public}d",
+         active, eqGainDb_[0].load(), eqGainDb_[1].load(), eqGainDb_[2].load(),
+         eqGainDb_[3].load(), eqGainDb_[4].load(), eqGainDb_[5].load(),
+         eqGainDb_[6].load(), eqGainDb_[7].load(), eqGainDb_[8].load(),
+         eqGainDb_[9].load());
+}
+
+/**
+ * 对一块 S16 立体声数据做 10 段均衡（就地修改）
+ *
+ * 为什么在"写设备之前"做：这里是音频通路的最后一道，
+ * 数据已经解码成 S16 交错立体声、音量和节奏都不再变化，
+ * 在这里改样本不会影响解码时间戳与音画同步。
+ */
+void FfmpegEngine::ApplyAudioEq(std::vector<uint8_t> &data) {
+    if (data.size() < 4) {
+        return;
+    }
+    // ★ 总开关必须在这里判断 ★
+    //   2026-10-04 自查发现：注释里写着"关闭时零开销"，代码却只判断了
+    //   "全部增益是否为 0"，于是**开关关掉之后曲线依然在生效**
+    //   （用户关了均衡器却还能听出音染，只会以为开关坏了）。
+    //   直接返回、连系数都不重建：打开时版本号必然已变，
+    //   下一次进来会重建，不会用到过期系数。
+    if (!eqEnabled_.load()) {
+        return;
+    }
+    // 参数变了就重建系数（同样只在音频线程里做，不需要锁）
+    const int32_t rev = eqRev_.load();
+    if (rev != eqSeenRev_) {
+        eqSeenRev_ = rev;
+        RebuildEqCoeffs();
+    }
+    if (eqActiveBands_ == 0) {
+        return;   // 全平坦：一个样本都不碰
+    }
+    int16_t *s = reinterpret_cast<int16_t *>(data.data());
+    const size_t frames = data.size() / 4;   // 2 声道 * 2 字节
+    for (size_t i = 0; i < frames; i++) {
+        for (int ch = 0; ch < 2; ch++) {
+            double x = static_cast<double>(s[i * 2 + static_cast<size_t>(ch)]);
+            for (int b = 0; b < 10; b++) {
+                const int idx = ch * 10 + b;
+                const double y = eqB0_[b] * x + eqB1_[b] * eqX1_[idx] + eqB2_[b] * eqX2_[idx]
+                                 - eqA1_[b] * eqY1_[idx] - eqA2_[b] * eqY2_[idx];
+                eqX2_[idx] = eqX1_[idx];
+                eqX1_[idx] = x;
+                eqY2_[idx] = eqY1_[idx];
+                eqY1_[idx] = y;
+                x = y;
+            }
+            int32_t v = static_cast<int32_t>(x + (x >= 0 ? 0.5 : -0.5));
+            if (v < -32768) {
+                v = -32768;
+            } else if (v > 32767) {
+                v = 32767;
+            }
+            s[i * 2 + static_cast<size_t>(ch)] = static_cast<int16_t>(v);
+        }
+    }
+}
+
 int32_t FfmpegEngine::SeekTo(int64_t positionMs) {
     if (state_.load() == PlayerState::RELEASED || session_ == nullptr) {
         return -1;
@@ -486,8 +794,14 @@ int32_t FfmpegEngine::SeekTo(int64_t positionMs) {
         positionMs = 0;
     }
     pendingSeekMs_.store(positionMs);
-    // seek 要清掉排队的旧帧，否则会先闪几帧旧画面
-    frameQueue_->Clear();
+    // seek 要清掉排队的旧帧，否则会先闪几帧旧画面。
+    //
+    // ★ 2026-10-04：这里**不再直接 frameQueue_->Clear()** ——
+    //   本函数是在 UI 线程上调用的，而 Clear() 只清长度、不回收缓冲，
+    //   会把队列里那几块 3.7MB 缓冲丢掉（池子上限只有 8 块，抽干后每帧
+    //   都要现场分配 3.7MB：实测 80ms/帧）。解码线程在处理 pendingSeekMs_
+    //   时会走 DrainFrameQueueRecycling()，既清队列又把缓冲还回池子，
+    //   时间差只有几十毫秒（解码循环每轮都会检查），闪旧帧的问题依旧成立。
     // ★ 2026-10-03：seek 世代号**刻意不在这里递增**，而是在解码线程真正把
     //   seek 交给解码器的那一刻（见 DecodeLoop 的 seek 处理段）。
     //
@@ -761,13 +1075,43 @@ bool FfmpegEngine::RenderFrame(VideoFrame &frame) {
     // RGBA8888 逐行拷贝。
     // 必须按 stride 逐行拷而不是整块 memcpy：buffer 的行宽通常大于
     // 画面行字节，整块拷会让画面按斜线错位。
+    //
+    // ★ 2026-10-04：色调调整就做在这一步 ★
+    //   这里是"解码结果 → 屏幕缓冲"的唯一通路，每帧本来就要逐行遍历一遍，
+    //   把颜色矩阵塞进同一趟循环最省（不额外多一次全画面遍历）。
+    //   参数全 0 时走原来的 memcpy 快路，**没有任何额外开销**。
     const int64_t tCopy0 = NowUs();
     uint8_t *dst = static_cast<uint8_t *>(mapped);
     const int32_t srcStride = frame.stride;
-    for (int32_t row = 0; row < h; row++) {
-        memcpy(dst + static_cast<size_t>(row) * handle->stride,
-               frame.data.data() + static_cast<size_t>(row) * srcStride,
-               static_cast<size_t>(rowBytes));
+    RefreshColorMatrixIfNeeded();
+    if (colIdentity_) {
+        for (int32_t row = 0; row < h; row++) {
+            memcpy(dst + static_cast<size_t>(row) * handle->stride,
+                   frame.data.data() + static_cast<size_t>(row) * srcStride,
+                   static_cast<size_t>(rowBytes));
+        }
+    } else {
+        // 16.16 定点的 3x3 矩阵 + 常数偏移：每像素 9 乘 3 加，整数运算
+        const int32_t m0 = colM_[0], m1 = colM_[1], m2 = colM_[2];
+        const int32_t m3 = colM_[3], m4 = colM_[4], m5 = colM_[5];
+        const int32_t m6 = colM_[6], m7 = colM_[7], m8 = colM_[8];
+        const int32_t o0 = colO_[0], o1 = colO_[1], o2 = colO_[2];
+        for (int32_t row = 0; row < h; row++) {
+            const uint8_t *srcRow = frame.data.data() + static_cast<size_t>(row) * srcStride;
+            uint8_t *dstRow = dst + static_cast<size_t>(row) * handle->stride;
+            for (int32_t x = 0; x + 3 < rowBytes; x += 4) {
+                const int32_t r = srcRow[x];
+                const int32_t g = srcRow[x + 1];
+                const int32_t b = srcRow[x + 2];
+                const int32_t nr = (m0 * r + m1 * g + m2 * b + o0) >> 16;
+                const int32_t ng = (m3 * r + m4 * g + m5 * b + o1) >> 16;
+                const int32_t nb = (m6 * r + m7 * g + m8 * b + o2) >> 16;
+                dstRow[x] = static_cast<uint8_t>(nr < 0 ? 0 : (nr > 255 ? 255 : nr));
+                dstRow[x + 1] = static_cast<uint8_t>(ng < 0 ? 0 : (ng > 255 ? 255 : ng));
+                dstRow[x + 2] = static_cast<uint8_t>(nb < 0 ? 0 : (nb > 255 ? 255 : nb));
+                dstRow[x + 3] = srcRow[x + 3];   // alpha 原样搬（surface 用不到，但别留脏值）
+            }
+        }
     }
     perfCopyUs_ += (NowUs() - tCopy0);
 
@@ -839,7 +1183,16 @@ void FfmpegEngine::DecodeLoop() {
             // seek 后解码器内部要重新对齐，EOF 标志必须清掉，
             // 否则跳到文件后半段会立刻误判为"播完了"
             eofReached = false;
-            queue->Clear();
+            // ★★ 2026-10-04：清队列必须把缓冲还回池子 ★★
+            //
+            //   原来这里调的是 queue->Clear()，它只把队列长度清 0 ——
+            //   帧里那几块 3.7MB 的缓冲就此丢失，解码器的缓冲池（上限 8 块）
+            //   被白白抽干。真机实测的连锁反应：
+            //     seek 几次之后 池命中=62/新分配=52
+            //     perf-split: 转换=2797ms（其中 分配=2383ms）→ 80ms/帧 → 只有 8fps
+            //   而每多一次 seek 就多丢最多 8 块，于是"拖得越多越卡"。
+            //   改成逐帧回收之后，缓冲在池内循环，分配耗时回到 0。
+            DrainFrameQueueRecycling();
             // ★ 这里才是"新一代"的开始：解码器已经收到 seek（上面 codecapi::Seek
             //   会清解码器内部状态并等待关键帧），此后解出来的帧才属于新位置。
             //   递增之后 renderedGen_ 自然变得不相等 → 解码线程会预渲染一帧
@@ -851,7 +1204,79 @@ void FfmpegEngine::DecodeLoop() {
             positionMs_.store(seekTarget);
             lastFramePtsMs_ = -1;
             lastFrameSysMs_ = 0;
+            // ★ 看门狗重新喂一次：seek 之后本来就要等解码器重新对齐，
+            //   给它 kStallDetectMs 的宽限，别把它自己的 seek 当成"停滞"（①.5）
+            lastDecodeOkMs_ = NowMs();
             Emit(PlayerEvent::POSITION, seekTarget, 0, "");
+        }
+
+        // ---------- ①.5 解码停滞看门狗（2026-10-04 新增） ----------
+        //
+        //   为什么必须有：真机上出现过"解码器收下了包却一帧都不吐"的病态 ——
+        //     seek 之后（帧级多线程解码器的参考链被判死）视频包队列满着
+        //     （深度 512），解码侧却一直睡觉，日志里连一条 perf 都没有，
+        //     画面永远停在旧位置。上层只能显示"正在缓冲…"，
+        //     用户看到的就是「拖完进度条没反应」。线程状态 dump 显示
+        //     33 个线程全部 sleeping、0% CPU —— 不是死锁，是解码器内部状态。
+        //
+        //   这类病态没有通用的"解法"（在解码器内部），但**可以检测**：
+        //   正在播放、队列里有包、却连续 kStallDetectMs 一帧都没解出来。
+        //   检测到就用最可靠的复位手段 —— 重新 seek 一次（codecapi::Seek 会
+        //   flush 解码器并等关键帧，等于把解码器整个重开），从**最后上屏的
+        //   位置**重来，位置不会跳。
+        //
+        //   限速与上限：恢复本身要读盘 + 重解码（很贵），所以每
+        //   kStallRecoverMinGapMs 最多一次；20 秒窗口内最多 kStormMaxRecover 次
+        //   —— 宁可停住，也不要把播放变成 seek 循环。
+        //
+        //   ★ 判据里"帧队列 ≥ 4"这一条很关键 ★
+        //     它把两种"不出帧"分开：
+        //       · 帧队列满着却不出帧 = 解码器手里有数据却不吐 → 真卡死，要恢复；
+        //       · 帧队列空着不出帧   = 在等盘读（冷缓存实测首帧最长要 18 秒）
+        //         → 这是正常的慢，重 seek 只会把读盘重新来过，必须放过。
+        //     冷启动时上层还没 play()（在等首帧），本来就不会进这里；
+        //     但用户拖到未缓存区域时同样可能慢上几秒，所以这条判据必须有。
+        if (playing_.load() && lastDecodeOkMs_ > 0 && queue->Size() >= 4) {
+            const int64_t kStallDetectMs = 2000;
+            const int64_t kStallRecoverMinGapMs = 2000;
+            const int64_t kStormWindowMs = 20000;
+            const int32_t kStormMaxRecover = 4;
+            // 这里单独取一次时间：下面的 nowMs 在节流段才声明（在它之后）
+            const int64_t wdNowMs = NowMs();
+            const int64_t sinceOkMs = wdNowMs - lastDecodeOkMs_;
+            if (sinceOkMs >= kStallDetectMs && wdNowMs - lastStallRecoverMs_ >= kStallRecoverMinGapMs) {
+                lastStallRecoverMs_ = wdNowMs;
+                // ★ 用一个 20 秒窗口给恢复动作封顶 ★
+                //
+                //   为什么不能只看"恢复之后有没有再出帧"：真机上出现过
+                //   每次恢复都只出一帧就再次停滞的情形（帧级解码器参考链被判死），
+                //   出帧就重置计数的话，计数永远回到 0 → 恢复永不封顶 →
+                //   播放变成"每 1.5 秒重新 seek 一次"的幻灯片。
+                //   改成"窗口内最多恢复 4 次"，无论出不出帧都能停下来。
+                if (wdNowMs - stallStormStartMs_ > kStormWindowMs) {
+                    stallStormStartMs_ = wdNowMs;
+                    stallRecoverCount_ = 0;
+                }
+                if (stallRecoverCount_ < kStormMaxRecover) {
+                    stallRecoverCount_++;
+                    // 回到"最后上屏的那一帧"，而不是 positionMs_ —— 后者在视频
+                    // 卡住时会被音频线程推着往前走，用它会把画面跳到前面去
+                    const int64_t backToMs = (lastFramePtsMs_ >= 0)
+                        ? lastFramePtsMs_ : positionMs_.load();
+                    LOGW("解码停滞 %{public}lldms 未出帧（帧队列=%{public}d），"
+                         "本窗口第 %{public}d 次恢复：重新 seek 到 %{public}lldms",
+                         static_cast<long long>(sinceOkMs), queue->Size(),
+                         stallRecoverCount_, static_cast<long long>(backToMs));
+                    pendingSeekMs_.store(backToMs);
+                } else if (stallRecoverCount_ == kStormMaxRecover) {
+                    stallRecoverCount_++;   // 只打一条，之后这个窗口内闭嘴
+                    LOGE("解码停滞：本窗口已恢复 %{public}d 次仍不出帧，"
+                         "暂停恢复动作（把播放变成 seek 循环更糟）",
+                         kStormMaxRecover);
+                }
+                // 无论恢复与否都把计时基准推后，避免每 50ms 刷一条日志
+                lastDecodeOkMs_ = wdNowMs;
+            }
         }
 
         // ---------- ② 填队列 ----------
@@ -873,6 +1298,9 @@ void FfmpegEngine::DecodeLoop() {
             perfDecodeUs_ += (NowUs() - decodeT0);
             if (ret == codecapi::kOk) {
                 queue->Push(frame);
+                // ★ 看门狗喂狗：解出一帧就说明解码器活着（①.5）
+                lastDecodeOkMs_ = NowMs();
+                stallRecoverCount_ = 0;
                 burst++;
                 continue;
             }
@@ -1207,11 +1635,28 @@ void FfmpegEngine::DecodeLoop() {
         //   处理：在"这个位置的首帧还没上屏"期间，pts 与 seek 目标差得离谱的帧
         //   直接丢掉、不上屏也不报信号，继续等真正属于新位置的那一帧。
         //   加计数上限是防呆：万一某个文件的时间戳整体不可信（比如 pts 恒为 0），
-        //   不能无限丢下去，丢掉 60 帧后就照常放行。
+        //   不能无限丢下去，丢掉若干帧后就照常放行。
+        //
+        //   ★★ 2026-10-04 修正：窗口原来写的是"目标前 3 秒"，太窄，把**正常帧**
+        //      当成残留帧丢掉了。真机现场（用户拖动滑块到 80:07）：
+        //        seek 后丢弃位置不符的残留帧: pts=4806816 目标=4810238ms（第 31 次）
+        //        …（第 32~40 次）…
+        //        位置首帧已上屏（seek 世代 2, pts=4807278ms）
+        //      拖动本身是好的，但 seek 落在目标**前 3.4 秒**的那个关键帧上
+        //      （RMF 的关键帧间隔约 4.5 秒，落在目标前是常态），于是从关键帧到
+        //      目标之间的 40 帧全被判成"残留帧"丢掉；而当时解码只有 1~2 fps，
+        //      40 帧 ≈ 40 秒 → 用户看到的就是「拖完没反应、又弹回去继续播」。
+        //
+        //      这个过滤真正要拦的是"seek 之前那一帧"（实测 pts=0 而目标是
+        //      3600853ms，差了一小时），所以窗口放宽到 ±30 秒/2 分钟完全够用，
+        //      丢帧上限也从 60 收到 8：能拦住跨小时的残留帧，又不会拖慢正常 seek。
         if (firstFrameOfGenMissing && lastSeekTargetMs_ >= 0) {
-            const bool ptsPlausible = (frame.ptsMs >= lastSeekTargetMs_ - 3000)
-                && (frame.ptsMs <= lastSeekTargetMs_ + 60000);
-            if (!ptsPlausible && staleFrameDropCount_ < 60) {
+            const int64_t kBeforeToleranceMs = 30000;    // 关键帧落在目标前是常态
+            const int64_t kAfterToleranceMs = 120000;    // 稀疏关键帧允许跳得更远
+            const int32_t kStaleDropMax = 8;             // 兜底：最多丢 8 帧就放行
+            const bool ptsPlausible = (frame.ptsMs >= lastSeekTargetMs_ - kBeforeToleranceMs)
+                && (frame.ptsMs <= lastSeekTargetMs_ + kAfterToleranceMs);
+            if (!ptsPlausible && staleFrameDropCount_ < kStaleDropMax) {
                 staleFrameDropCount_++;
                 LOGW("seek 后丢弃位置不符的残留帧: pts=%{public}lld 目标=%{public}lldms（第 %{public}d 次）",
                      static_cast<long long>(frame.ptsMs),
@@ -1450,6 +1895,10 @@ void FfmpegEngine::AudioLoop() {
             continue;
         }
 
+        // ★ 均衡器：写设备之前就地处理（见 ApplyAudioEq 的说明）。
+        //   总开关关闭或全部增益为 0dB 时它立刻返回，等于没有这段代码。
+        ApplyAudioEq(chunk.data);
+
         // 写入环形缓冲；一次写不完（缓冲满）就分次写，避免丢数据造成断音
         size_t offset = 0;
         const size_t total = chunk.data.size();
@@ -1460,6 +1909,34 @@ void FfmpegEngine::AudioLoop() {
                 // 缓冲满：稍等再写。这一步保证了音频永不丢帧
                 sleeper_->Sleep(10);
             }
+        }
+
+        // ★★ 2026-10-04：向后 seek 之后，音频侧的"位置基准"必须跟着重置 ★★
+        //
+        //   现场（用户反馈「拖动进度条后弹回去继续播放」，真机 diag.log 实锤）：
+        //     12:39:16.4  persist pos=1562534   ← 拖到 26:03，界面正确
+        //     12:39:17.5  persist pos=1562534   ← 仍然正确
+        //     12:39:18.7  persist pos=5024622   ← 弹回 83:45，之后每 1.1 秒涨 1104ms
+        //   而同一时刻引擎已经把新位置的帧上屏了：
+        //     位置首帧已上屏（seek 世代 2, pts=1558685ms）
+        //   ——画面是对的，位置却是错的，问题就在下面那行累加：
+        //     lastPosMs = (chunk.ptsMs > lastPosMs) ? chunk.ptsMs : (lastPosMs + duration)
+        //   向后 seek 后新位置的音频包 pts（1558xxx）**小于** lastPosMs（5024xxx），
+        //   于是走 else 分支从旧基准一直加下去：位置永远回不到新位置，
+        //   而它每 500ms 就上报一次，界面每 100ms 被覆盖一次 → 滑块"弹回去"。
+        //
+        //   只需要判断"倒退"：向前 seek 时 chunk.ptsMs 自然大于旧值、走 if 分支自愈，
+        //   只有向后 seek 才需要在这里把基准归零。
+        //   阈值取 1 秒：正常播放相邻音频块不可能倒退 1 秒（时间戳防护已保证单调），
+        //   而 seek 的跨度是分钟级，两者不会混淆。
+        if (chunk.ptsMs > 0 && lastPosMs > 0 && chunk.ptsMs + 1000 < lastPosMs) {
+            LOGI("音频位置倒退到 %{public}lldms（seek 已生效），重置音频侧基准（原基准 %{public}lldms）",
+                 static_cast<long long>(chunk.ptsMs), static_cast<long long>(lastPosMs));
+            lastPosMs = 0;
+            // 与 SeekTo 的约定保持一致：音频时钟是【相对】基准，seek 后从 0 重新累积
+            audioWrittenMs_.store(0);
+            // 归零后下面那段上报会立刻发一条新位置的 POSITION 给上层
+            audioLastReportMs_ = 0;
         }
 
         // 累计"已提交给输出的音频时长"——音频时钟的基准

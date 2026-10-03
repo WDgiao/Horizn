@@ -70,6 +70,13 @@ public:
     int32_t SeekTo(int64_t positionMs) override;
     int32_t SetSurface(const std::string &surfaceId) override;
 
+    /** 色调调整（七项百分比，见 IPlayerEngine 说明）：随时可调用，立即生效 */
+    void SetColorAdjust(int32_t brightness, int32_t contrast, int32_t saturation,
+                        int32_t hue, int32_t rGain, int32_t gGain, int32_t bGain) override;
+
+    /** 均衡器（10 段增益 dB）：随时可调用，下一块音频起生效 */
+    void SetAudioEq(bool enabled, const int32_t *gainsDb, int32_t count) override;
+
     /**
      * 解绑 surface
      *
@@ -157,6 +164,46 @@ private:
 
     /** 清空映射缓存（窗口重建 / 释放时必须调用，否则会用到野映射） */
     void ClearSurfaceMapCache();
+
+    /**
+     * 清空帧队列，并把每帧的缓冲**还回解码器的缓冲池**
+     *
+     * ★ 2026-10-04：seek 时不能再用 FrameQueue::Clear() ——
+     *   它只清长度、不回收缓冲，每 seek 一次就丢最多 8 块 3.7MB 缓冲，
+     *   池子（上限 8）抽干后每帧都要现场分配（实测 80ms/帧 → 只有 8fps，
+     *   表现为"拖几次进度条之后越来越卡"）。
+     *   只在解码线程里调用（见 DecodeLoop 的 seek 处理段）。
+     */
+    void DrainFrameQueueRecycling();
+
+    /* ==================== 色调 / 均衡器（2026-10-04 新增） ==================== */
+
+    /**
+     * 重建颜色变换矩阵（渲染线程调用，参数变化时触发一次）
+     *
+     * 为什么合成**一个** 3x3 矩阵 + 3 个偏移，而不是逐项做七次运算：
+     *   每帧要处理 1280x720 = 92 万像素，逐项做就是七八遍遍历（每遍几十毫秒），
+     *   而"对比度/通道增益/饱和度/色彩度"全是**线性**运算，可以按顺序相乘
+     *   折叠成单个矩阵；亮度是常数偏移，也用矩阵的同一趟算掉。
+     *   于是每像素只剩 9 次乘加，实测在 92 万像素上约十几毫秒
+     *   —— 只有**开了色调**才会走这条路，参数全 0 时仍是原来的 memcpy。
+     */
+    void RebuildColorMatrix();
+
+    /** 把当前是否"需要做颜色变换"的判断缓存下来（避免每帧重算矩阵） */
+    void RefreshColorMatrixIfNeeded();
+
+    /**
+     * 音频均衡器：就地处理一块 S16 立体声数据（音频线程调用）
+     *
+     * 10 段 peaking biquad 串起来，频点与 Winamp 预设一致
+     * （60/170/310/600/1k/3k/6k/12k/14k/16k）。
+     * 全部增益为 0dB 或总开关关闭时**直接返回**，不产生任何计算。
+     */
+    void ApplyAudioEq(std::vector<uint8_t> &data);
+
+    /** 按 eqGainDb_ 重建双二阶系数（音频线程内部调用，参数变化时一次） */
+    void RebuildEqCoeffs();
 
     /** 内联的映射缓存项 */
     struct SurfaceMap {
@@ -325,6 +372,72 @@ private:
     int64_t lastSeekTargetMs_ = -1;
     /** 已经因为"位置不符"丢掉多少帧（防呆上限，见 DecodeLoop） */
     int32_t staleFrameDropCount_ = 0;
+
+    /**
+     * 最近一次"成功解出视频帧"的时刻（毫秒，NowMs()）；0 = 还没解出过
+     *
+     * ★ 2026-10-04：解码停滞看门狗用的"喂狗"时间戳（见 DecodeLoop ①.5）。
+     *   真机出现过解码器收下包却一帧不吐的病态（线程全睡、0% CPU、
+     *   队列满着却没有任何输出），画面永远停在旧位置。
+     *   有了这个时间戳就能检测出来，并用"重新 seek 一次"把解码器重开。
+     */
+    int64_t lastDecodeOkMs_ = 0;
+    /** 最近一次执行"停滞恢复"的时刻（限速用，避免反复重 seek） */
+    int64_t lastStallRecoverMs_ = 0;
+    /** 当前"恢复风暴窗口"的起点（毫秒）；窗口内最多恢复若干次，防止 seek 循环 */
+    int64_t stallStormStartMs_ = 0;
+    /** 当前窗口内已经恢复了几次（窗口滚动时清零；满额后本窗口不再动作用） */
+    int32_t stallRecoverCount_ = 0;
+
+    /* ==================== 色调（画面颜色）状态 ==================== */
+
+    /**
+     * 七个色调参数（百分比 -100~100），由 UI 线程写、渲染线程读
+     *
+     * 用原子量而不是加锁：渲染线程每帧都要读，锁的开销和优先级反转风险
+     * 都不值得；每个参数单独 4 字节对齐，读到的值最多是"差一帧的旧值"，
+     * 对画面没有任何影响。
+     */
+    std::atomic<int32_t> colBrightness_{0};
+    std::atomic<int32_t> colContrast_{0};
+    std::atomic<int32_t> colSaturation_{0};
+    std::atomic<int32_t> colHue_{0};
+    std::atomic<int32_t> colRGain_{0};
+    std::atomic<int32_t> colGGain_{0};
+    std::atomic<int32_t> colBGain_{0};
+    /** 参数版本号：UI 线程每改一次 +1，渲染线程据此判断要不要重建矩阵 */
+    std::atomic<int32_t> colRev_{0};
+    /** 渲染线程已经用过的版本号 */
+    int32_t colSeenRev_ = -1;
+    /** 合成后的颜色矩阵（16.16 定点，行主序 3x3）与常数偏移（同样是 16.16） */
+    int32_t colM_[9] = {65536, 0, 0, 0, 65536, 0, 0, 0, 65536};
+    int32_t colO_[3] = {0, 0, 0};
+    /** 矩阵是否等于"恒等变换"（恒等时走原来的 memcpy 通路） */
+    bool colIdentity_ = true;
+
+    /* ==================== 均衡器状态 ==================== */
+
+    /** 总开关 */
+    std::atomic<bool> eqEnabled_{false};
+    /** 各段增益（dB），UI 线程写、音频线程读 */
+    std::atomic<int32_t> eqGainDb_[10];
+    /** 参数版本号（同 colRev_ 的思路） */
+    std::atomic<int32_t> eqRev_{0};
+    /** 音频线程已经用过的版本号 */
+    int32_t eqSeenRev_ = -1;
+    /** 非平坦段数：0 表示可以整块跳过 */
+    int32_t eqActiveBands_ = 0;
+    /** 10 段的双二阶系数（归一化后） */
+    double eqB0_[10] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+    double eqB1_[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    double eqB2_[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    double eqA1_[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    double eqA2_[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    /** 滤波器状态： [声道 * 10 + 段] —— 只有音频线程访问 */
+    double eqX1_[20] = {0};
+    double eqX2_[20] = {0};
+    double eqY1_[20] = {0};
+    double eqY2_[20] = {0};
 
     /* ==================== 音频 ==================== */
 

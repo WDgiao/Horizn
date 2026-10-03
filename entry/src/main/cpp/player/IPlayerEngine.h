@@ -191,6 +191,37 @@ public:
     /** 音频轨是否支持切换（文件里有多条可解码音轨） */
     virtual bool CanSwitchAudioTrack() const { return false; }
 
+    /**
+     * 色调调整（2026-10-04 新增）
+     *
+     * 七个参数都是**百分比**（-100 ~ +100，0 = 不改）：
+     *   brightness 亮度、contrast 对比度、saturation 饱和度、
+     *   hue 色彩度（±100% 对应 ±180°）、rGain/gGain/bGain 三个通道各自的增益。
+     *
+     * 默认实现什么都不做：系统 AVPlayer 通道的画面由系统渲染，
+     * 播放器拿不到像素，那条路天然不支持（上层会给出提示）。
+     */
+    virtual void SetColorAdjust(int32_t brightness, int32_t contrast, int32_t saturation,
+                                int32_t hue, int32_t rGain, int32_t gGain, int32_t bGain)
+    {
+        (void)brightness; (void)contrast; (void)saturation; (void)hue;
+        (void)rGain; (void)gGain; (void)bGain;
+    }
+
+    /**
+     * 均衡器（2026-10-04 新增）
+     *
+     * @param enabled  总开关；关掉时**完全不做处理**（零开销）
+     * @param gainsDb  各段增益（dB，-12 ~ +12），长度由 count 给出
+     * @param count    段数（上层固定传 10：60/170/310/600/1k/3k/6k/12k/14k/16kHz）
+     *
+     * 同样只有软解通道支持 —— AVPlayer 的音频由系统输出，插不进滤波器。
+     */
+    virtual void SetAudioEq(bool enabled, const int32_t *gainsDb, int32_t count)
+    {
+        (void)enabled; (void)gainsDb; (void)count;
+    }
+
     /** 释放全部资源，之后不可再调用其它方法 */
     virtual void Release() = 0;
 };

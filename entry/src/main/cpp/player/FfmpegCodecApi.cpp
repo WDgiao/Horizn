@@ -593,20 +593,27 @@ struct DecoderSession {
     int64_t audioPacketGen = 0;
 
     /**
-     * 视频解码器是否在等第一个关键帧（seek 之后置位）
+     * "只送关键帧"开关（**当前没有任何路径会置 true**，保留为安全阀）
      *
-     * 为什么需要：flush 之后解码器处于"要从关键帧重新开始"的状态，
-     * 此时若送进去一个非关键帧，VP9 会直接拒绝并报 AVERROR_INVALIDDATA
-     * （真机实测：换轨后连续多个包被拒，正是这个原因 —— 那些包
-     *  size≈17~18KB、pts 7000/7280/7600…，全是非关键帧）。
-     * 正确做法是**主动跳过**：seek 之后一直丢包，直到遇到带
-     * AV_PKT_FLAG_KEY 的那个再开始送。
+     * 历史（为什么曾经需要它）：flush 之后解码器处于"要从关键帧重新开始"
+     * 的状态，此时送进去一个非关键帧，VP9 会直接拒绝并报
+     * AVERROR_INVALIDDATA（真机实测：换轨后连续多个包被拒，正是这个原因）。
+     * 当时的对策是"主动跳过非关键帧，直到遇到 AV_PKT_FLAG_KEY"。
      *
-     * ★ 2026-10-03 起它还是"包被拒"的唯一恢复手段：
-     *   包被拒（AVERROR_INVALIDDATA）时不再 flush 解码器，而是置本标志
-     *   转入等关键帧 —— 理由见 DecodeVideoFrame 里那段真机日志。
+     * ★ 2026-10-04 起默认 false，且 seek 之后也不再置位 ★
+     *   真机对比证明这套"跳关键帧"策略对这个 .rmvb（RMF 容器）有害无益：
+     *     RMF 的 AV_PKT_FLAG_KEY 不可靠 —— demuxer 的 av_seek_frame 已经落在
+     *     真正的关键帧上，而"带 KEY 标志"的包并不真的是关键帧；
+     *     专门挑它们送进解码器，解码器必以"参考链断了"拒绝，
+     *     于是每次 seek 都变成"跳过一段 → 送一个假关键帧 → 被拒"的循环，
+     *     画面只剩每 1.5 秒一帧（幻灯片，用户描述为"拖完没反应"）。
+     *     改成全喂之后，seek 立刻出画面（40fps、丢帧=0）。
+     *   现在只要解码器拒绝就"丢掉这一个包、后面的继续送"，
+     *   由解码器自己在下一个真关键帧重新对齐；
+     *   万一是真卡死（长时间一帧都不吐），由引擎的停滞看门狗兜底
+     *   （FfmpegEngine::DecodeLoop ①.5：重新 seek 把解码器整个重开）。
      */
-    bool videoWaitKeyframe = true;
+    bool videoWaitKeyframe = false;
 
     /**
      * 本轮"等关键帧"已经跳过了多少个包
@@ -615,6 +622,25 @@ struct DecoderSession {
      * 累计到阈值后才会动用最后手段（flush + 放弃等待）。
      */
     int64_t videoWaitSkip = 0;
+
+    /**
+     * 累计被解码器拒绝（AVERROR_INVALIDDATA）的包数，送成功一个就清零
+     *
+     * 纯诊断用（日志里用它决定"前 3 次打印、之后闭嘴"）。
+     *
+     * ★ 2026-10-04 的两次真机对比结论（改动前请先读完）★
+     *   这里一度改成"单次被拒只丢这一包、后面的包照送"，理由是帧级多线程
+     *   解码器的 INVALIDDATA 属于**延迟上报**、会误伤后面的好包。
+     *   实测把这个改动**否掉了**：
+     *     · 被拒后"转入等关键帧"→ seek 完立刻出画面，一切正常；
+     *     · 被拒后"继续送"    → 解码器直接睡死：视频包队列满着（深度 512），
+     *       reject 只报 3 次就再无任何输出，画面永远停在旧位置（"拖完没反应"）。
+     *   原因：rv40 这类带帧间预测的流，参考链一旦判死，继续喂非关键帧
+     *   只会让它越陷越深；必须跳过一段、从下一个关键帧重新对齐。
+     *   所以现在的策略是"丢一包 + 等关键帧"，而"等不到关键帧"那种极端情况
+     *   由引擎侧的停滞看门狗兜底（FfmpegEngine::DecodeLoop ①.5）。
+     */
+    int32_t sendInvalidStreak = 0;
 
     /**
      * 上一次交给上层的视频帧时间戳（毫秒），-1 表示还没给过
@@ -632,6 +658,15 @@ struct DecoderSession {
     int64_t lastOutPtsMs = -1;
     /** 坏时间戳日志已打印次数（避免坏流刷屏） */
     int32_t tsJumpLog = 0;
+    /**
+     * 连续被判为"时间戳跳变"的帧数（送出一个正常帧就清零）
+     *
+     * ★ 2026-10-04 新增：坏时间戳防护原来会把自己锁死 ——
+     *   跳变帧被丢弃时 lastOutPtsMs 不更新，于是"落后 9.6 秒"的判据
+     *   对后面每一帧都成立，时间轴永远回不到真实位置。
+     *   连续 kTsJumpStreakMax 帧都落在新位置上就不再当坏值，采信它。
+     */
+    int32_t tsJumpStreak = 0;
     /**
      * 从码流里**实测**出来的帧间隔（毫秒），0 = 还没估出来
      *
@@ -1178,20 +1213,44 @@ int64_t ResolveFrameTimestamp(DecoderSession *s, const AVFrame *raw, int64_t &pt
                 s->stepSamples++;
             }
             if (diff < -step || diff > 3000) {
-                if (s->tsJumpLog < 8) {
-                    s->tsJumpLog++;
-                    LOGW("视频时间戳跳变，已丢弃: 算出=%{public}lldms 上一帧=%{public}lldms "
-                         "(差 %{public}lldms) | 原始 best_effort=%{public}lld pts=%{public}lld "
-                         "dts=%{public}lld 时基=%{public}d/%{public}d 帧间隔=%{public}lldms",
-                         static_cast<long long>(ms), static_cast<long long>(s->lastOutPtsMs),
-                         static_cast<long long>(diff),
-                         static_cast<long long>(raw->best_effort_timestamp),
-                         static_cast<long long>(raw->pts),
-                         static_cast<long long>(raw->pkt_dts),
-                         s->timeBase.num, s->timeBase.den,
-                         static_cast<long long>(step));
+                // ★ 2026-10-04：跳变**不能无限丢弃**，否则会自我维持成死循环 ★
+                //
+                //   现场证据（同一次真机日志）：解码器"跳过 230 个包"之后，
+                //   真实位置本来就该往前跳 9.6 秒，于是
+                //     算出=2710921ms 上一帧=2701245ms（差 9676ms）→ 丢弃
+                //   而丢弃不会更新 lastOutPtsMs，下一帧差得更多 → 继续丢，
+                //   **基准永远冻在 2701245ms，此后每一帧都被判成跳变** ——
+                //   时间轴再也回不来，只剩零星几帧漏过去（实测 1~2 fps）。
+                //
+                //   正确的判据：真实的跳变是**连续多帧一致地**落在新基准上；
+                //   而坏值（833 秒那种）是孤立的，下一帧就回到真实值。
+                //   所以连续 kTsJumpStreakMax 帧都跳变，就采信新基准。
+                const int32_t kTsJumpStreakMax = 3;
+                if (++s->tsJumpStreak >= kTsJumpStreakMax) {
+                    LOGW("连续 %{public}d 帧时间戳都在新位置，接受新基准: "
+                         "算出=%{public}lldms 旧基准=%{public}lldms（差 %{public}lldms）",
+                         s->tsJumpStreak, static_cast<long long>(ms),
+                         static_cast<long long>(s->lastOutPtsMs),
+                         static_cast<long long>(diff));
+                    s->tsJumpStreak = 0;
+                } else {
+                    if (s->tsJumpLog < 8) {
+                        s->tsJumpLog++;
+                        LOGW("视频时间戳跳变，已丢弃: 算出=%{public}lldms 上一帧=%{public}lldms "
+                             "(差 %{public}lldms) | 原始 best_effort=%{public}lld pts=%{public}lld "
+                             "dts=%{public}lld 时基=%{public}d/%{public}d 帧间隔=%{public}lldms",
+                             static_cast<long long>(ms), static_cast<long long>(s->lastOutPtsMs),
+                             static_cast<long long>(diff),
+                             static_cast<long long>(raw->best_effort_timestamp),
+                             static_cast<long long>(raw->pts),
+                             static_cast<long long>(raw->pkt_dts),
+                             s->timeBase.num, s->timeBase.den,
+                             static_cast<long long>(step));
+                    }
+                    ms = s->lastOutPtsMs + step;
                 }
-                ms = s->lastOutPtsMs + step;
+            } else {
+                s->tsJumpStreak = 0;
             }
         }
         ptsMs = ms;
@@ -2118,8 +2177,27 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
         if (gen != s->videoSeekGen) {
             s->videoSeekGen = gen;
             avcodec_flush_buffers(s->videoCtx);
-            // flush 之后解码器要从关键帧重开，置位让下面的循环跳过非关键帧
-            s->videoWaitKeyframe = true;
+            // ★★ 2026-10-04：flush 之后**不再**置"等关键帧" ★★
+            //
+            //   原来这里置 true，让下面的循环跳过非关键帧、只送
+            //   AV_PKT_FLAG_KEY 的包。真机对比后确认这是错的：
+            //     · 置 true ：**每一次** seek 都陷入拒绝循环 ——
+            //         已等到关键帧（pts=3870248），恢复送包（跳过 19 个包）
+            //         视频包被拒（参考链断了）: pts=3870248 flags=1
+            //       而且与位置无关（9 分钟的早期位置一样中招），
+            //       每次恢复只出一帧就再停，看门狗反复重 seek，成了幻灯片。
+            //     · 置 false：seek 之后直接出画面，实测 40fps、丢帧=0
+            //       （第一次构建就是这样，只是当时被另一个缺陷掩盖了）。
+            //   原因：**这个 .rmvb（RMF 容器）的关键帧标志不可靠** ——
+            //   demuxer 的 av_seek_frame 已经落在真正的关键帧上，
+            //   而它后面那些"带 KEY 标志"的包并不真的是关键帧，
+            //   专门挑它们送进去，解码器必拒（"参考链断了"）。
+            //   顺序播放时根本不做这个门控（waitKeyframe 恒为 false），
+            //   所以只有 seek 之后才会犯病 —— 与现场完全吻合。
+            //
+            //   被拒的包现在只丢它自己、后面的继续送（见下面的处理），
+            //   "解码器整个睡死"那种极端情况由引擎的停滞看门狗兜底。
+            s->videoWaitKeyframe = false;
             s->videoWaitSkip = 0;
             // seek 之后位置会合法地大幅跳变，坏时间戳防护的基准要一并重置
             // （否则新位置的第一个关键帧会被误判成坏值，画面从错误的位置接上）
@@ -2251,21 +2329,51 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
         //   每秒两次 flush 也意味着解码器的帧级流水线永远排不满，
         //   这本身就是"解码只有个位数 fps"的一大来源。
         //
-        //   正确做法是**完全不动解码器**：丢掉当前这一包，转入"等关键帧"，
-        //   让解码器自己从下一个关键帧把参考链重新对齐（下面的
-        //   videoWaitKeyframe 分支就是为此存在的，它与 seek 用同一个约定）。
-        //   只丢一两个 GOP 的代价，远小于"整段播不出画面"。
+        //   正确做法是**完全不动解码器**：只丢掉被拒的这一个包，
+        //   后面的包照常送 —— 解码器自己会在下一个关键帧把参考链对齐。
+        //   ★ 2026-10-04 又修了一层：原来这里是"丢一包 + 转入等关键帧"，
+        //     实测会变成"等 4.5 秒 → 把刚等到的关键帧也丢掉 → 再等"，因为
+        //     延迟上报的错误会把**好的**关键帧也判成被拒。现在只有**连续**
+        //     被拒才转入等关键帧（见 sendInvalidStreak 的完整现场记录）。
         if (rret == AVERROR_INVALIDDATA) {
             s->pfSplit.flushRetry++;
-            LOGW("视频包被拒（参考链断了，转入等关键帧）: size=%{public}d "
-                 "pts=%{public}lld flags=%{public}d（不 flush，避免破坏帧级流水线）",
-                 vpkt->size, static_cast<long long>(vpkt->pts), vpkt->flags);
-            s->videoWaitKeyframe = true;
-            s->videoWaitSkip = 0;
+            // ★★ 2026-10-04 结论：这里必须回到"丢这一包 + 等关键帧" ★★
+            //
+            //   本轮先试过"只丢这一包、后面的照送"（理由：延迟上报的报错会误伤
+            //   好的关键帧），真机对比后否掉了：
+            //     · 【等关键帧】seek 之后干净利落 —— 关键帧被接受、帧立刻出来
+            //       （日志：已等到关键帧 pts=1566192 跳过 0 个包 → 位置首帧已上屏）
+            //     · 【继续送】seek 之后解码器直接睡死 —— 队列满（深度 512）、
+            //       reject 只报 3 次就再无输出，连一条 perf 都没有，画面永远停在
+            //       旧位置（真机实测，用户看到的就是"拖完没反应"）。
+            //   即：帧级 rv40 解码器一旦被判参考链断裂，继续喂非关键帧只会让它
+            //   越陷越深，**只有跳过一段、从下一个关键帧重新对齐才能恢复**。
+            //   丢一个 GOP（约 4.5 秒）换"能继续播"，是明确的划算。
+            //
+            //   （"等关键帧却永远等不到"那个死循环另有一层原因 —— 关键帧本身
+            //     被延迟上报的错误误判，那由引擎侧的"解码停滞看门狗"兜底，
+            //     见 FfmpegEngine::DecodeLoop ①.5：它检测到长时间不出帧就重新
+            //     seek 一次，把解码器整个重开。）
+            if (s->sendInvalidStreak <= 3) {
+                // 只在前 3 次打印，避免坏流刷屏
+                LOGW("视频包被拒（延迟上报，只丢这一包，继续送后面的）: size=%{public}d "
+                     "pts=%{public}lld flags=%{public}d",
+                     vpkt->size, static_cast<long long>(vpkt->pts), vpkt->flags);
+            }
+            s->sendInvalidStreak++;
+            // ★★ 只丢被拒的这一个包，绝不转入"等关键帧" ★★
+            //
+            //   理由见上面 seek 世代块里的真机对比：这个 RMF 的关键帧标志不可靠，
+            //   "等关键帧"会让解码器专门收到假关键帧、然后一路被拒，
+            //   每次恢复只出一帧就再停（幻灯片）。而"丢一包继续送"能靠
+            //   解码器自己在下一个真关键帧重新对齐；万一是真卡死，
+            //   引擎侧的停滞看门狗会重新 seek 把解码器整个重开。
             s->pfSplit.waitKeyframe++;
             av_packet_unref(vpkt);
             continue;
         }
+        // 送成功一个包就说明解码器不再处于"等关键帧"状态
+        s->sendInvalidStreak = 0;
         s->pfSplit.sendUs += (NowUs() - tSend0);
         av_packet_unref(vpkt);
         if (rret < 0 && rret != AVERROR(EAGAIN)) {

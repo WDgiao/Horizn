@@ -31,7 +31,19 @@ struct PlaybackSettingsPage {
     preferExternalSubtitle: true,
     autoLoadSidecar: false,
     subtitleFontSize: 1,
-    subtitleBackground: true
+    subtitleBackground: true,
+    // 色调 / 均衡器不在这里编辑（它们属于播放页的抽屉），
+    // 但字段必须给全 —— ArkTS 的对象字面量要求覆盖接口的全部属性
+    colorBrightness: 0,
+    colorContrast: 0,
+    colorSaturation: 0,
+    colorHue: 0,
+    colorRGain: 0,
+    colorGGain: 0,
+    colorBGain: 0,
+    eqEnabled: false,
+    eqPreset: '默认',
+    eqBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   };
 
   private store: AppSettings | undefined = undefined;

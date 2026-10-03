@@ -46,8 +46,59 @@ export enum SubtitleFontSize {
   LARGE = 2
 }
 
-/** 落盘的数据结构（字段全部是原始类型，便于校验） */
-export interface SettingsData {
+/**
+ * 均衡器预置（2026-10-04 新增）
+ *
+ * 19 条与用户给的参考图一一对应（经典的 Winamp 预置表），
+ * 每条的 10 个数字是各频段增益（dB，-12 ~ +12），频点固定为
+ * 60/170/310/600/1k/3k/6k/12k/14k/16kHz —— 与 C++ 侧 ApplyAudioEq 一致。
+ *
+ * 为什么放在**设置模块**里而不是播放页：
+ *   设置文件里有"预置名 + 10 段曲线"两份数据，加载时要做一致性校正
+ *   （见 load() 里的说明），那个校正需要预置表。表放在播放页，
+ *   设置模块就得反过来 import 页面，依赖方向是错的。
+ */
+export interface EqPreset {
+  name: string;
+  gains: number[];
+}
+
+export const EQUALIZER_PRESETS: EqPreset[] = [
+  { name: '默认', gains: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
+  { name: '古典乐', gains: [0, 0, 0, 0, 0, 0, -7, -7, -7, -9] },
+  { name: '俱乐部', gains: [0, 0, 8, 5, 5, 5, 3, 0, 0, 0] },
+  { name: '舞曲', gains: [9, 7, 2, 0, 0, -5, -7, -7, 0, 0] },
+  { name: '超重低音', gains: [-8, -6, -2, 4, 8, 10, 11, 11, 11, 11] },
+  { name: '超重低音和高音', gains: [7, 5, 0, -7, -4, 2, 8, 11, 11, 11] },
+  { name: '超高高音', gains: [-9, -9, -9, -4, 2, 11, 11, 11, 11, 11] },
+  { name: '掌上乐', gains: [4, 3, 1, 0, -1, -2, -3, -5, -6, -7] },
+  { name: '大厅', gains: [10, 10, 5, 5, 0, -3, -3, -3, 0, 0] },
+  { name: '现场', gains: [-5, 0, 4, 5, 5, 5, 4, 3, 3, 3] },
+  { name: '重音', gains: [6, 5, 4, 2, 0, 0, 0, 0, 0, 0] },
+  { name: '派对', gains: [7, 7, 0, 0, 0, 0, 0, 0, 7, 7] },
+  { name: '流行乐', gains: [-2, -1, 0, 3, 5, 5, 3, 0, -1, -2] },
+  { name: '雷鬼', gains: [0, 0, 0, -6, 0, 6, 6, 0, 0, 0] },
+  { name: '摇滚', gains: [8, 5, -2, -5, -3, 0, 4, 6, 7, 7] },
+  { name: '斯卡', gains: [-3, -2, 0, 3, 5, 5, 6, 6, 6, 6] },
+  { name: '轻柔', gains: [5, 3, 0, -2, -4, -5, -3, 0, 3, 5] },
+  { name: '慢摇滚', gains: [5, 3, -1, -3, -2, 1, 4, 5, 6, 6] },
+  { name: '泰克诺', gains: [8, 6, 0, -4, -3, 0, 8, 10, 10, 10] }
+];
+
+/** 手动调过之后的名字：表示"这条曲线不属于任何预置" */
+export const EQ_CUSTOM_NAME: string = '自定义';
+
+/** 按名字找预置；找不到（含"自定义"）返回 undefined */
+export function findEqPresetOrUndefined(name: string): EqPreset | undefined {
+  for (let i = 0; i < EQUALIZER_PRESETS.length; i++) {
+    if (EQUALIZER_PRESETS[i].name === name) {
+      return EQUALIZER_PRESETS[i];
+    }
+  }
+  return undefined;
+}
+
+/** 落盘的数据结构（字段全部是原始类型，便于校验） */export interface SettingsData {
   /** 解码方式偏好，见 DecodePreference */
   decodePreference: number;
   /** 系统解码失败/无画面时是否自动回退软解 */
@@ -66,6 +117,36 @@ export interface SettingsData {
   subtitleFontSize: number;
   /** 字幕是否加半透明底衬 */
   subtitleBackground: boolean;
+
+  /* ---- 色调（画面）与均衡器（声音）—— 2026-10-04 新增 ---- */
+
+  /** 亮度，-100 ~ +100（%），0 = 不改 */
+  colorBrightness: number;
+  /** 对比度 */
+  colorContrast: number;
+  /** 饱和度 */
+  colorSaturation: number;
+  /** 色彩度（色相旋转，±100% = ±180°） */
+  colorHue: number;
+  /** 红色通道增益 */
+  colorRGain: number;
+  /** 绿色通道增益 */
+  colorGGain: number;
+  /** 蓝色通道增益 */
+  colorBGain: number;
+  /** 均衡器总开关 */
+  eqEnabled: boolean;
+  /** 均衡器预置名（找不到时按"默认"处理），见 EQUALIZER_PRESETS */
+  eqPreset: string;
+  /**
+   * 均衡器 10 段手动增益（dB，-12 ~ +12）
+   *
+   * ★ 2026-10-04 新增：用户可以在面板里逐段手调。
+   *   它不是"从 eqPreset 推出来的" —— 两者都存：
+   *   预置名只用于在列表里显示"当前选的是哪一条"，
+   *   真正生效的永远是这 10 个数（手调之后预置名会变成"自定义"）。
+   */
+  eqBands: number[];
 }
 
 /** 默认值（首次使用、字段缺失、类型不对时都用它） */
@@ -79,7 +160,17 @@ export function defaultSettings(): SettingsData {
     preferExternalSubtitle: true,
     autoLoadSidecar: false,
     subtitleFontSize: SubtitleFontSize.NORMAL,
-    subtitleBackground: true
+    subtitleBackground: true,
+    colorBrightness: 0,
+    colorContrast: 0,
+    colorSaturation: 0,
+    colorHue: 0,
+    colorRGain: 0,
+    colorGGain: 0,
+    colorBGain: 0,
+    eqEnabled: false,
+    eqPreset: '默认',
+    eqBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   };
 }
 
@@ -102,6 +193,16 @@ export interface SettingsPatch {
   autoLoadSidecar?: boolean;
   subtitleFontSize?: number;
   subtitleBackground?: boolean;
+  colorBrightness?: number;
+  colorContrast?: number;
+  colorSaturation?: number;
+  colorHue?: number;
+  colorRGain?: number;
+  colorGGain?: number;
+  colorBGain?: number;
+  eqEnabled?: boolean;
+  eqPreset?: string;
+  eqBands?: number[];
 }
 
 /**
@@ -221,7 +322,18 @@ export class AppSettings {
       preferExternalSubtitle: pickBool(patch.preferExternalSubtitle, cur.preferExternalSubtitle),
       autoLoadSidecar: pickBool(patch.autoLoadSidecar, cur.autoLoadSidecar),
       subtitleFontSize: pickNumber(patch.subtitleFontSize, cur.subtitleFontSize, 0, 2),
-      subtitleBackground: pickBool(patch.subtitleBackground, cur.subtitleBackground)
+      subtitleBackground: pickBool(patch.subtitleBackground, cur.subtitleBackground),
+      // 色调：范围都是 ±100%，越界值直接夹回（UI 的滑块步长是 1%）
+      colorBrightness: pickNumber(patch.colorBrightness, cur.colorBrightness, -100, 100),
+      colorContrast: pickNumber(patch.colorContrast, cur.colorContrast, -100, 100),
+      colorSaturation: pickNumber(patch.colorSaturation, cur.colorSaturation, -100, 100),
+      colorHue: pickNumber(patch.colorHue, cur.colorHue, -100, 100),
+      colorRGain: pickNumber(patch.colorRGain, cur.colorRGain, -100, 100),
+      colorGGain: pickNumber(patch.colorGGain, cur.colorGGain, -100, 100),
+      colorBGain: pickNumber(patch.colorBGain, cur.colorBGain, -100, 100),
+      eqEnabled: pickBool(patch.eqEnabled, cur.eqEnabled),
+      eqPreset: pickString(patch.eqPreset, cur.eqPreset),
+      eqBands: pickNumberArray(patch.eqBands, cur.eqBands, 10, -12, 12)
     };
     this.cache = next;
     this.persist(next);
@@ -242,6 +354,20 @@ export class AppSettings {
       return def;
     }
     const r = raw[0] as SettingsData;
+    // ★ 均衡器：预置名与 10 段曲线的一致性校正（2026-10-04）★
+    //
+    //   背景：eqBands 是后加的字段，旧设置文件里没有它，于是会出现
+    //   "面板写着『当前：舞曲』、曲线却是平的"这种自相矛盾。
+    //   规则：名字是**已知预置**时，曲线一律以预置表为准（自愈）；
+    //         名字是"自定义"时，曲线以文件里的为准。
+    //   为什么这样不会丢用户的手调结果：手调代码会把名字置成"自定义"，
+    //   所以"名字=已知预置"就意味着用户没有手调过，用预置表覆盖是安全的。
+    const loadedPreset: string = pickString(r.eqPreset, def.eqPreset);
+    let loadedBands: number[] = pickNumberArray(r.eqBands, def.eqBands, 10, -12, 12);
+    const known = findEqPresetOrUndefined(loadedPreset);
+    if (known !== undefined) {
+      loadedBands = known.gains.slice();
+    }
     // 逐字段校验：文件可能来自旧版本（缺字段）或被人手改过（类型不对）。
     // 任何一个字段不对就单独回落到默认值，而不是整份设置作废。
     return {
@@ -253,7 +379,17 @@ export class AppSettings {
       preferExternalSubtitle: pickBool(r.preferExternalSubtitle, def.preferExternalSubtitle),
       autoLoadSidecar: pickBool(r.autoLoadSidecar, def.autoLoadSidecar),
       subtitleFontSize: pickNumber(r.subtitleFontSize, def.subtitleFontSize, 0, 2),
-      subtitleBackground: pickBool(r.subtitleBackground, def.subtitleBackground)
+      subtitleBackground: pickBool(r.subtitleBackground, def.subtitleBackground),
+      colorBrightness: pickNumber(r.colorBrightness, def.colorBrightness, -100, 100),
+      colorContrast: pickNumber(r.colorContrast, def.colorContrast, -100, 100),
+      colorSaturation: pickNumber(r.colorSaturation, def.colorSaturation, -100, 100),
+      colorHue: pickNumber(r.colorHue, def.colorHue, -100, 100),
+      colorRGain: pickNumber(r.colorRGain, def.colorRGain, -100, 100),
+      colorGGain: pickNumber(r.colorGGain, def.colorGGain, -100, 100),
+      colorBGain: pickNumber(r.colorBGain, def.colorBGain, -100, 100),
+      eqEnabled: pickBool(r.eqEnabled, def.eqEnabled),
+      eqPreset: loadedPreset,
+      eqBands: loadedBands
     };
   }
 
@@ -286,6 +422,37 @@ function pickBool(v: boolean | undefined, fallback: boolean): boolean {
     return fallback;
   }
   return v;
+}
+
+/** 取字符串：类型不对或用空串时用兜底值（均衡器预置名用） */
+function pickString(v: string | undefined, fallback: string): string {
+  if (v === undefined || typeof v !== 'string' || v.length === 0) {
+    return fallback;
+  }
+  return v;
+}
+
+/**
+ * 取定长数字数组（均衡器各段增益用）
+ *
+ * 校验规则：必须正好 len 个、每个都是有限数且落在 [lo, hi] 内。
+ * 任何一项不合格就整条回落到兜底值 —— 增益曲线是"成组"使用的，
+ * 半条曲线（例如前 5 段对了后 5 段丢了）比整条用默认更糟。
+ */
+function pickNumberArray(v: number[] | undefined, fallback: number[],
+                         len: number, lo: number, hi: number): number[] {
+  if (v === undefined || !Array.isArray(v) || v.length !== len) {
+    return fallback;
+  }
+  const out: number[] = [];
+  for (let i = 0; i < len; i++) {
+    const n: number = v[i];
+    if (typeof n !== 'number' || !Number.isFinite(n) || n < lo || n > hi) {
+      return fallback;
+    }
+    out.push(Math.round(n));
+  }
+  return out;
 }
 
 /**

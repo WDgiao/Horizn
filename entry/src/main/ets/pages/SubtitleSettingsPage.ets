@@ -28,7 +28,18 @@ struct SubtitleSettingsPage {
     preferExternalSubtitle: true,
     autoLoadSidecar: false,
     subtitleFontSize: SubtitleFontSize.NORMAL,
-    subtitleBackground: true
+    subtitleBackground: true,
+    // 色调 / 均衡器在播放页的抽屉里调，这里只是把字段补全（ArkTS 要求字面量覆盖全部属性）
+    colorBrightness: 0,
+    colorContrast: 0,
+    colorSaturation: 0,
+    colorHue: 0,
+    colorRGain: 0,
+    colorGGain: 0,
+    colorBGain: 0,
+    eqEnabled: false,
+    eqPreset: '默认',
+    eqBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
   };
 
   private store: AppSettings | undefined = undefined;

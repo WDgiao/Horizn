@@ -223,6 +223,38 @@ export class SoftPlayerController {
   }
 
   /**
+   * 色调调整（2026-10-04 新增）
+   *
+   * 七个百分比参数见 index.d.ts 的说明。异常只记诊断、不打断播放 ——
+   * 调色是"锦上添花"，不能因为它让正在播的视频停下来。
+   */
+  setColorAdjust(brightness: number, contrast: number, saturation: number,
+                 hue: number, rGain: number, gGain: number, bGain: number): void {
+    const p: SoftPlayer | undefined = this.player;
+    if (p === undefined || this.released) {
+      return;
+    }
+    try {
+      p.setColorAdjust(brightness, contrast, saturation, hue, rGain, gGain, bGain);
+    } catch (err) {
+      this.fail('setColorAdjust 异常：' + JSON.stringify(err));
+    }
+  }
+
+  /** 均衡器（10 段 dB） */
+  setAudioEq(enabled: boolean, gainsDb: number[]): void {
+    const p: SoftPlayer | undefined = this.player;
+    if (p === undefined || this.released) {
+      return;
+    }
+    try {
+      p.setAudioEq(enabled, gainsDb);
+    } catch (err) {
+      this.fail('setAudioEq 异常：' + JSON.stringify(err));
+    }
+  }
+
+  /**
    * 解绑渲染 surface（页面销毁前必须调用，且要在 release 之前）
    *
    * 为什么不能只靠 release：

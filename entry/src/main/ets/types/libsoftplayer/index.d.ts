@@ -132,6 +132,27 @@ export class SoftPlayer {
   /** 文件里是否有多条可切换音轨 */
   canSwitchAudioTrack(): boolean;
 
+  /**
+   * 色调调整（2026-10-04 新增）
+   *
+   * 七个参数都是百分比（-100 ~ +100，0 = 不改）：
+   * 亮度、对比度、饱和度、色彩度（±100% = ±180°色相旋转）、R/G/B 通道增益。
+   * 立即生效；全部传 0 等于关闭调整（画面走零开销的快路）。
+   * 只对软解通道有效：系统 AVPlayer 的画面由系统渲染，拿不到像素。
+   */
+  setColorAdjust(brightness: number, contrast: number, saturation: number,
+                 hue: number, rGain: number, gGain: number, bGain: number): void;
+
+  /**
+   * 均衡器（2026-10-04 新增）
+   *
+   * @param enabled 总开关（false 时零开销）
+   * @param gainsDb 10 段增益（dB，-12 ~ +12），
+   *                频点 60/170/310/600/1k/3k/6k/12k/14k/16kHz
+   * 只对软解通道有效：AVPlayer 的音频由系统输出，插不进滤波器。
+   */
+  setAudioEq(enabled: boolean, gainsDb: number[]): void;
+
   pollEvents(): SoftPlayerEvent[];
 }
 

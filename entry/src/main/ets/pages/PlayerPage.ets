@@ -14,8 +14,9 @@ import { DiagLog } from '../model/DiagLog';
 import { SoftPlayerController, SoftPlayerSnapshot } from '../model/SoftPlayerController';
 import { SoftPlayerState, SoftAudioTrack, SoftSubtitleTrack } from '../model/SoftPlayerTypes';
 import {
-  appSettings, AppSettings, SettingsData, defaultSettings, DecodePreference, SubtitleLanguage,
-  subtitleFontPx, trackMatchesLanguage
+  appSettings, AppSettings, SettingsData, SettingsPatch, defaultSettings, DecodePreference,
+  SubtitleLanguage, subtitleFontPx, trackMatchesLanguage,
+  EqPreset, EQUALIZER_PRESETS, EQ_CUSTOM_NAME, findEqPresetOrUndefined
 } from '../model/AppSettings';
 import {
   ExternalSubtitle, SubtitleCandidate, current as externalSubtitle,
@@ -109,6 +110,84 @@ function channelLabel(ch: number): string {
  * 5 秒是主流播放器的量级，也足够"看一眼进度"。
  */
 const CONTROLS_AUTO_HIDE_MS: number = 5000;
+
+/**
+ * 发起 seek 之后，"忽略旧位置回写"的时长（毫秒）
+ *
+ * 取值理由：软解通道的 seek 要等解码器重新对齐参考链（关键帧间隔最大
+ * 约 4.5 秒），实测一次拖动后 1~2 秒内就能出画面；给 3 秒足够覆盖，
+ * 又不会在 seek 真的失败时把界面"骗"太久。
+ * 它只影响显示，不影响播放：超时后一切照旧跟随引擎上报的真实位置。
+ */
+const SEEK_SETTLE_MS: number = 3000;
+
+/**
+ * 均衡器预置表已移到 AppSettings.ets（设置模块）：
+ * 那里的加载逻辑要用它做"预置名 ↔ 曲线"的一致性校正，
+ * 表放在页面里会让依赖方向反过来（设置模块 import 页面）。
+ * 这里只保留频点标签，用于手动调节那一排竖滑块下面的刻度。
+ */
+const EQ_FREQ_LABELS: string[] = ['60', '170', '310', '600', '1k', '3k', '6k', '12k', '14k', '16k'];
+
+/**
+ * 「色调」面板的七行参数名，顺序与 colorValue() / setColorValueLocal() 的下标一致
+ *
+ * 前四项对应参考图里的功能（亮度/对比度/饱和度/色彩度），
+ * 后三项是用户要求的"调整视频的 RGB 颜色"（三个通道各自的增益）。
+ */
+const COLOR_ROW_LABELS: string[] = ['亮度', '对比度', '饱和度', '色彩度', '红色', '绿色', '蓝色'];
+
+/**
+ * 色调预设（2026-10-04 新增，放在色调面板最下方）
+ *
+ * 每一项就是七个参数的成套取值（百分比，含义同滑块）。
+ * 设计取向：
+ *   · 明亮/柔和/鲜艳  —— 观感类，日常最常用；
+ *   · 冷色/暖色       —— 用 R/B 通道增益做色温偏移（比色相旋转更"像白平衡"）；
+ *   · 电影/怀旧/黑白  —— 风格类，对应压对比、褪色、除色这些常见调色手法。
+ * 选预设后滑块会跟着动（面板里的数值始终等于实际生效值）。
+ */
+interface ColorPreset {
+  name: string;
+  bri: number;
+  con: number;
+  sat: number;
+  hue: number;
+  r: number;
+  g: number;
+  b: number;
+}
+
+const COLOR_PRESETS: ColorPreset[] = [
+  { name: '原色', bri: 0, con: 0, sat: 0, hue: 0, r: 0, g: 0, b: 0 },
+  { name: '明亮', bri: 18, con: 12, sat: 8, hue: 0, r: 0, g: 0, b: 0 },
+  { name: '柔和', bri: 6, con: -14, sat: -10, hue: 0, r: 4, g: 2, b: 0 },
+  { name: '鲜艳', bri: 4, con: 14, sat: 30, hue: 0, r: 0, g: 0, b: 0 },
+  { name: '冷色', bri: 4, con: 4, sat: 0, hue: -6, r: -10, g: 0, b: 12 },
+  { name: '暖色', bri: 6, con: 4, sat: 6, hue: 6, r: 14, g: 4, b: -12 },
+  { name: '电影', bri: -6, con: 20, sat: -6, hue: 8, r: -6, g: 2, b: 8 },
+  { name: '怀旧', bri: 8, con: -20, sat: -38, hue: 10, r: 12, g: 6, b: -12 },
+  { name: '黑白', bri: 4, con: 16, sat: -100, hue: 0, r: 0, g: 0, b: 0 }
+];
+
+/** 带符号的百分比文本：+12% / -3% / 0% */
+function formatSignedPercent(v: number): string {
+  if (v > 0) {
+    return '+' + v.toString() + '%';
+  }
+  return v.toString() + '%';
+}
+
+/** 按名字找预置；找不到时返回"默认"（设置文件被手改过也不能让面板空掉） */
+function findEqPreset(name: string): EqPreset {
+  for (let i = 0; i < EQUALIZER_PRESETS.length; i++) {
+    if (EQUALIZER_PRESETS[i].name === name) {
+      return EQUALIZER_PRESETS[i];
+    }
+  }
+  return EQUALIZER_PRESETS[0];
+}
+
 @Entry
 @Component
 struct PlayerPage {
@@ -190,6 +269,73 @@ struct PlayerPage {
 
   /** 用户是否正在拖动进度条 */
   private dragging: boolean = false;
+
+  /**
+   * 上一次看到的软解状态机状态（-1 = 还没看到过）
+   *
+   * ★ 2026-10-04 新增，修的是一个"把 1 秒节流废掉"的缺陷 ★
+   *
+   *   onSoftUpdate 是**每 100ms** 调一次的快照回调，而 PLAYING 分支里原来写着
+   *     this.lastSavedAt = Date.now();
+   *     this.persistProgress(...);
+   *   于是每次快照都把节流时间戳刷新一遍，下面那段
+   *     "now - lastSavedAt > 1000 才落盘" 永远不成立，
+   *   实际变成**每 100ms 写一次观看记录**（真机 diag.log 实锤：
+   *   "persist OK pos=… total=20" 连成一片，一秒十条）。
+   *   代价是 UI 线程每秒做 10 次 JSON 序列化 + 文件写入 ——
+   *   拖动进度条时会明显发涩、丢帧。
+   *   现在只在"状态**变化**到 PLAYING"的那一刻落一次盘，周期性落盘仍交给
+   *   下面的 1 秒节流。
+   */
+  private lastSoftState: number = -1;
+
+  /**
+   * 刚发起的 seek：时刻（Date.now()）与目标位置（毫秒）
+   *
+   * ★ 2026-10-04 新增，专治用户反馈的「拖动后弹回去继续播放」★
+   *
+   *   时间轴是这样的：用户松手 → 上层把位置设成目标值 → 引擎开始 seek。
+   *   而 seek 真正生效前，引擎仍会按 100ms 的节奏上报**旧位置**的进度，
+   *   上层的"位置回写"就会把滑块又拉回旧位置 —— 视觉上就是"弹回去"，
+   *   用户以为没生效，其实 seek 正在执行。
+   *
+   *   所以发起 seek 之后的一小段时间里，凡是与目标差得较远的快照位置
+   *   一律忽略（滑块停在用户放下的地方），等引擎真的跳到目标附近再交还控制权。
+   *   这是纯 UI 侧的兜底：它不假设引擎多久能完成，只保证"用户看到的
+   *   位置不会在他刚拖完之后自己弹回去"。
+   */
+  private seekIssuedAt: number = 0;
+  private seekIssuedTo: number = -1;
+
+  /* ==================== 色调 / 均衡器状态（2026-10-04 新增） ==================== */
+
+  /** 是否显示「色调」面板 */
+  @State showColorPanel: boolean = false;
+  /** 是否显示「均衡器」面板 */
+  @State showEqPanel: boolean = false;
+
+  // 色调七项（百分比 -100~100）。做成 @State 是为了让滑块/数值实时刷新。
+  @State colBrightness: number = 0;
+  @State colContrast: number = 0;
+  @State colSaturation: number = 0;
+  @State colHue: number = 0;
+  @State colRGain: number = 0;
+  @State colGGain: number = 0;
+  @State colBGain: number = 0;
+
+  /** 均衡器总开关与当前预置名 */
+  @State eqEnabled: boolean = false;
+  @State eqPresetName: string = '默认';
+
+  /**
+   * 均衡器 10 段手动增益（dB）
+   *
+   * ★ 必须整体替换数组才会触发重绘 ★
+   *   ArkUI 的 @State 对数组是"引用比较"：`this.eqBands[i] = v` 改了内容但引用没变，
+   *   界面不会刷新（滑块拖了不走、柱状图不动）。所以 setEqBand 里一律
+   *   slice() 出一份新数组再赋值 —— 这是 ArkUI 状态管理的经典坑。
+   */
+  @State eqBands: number[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
   /**
    * 控制层最近一次"被唤出/被操作"的时刻（Date.now()，毫秒）
@@ -382,6 +528,22 @@ struct PlayerPage {
       this.history = new WatchHistory(appCtx);
       // 应用设置（播放/字幕）也用同一个上下文创建；单例，别的页面改过就立刻可见
       this.settings = appSettings(appCtx);
+      // ★ 2026-10-04：把上次的色调 / 均衡器状态读进 @State ——
+      //   面板打开时显示的就是"当前实际生效"的值，不会出现
+      //   "界面显示 0%、实际画面偏蓝"这种对不上的情况。
+      const st: SettingsData = this.settings.get();
+      this.colBrightness = st.colorBrightness;
+      this.colContrast = st.colorContrast;
+      this.colSaturation = st.colorSaturation;
+      this.colHue = st.colorHue;
+      this.colRGain = st.colorRGain;
+      this.colGGain = st.colorGGain;
+      this.colBGain = st.colorBGain;
+      this.eqEnabled = st.eqEnabled;
+      this.eqPresetName = st.eqPreset;
+      // 手调的 10 段曲线也要读回来：它是真正生效的曲线，
+      // 少了这一句就会出现"界面显示默认、耳朵听到超重低音"的不一致
+      this.eqBands = st.eqBands.slice();
       this.diag.log('Player', 'aboutToAppear path=' + this.videoPath
         + ' startMs=' + this.startPositionMs.toString());
     } catch (err) {
@@ -1249,8 +1411,8 @@ struct PlayerPage {
         this.videoAspect = aspect;
       }
     }
-    // 播放位置（拖动时不要被回写覆盖）
-    if (!this.dragging) {
+    // 播放位置（拖动时不要被回写覆盖；刚 seek 完的旧位置也不要）
+    if (!this.dragging && !this.isStalePositionAfterSeek(snap.positionMs)) {
       this.positionMs = snap.positionMs;
     }
     // ★ 2026-10-03：位置更新统一走 notePosition —— 它负责
@@ -1315,6 +1477,17 @@ struct PlayerPage {
       this.readyHandled = true;
       // 按字幕设置挑内嵌字幕轨（内部还有一次自己的闸门，双保险）
       this.applySubtitlePreference(snap.subtitleTracks, snap.currentSubtitleIndex);
+      // ★ 2026-10-04：软解通道就绪时把色调 / 均衡器推给引擎 ★
+      //   放在这里而不是 Prepare 之前：引擎要等会话建立后这些设置才有意义；
+      //   而 READY 恰好只跑一次（上面的 readyHandled 闸门），推一次就够。
+      //   这样"上次调过的画面/声音"在新文件里自动延续，用户不必每次重调。
+      this.applyColorAdjust();
+      this.applyAudioEq();
+      this.writeDiag('色调/均衡已应用：' + this.colBrightness.toString() + '/'
+        + this.colContrast.toString() + '/' + this.colSaturation.toString() + '/'
+        + this.colHue.toString() + '/' + this.colRGain.toString() + '/'
+        + this.colGGain.toString() + '/' + this.colBGain.toString()
+        + ' eq=' + this.eqEnabled.toString() + '(' + this.eqPresetName + ')');
       // 就绪即播：续播起点用 seekTo 处理（软解在 READY 态接受 seek）
       //
       // 诊断：这里必须记下"决定要不要 seek"的三个输入。
@@ -1337,7 +1510,9 @@ struct PlayerPage {
       this.playing = true;
       this.preparing = false;
       this.errorMsg = '';
-      if (this.durationMs > 0) {
+      // ★ 只在"刚进入 PLAYING"那一刻落一次盘（见 lastSoftState 的说明）：
+      //   这个分支每 100ms 都会跑到，无脑落盘会把 1 秒节流刷没。
+      if (this.durationMs > 0 && st !== this.lastSoftState) {
         this.lastSavedAt = Date.now();
         this.persistProgress(this.positionMs, this.durationMs);
       }
@@ -1351,6 +1526,9 @@ struct PlayerPage {
     } else if (st === SoftPlayerState.ERROR_STATE) {
       this.preparing = false;
     }
+
+    // ★ 记下本帧看到的状态，供"是否刚进入 PLAYING"判断（见 lastSoftState）
+    this.lastSoftState = st;
 
     // 软解进度同样要按 1 秒间隔落盘（与 AVPlayer 通道保持一致）
     const now: number = Date.now();
@@ -1453,7 +1631,8 @@ struct PlayerPage {
 
     // 播放进度，用于刷新进度条与时间文本
     p.on('timeUpdate', (time: number) => {
-      if (!this.dragging) {
+      // 拖动中不回写；刚发起 seek、引擎还在旧位置上时也不回写（否则滑块会弹回去）
+      if (!this.dragging && !this.isStalePositionAfterSeek(time)) {
         this.positionMs = time;
       }
       // ★ 2026-10-03：系统通道也走统一的位置入口 —— 它的"首帧已上屏"信号
@@ -1801,7 +1980,8 @@ struct PlayerPage {
     if (!this.showControls) {
       return;
     }
-    if (this.dragging || this.showTrackPanel) {
+    // 拖动进度条、或任意抽屉开着时都不自动隐藏控制层
+    if (this.dragging || this.anyPanelOpen()) {
       this.controlsActiveAt = Date.now();
       return;
     }
@@ -1864,6 +2044,16 @@ struct PlayerPage {
     }
     // 跳转之后控制层再多留一会儿，方便连续调
     this.noteControlsActivity();
+    // 记下"刚发起 seek"，让位置回写在这段时间里不要弹回旧位置
+    // （说明见 seekIssuedAt / isStalePositionAfterSeek）
+    this.seekIssuedAt = Date.now();
+    this.seekIssuedTo = ms;
+    // ★ 诊断留痕（2026-10-04）：用户反馈"拖进度条没反应"时，必须能区分
+    //   ①上层根本没把 seek 发出去（手势没到 / durationMs 还是 0）
+    //   ②发出去了但引擎没执行（这边日志有、引擎那边没动）
+    //   每个 seek 只打一条，不会刷屏（拖动也只会在松手时走这里一次）。
+    this.writeDiag('seek 请求 ms=' + ms.toString() + ' 通道='
+      + (this.usingSoft ? 'soft' : 'avplayer') + ' dur=' + this.durationMs.toString());
     if (this.usingSoft) {
       this.softCtl?.seekTo(ms);
       this.positionMs = ms;
@@ -1873,6 +2063,259 @@ struct PlayerPage {
       this.player.seek(ms, media.SeekMode.SEEK_CLOSEST);
       this.positionMs = ms;
     }
+  }
+
+  /* ==================== 色调 / 均衡器：状态与应用 ==================== */
+
+  /** 取第 i 项色调参数（0 亮度 1 对比度 2 饱和度 3 色彩度 4 红 5 绿 6 蓝） */
+  private colorValue(i: number): number {
+    if (i === 0) { return this.colBrightness; }
+    if (i === 1) { return this.colContrast; }
+    if (i === 2) { return this.colSaturation; }
+    if (i === 3) { return this.colHue; }
+    if (i === 4) { return this.colRGain; }
+    if (i === 5) { return this.colGGain; }
+    return this.colBGain;
+  }
+
+  /** 写入第 i 项色调参数（只改内存，不落盘） */
+  private setColorValueLocal(i: number, v: number): void {
+    const c: number = v < -100 ? -100 : (v > 100 ? 100 : v);
+    if (i === 0) { this.colBrightness = c; }
+    else if (i === 1) { this.colContrast = c; }
+    else if (i === 2) { this.colSaturation = c; }
+    else if (i === 3) { this.colHue = c; }
+    else if (i === 4) { this.colRGain = c; }
+    else if (i === 5) { this.colGGain = c; }
+    else { this.colBGain = c; }
+  }
+
+  /** 是否有任何一项色调不为 0（按钮亮暗与"重置"是否可用都看它） */
+  private colorAdjusted(): boolean {
+    return this.colBrightness !== 0 || this.colContrast !== 0 || this.colSaturation !== 0
+      || this.colHue !== 0 || this.colRGain !== 0 || this.colGGain !== 0 || this.colBGain !== 0;
+  }
+
+  /**
+   * 把当前七项色调推给引擎（软解通道）
+   *
+   * 只有软解通道能改画面：AVPlayer 的画面由系统渲染，播放器拿不到像素，
+   * 所以那条路上这里会静默无效 —— 打开面板时会给出明确提示（见 toggleColorPanel）。
+   */
+  private applyColorAdjust(): void {
+    this.softCtl?.setColorAdjust(this.colBrightness, this.colContrast, this.colSaturation,
+      this.colHue, this.colRGain, this.colGGain, this.colBGain);
+  }
+
+  /** 拖动中的实时应用（不落盘）+ 松手时落盘 */
+  private onColorChanged(i: number, v: number, persist: boolean): void {
+    this.setColorValueLocal(i, Math.round(v));
+    this.applyColorAdjust();
+    if (persist) {
+      this.persistColorSettings();
+      this.writeDiag('色调 ms=' + this.colBrightness.toString() + '/' + this.colContrast.toString()
+        + '/' + this.colSaturation.toString() + '/' + this.colHue.toString()
+        + '/' + this.colRGain.toString() + '/' + this.colGGain.toString()
+        + '/' + this.colBGain.toString());
+    }
+  }
+
+  /** 七项色调写进设置文件（下次打开自动生效） */
+  private persistColorSettings(): void {
+    const s: AppSettings | undefined = this.settings;
+    if (s === undefined) {
+      return;
+    }
+    s.update({
+      colorBrightness: this.colBrightness,
+      colorContrast: this.colContrast,
+      colorSaturation: this.colSaturation,
+      colorHue: this.colHue,
+      colorRGain: this.colRGain,
+      colorGGain: this.colGGain,
+      colorBGain: this.colBGain
+    } as SettingsPatch);
+  }
+
+  /** 七项全部归零 */
+  private resetColorAdjust(): void {
+    this.colBrightness = 0;
+    this.colContrast = 0;
+    this.colSaturation = 0;
+    this.colHue = 0;
+    this.colRGain = 0;
+    this.colGGain = 0;
+    this.colBGain = 0;
+    this.applyColorAdjust();
+    this.persistColorSettings();
+    this.writeDiag('色调已重置');
+  }
+
+  /** 当前生效的 10 段增益（就是手调数组；预置选中时它已被写成预置的曲线） */
+  private eqGains(): number[] {
+    return this.eqBands;
+  }
+
+  /**
+   * 手动调某一频段
+   *
+   * 一旦手调，预置名立刻变成"自定义" —— 因为这条曲线已经不等于任何预置了，
+   * 名字还挂着"超重低音"会让用户以为选错了。
+   * 落盘只在松手时做（拖动过程每帧写文件会把 UI 线程写满）。
+   */
+  private setEqBand(i: number, db: number, persist: boolean): void {
+    // ★ 必须换一份新数组：@State 对数组是引用比较，原地改不会触发重绘
+    const next: number[] = this.eqBands.slice();
+    next[i] = Math.round(db);
+    this.eqBands = next;
+    this.eqPresetName = EQ_CUSTOM_NAME;
+    // 手调等于"我要用它"，顺手把开关打开
+    this.eqEnabled = true;
+    this.applyAudioEq();
+    if (persist) {
+      const s: AppSettings | undefined = this.settings;
+      if (s !== undefined) {
+        s.update({
+          eqEnabled: this.eqEnabled,
+          eqPreset: this.eqPresetName,
+          eqBands: this.eqBands
+        } as SettingsPatch);
+      }
+      this.writeDiag('均衡器手调 第' + i.toString() + '段=' + db.toString() + 'dB 曲线='
+        + this.eqBands.join(','));
+    }
+  }
+
+  /**
+   * 应用一个色调预设（面板最下方那一排）
+   *
+   * 直接写七项 @State，滑块会跟着动 —— 用户能立刻看到"这个预设到底改了什么"。
+   */
+  private chooseColorPreset(p: ColorPreset): void {
+    this.colBrightness = p.bri;
+    this.colContrast = p.con;
+    this.colSaturation = p.sat;
+    this.colHue = p.hue;
+    this.colRGain = p.r;
+    this.colGGain = p.g;
+    this.colBGain = p.b;
+    this.applyColorAdjust();
+    this.persistColorSettings();
+    this.writeDiag('色调预设=' + p.name);
+  }
+
+  /** 当前是否正好等于某个预设（用于把那一项高亮） */
+  private colorPresetActive(p: ColorPreset): boolean {
+    return this.colBrightness === p.bri && this.colContrast === p.con
+      && this.colSaturation === p.sat && this.colHue === p.hue
+      && this.colRGain === p.r && this.colGGain === p.g && this.colBGain === p.b;
+  }
+
+  /** 把均衡器状态推给引擎 */
+  private applyAudioEq(): void {
+    // ★ 必须手工拷成**普通数组**再传 ★
+    //
+    //   2026-10-04 真机抓到的坑：eqBands 是 @State 数组，ArkTS 会给它套一层
+    //   观察者代理；把代理直接传到 NAPI 时 napi_is_array 返回 false，
+    //   原生侧于是按"全 0"处理 —— 界面显示 eq=true、曲线也对，
+    //   但引擎日志是「0 段非平坦 | 曲线=0,0,...,0」，声音完全没变。
+    //   （之前选预置能生效，是因为那条路径传的是 gains.slice() 出来的普通数组。）
+    //   这里逐项 push 出一个干净的 number[]，不依赖 slice 对代理的行为。
+    const plain: number[] = [];
+    for (let i = 0; i < 10; i++) {
+      plain.push(i < this.eqBands.length ? this.eqBands[i] : 0);
+    }
+    this.softCtl?.setAudioEq(this.eqEnabled, plain);
+  }
+
+  /** 选择预置：立即生效并落盘 */
+  private chooseEqPreset(name: string): void {
+    const p: EqPreset | undefined = findEqPresetOrUndefined(name);
+    if (p === undefined) {
+      return;
+    }
+    this.eqPresetName = name;
+    // 预置名 → 曲线：之后手调是以这条曲线为起点继续改
+    this.eqBands = p.gains.slice();
+    // 选预置天然意味着"我要用它"，顺手把总开关打开 ——
+    // 否则用户点了预置却听不出变化，会以为功能坏了
+    this.eqEnabled = true;
+    this.applyAudioEq();
+    const s: AppSettings | undefined = this.settings;
+    if (s !== undefined) {
+      s.update({
+        eqEnabled: this.eqEnabled,
+        eqPreset: this.eqPresetName,
+        eqBands: this.eqBands
+      } as SettingsPatch);
+    }
+    this.writeDiag('均衡器预置=' + name + ' 开启=' + this.eqEnabled.toString());
+  }
+
+  /** 开关均衡器 */
+  private setEqEnabled(on: boolean): void {
+    this.eqEnabled = on;
+    this.applyAudioEq();
+    const s: AppSettings | undefined = this.settings;
+    if (s !== undefined) {
+      s.update({ eqEnabled: on } as SettingsPatch);
+    }
+    this.writeDiag('均衡器开关=' + on.toString() + ' 预置=' + this.eqPresetName);
+  }
+
+  /**
+   * 打开「色调」面板
+   *
+   * 走系统解码的文件会明确告知"调色只在软解生效"：这类提示必须有 ——
+   * 用户拖了半天滑块画面没变化，最需要知道的就是"为什么"。
+   */
+  private toggleColorPanel(): void {
+    if (this.showColorPanel) {
+      this.closePanels();
+      return;
+    }
+    if (!this.usingSoft) {
+      this.trackNotice = '当前用系统解码播放，色调调整只在软解通道生效';
+    } else {
+      this.trackNotice = '';
+    }
+    this.openPanel(1);
+    this.noteControlsActivity();
+  }
+
+  /** 打开「均衡器」面板（同样只对软解有效） */
+  private toggleEqPanel(): void {
+    if (this.showEqPanel) {
+      this.closePanels();
+      return;
+    }
+    if (!this.usingSoft) {
+      this.trackNotice = '当前用系统解码播放，均衡器只在软解通道生效';
+    } else {
+      this.trackNotice = '';
+    }
+    this.openPanel(2);
+    this.noteControlsActivity();
+  }
+
+  /**
+   * 这次快照位置是不是"seek 还没生效时的旧值"
+   * 判据（两个条件同时成立才算旧值）：
+   *   ① 距上次发起 seek 还在 SEEK_SETTLE_MS 之内；
+   *   ② 快照位置与 seek 目标相差超过 3 秒 —— 引擎真的跳过去之后，
+   *      位置会在目标附近（关键帧最多落在目标前一个 GOP），不会再差 3 秒。
+   * 超时后自动放行，不依赖引擎回报任何"seek 完成"事件，
+   * 所以即使 seek 失败，界面也只是多停 3 秒就会继续跟随真实进度。
+   */
+  private isStalePositionAfterSeek(pos: number): boolean {
+    if (this.seekIssuedTo < 0) {
+      return false;
+    }
+    if (Date.now() - this.seekIssuedAt > SEEK_SETTLE_MS) {
+      this.seekIssuedTo = -1;   // 窗口结束，恢复正常的进度回写
+      return false;
+    }
+    return Math.abs(pos - this.seekIssuedTo) > 3000;
   }
 
   /** 返回上一页 */
@@ -1891,7 +2334,7 @@ struct PlayerPage {
    */
   private toggleTrackPanel(): void {
     if (this.showTrackPanel) {
-      this.showTrackPanel = false;
+      this.setTrackPanel(false);
       return;
     }
     const sc: SoftPlayerController | undefined = this.softCtl;
@@ -1911,9 +2354,79 @@ struct PlayerPage {
       this.refreshAvTracks();
     }
     this.trackNotice = '';
-    this.showTrackPanel = true;
+    this.setTrackPanel(true);
     // 打开面板时把控制层的倒计时推后：关掉面板后控制栏还在，用户不用再点一次
     this.noteControlsActivity();
+  }
+
+  /**
+   * 打开 / 关闭音轨字幕面板（带弹出动画）
+   *
+   * ★ 2026-10-04：面板改成"全屏时从屏幕右侧滑出"之后，显隐**必须走这里** ——
+   *   ArkUI 的 .transition() 只在显式动画（animateTo）里才会播放；
+   *   直接改 @State 是瞬间出现/消失，用户看到的是"啪一下蹦出来"，
+   *   完全没有"从右侧弹出"的感觉。
+   */
+  private setTrackPanel(open: boolean): void {
+    if (!open) {
+      this.closePanels();
+      return;
+    }
+    if (this.showTrackPanel) {
+      return;
+    }
+    this.openPanel(0);
+  }
+
+  /**
+   * 打开某一个右侧抽屉（0=音轨字幕 1=色调 2=均衡器），互斥
+   *
+   * 三个面板共用同一套"全屏从右侧滑出 / 竖屏从底部滑上"的容器
+   * （见 build() 里那段 if/else），所以切换时必须**互相排除**，
+   * 否则会出现两层遮罩叠在一起、点一下只关掉一层的怪现象。
+   */
+  private openPanel(which: number): void {
+    this.getUIContext().animateTo({ duration: 220, curve: Curve.Friction }, () => {
+      this.showTrackPanel = (which === 0);
+      this.showColorPanel = (which === 1);
+      this.showEqPanel = (which === 2);
+    });
+  }
+
+  /** 关闭所有抽屉（点遮罩、点 ✕、再点一次按钮都走这里） */
+  private closePanels(): void {
+    if (!this.showTrackPanel && !this.showColorPanel && !this.showEqPanel) {
+      return;
+    }
+    this.getUIContext().animateTo({ duration: 220, curve: Curve.Friction }, () => {
+      this.showTrackPanel = false;
+      this.showColorPanel = false;
+      this.showEqPanel = false;
+    });
+  }
+
+  /** 是否有任意抽屉开着（控制层自动隐藏要避开它） */
+  private anyPanelOpen(): boolean {
+    return this.showTrackPanel || this.showColorPanel || this.showEqPanel;
+  }
+
+  /**
+   * 面板内字号：全屏（横屏）时抽屉只占 1/3 屏宽，字号要跟着收一点
+   *
+   * 规则：按 0.85 缩放，但**下限 11vp** —— 实测 11vp 在 2832x1280 的横屏上
+   * 仍能看清并准确点中（列表项整行可点，不依赖精确命中），而再小就会出现
+   * "看不清是哪条轨道"的问题。竖屏（底部半屏面板）宽度充足，字号不动。
+   */
+  private panelFont(base: number): number {
+    if (!this.isLandscape) {
+      return base;
+    }
+    return Math.max(11, Math.round(base * 0.85));
+  }
+
+  /** 面板内边距：全屏时同步收紧（20→14、12→8），给窄抽屉腾出可用宽度 */
+  private panelPad(base: number): number {
+    return this.isLandscape ? Math.max(6, Math.round(base * 0.7)) : base;
   }
 
   /** 切换音轨 */
@@ -2340,65 +2853,71 @@ struct PlayerPage {
       // ---- 标题栏 ----
       Row() {
         Text('音轨与字幕')
-          .fontSize(16)
+          .fontSize(this.panelFont(16))
           .fontWeight(FontWeight.Medium)
           .fontColor(Color.White)
           .layoutWeight(1)
         Text('✕')
-          .fontSize(18)
+          .fontSize(this.panelFont(18))
           .fontColor('rgba(255,255,255,0.70)')
           .padding(8)
           .onClick(() => {
-            this.showTrackPanel = false;
+            this.setTrackPanel(false);
           })
       }
       .width('100%')
-      .padding({ left: 20, right: 12, top: 14, bottom: 10 })
+      .padding({
+        left: this.panelPad(20), right: this.panelPad(12),
+        top: this.panelPad(14), bottom: this.panelPad(10)
+      })
 
       // ---- 操作提示 ----
       if (this.trackNotice.length > 0) {
         Text(this.trackNotice)
-          .fontSize(12)
+          .fontSize(this.panelFont(12))
           .fontColor(Theme.ACCENT)
           .width('100%')
-          .padding({ left: 20, right: 20, bottom: 8 })
+          .padding({ left: this.panelPad(20), right: this.panelPad(20), bottom: this.panelPad(8) })
       }
 
       List({ space: 0 }) {
         // ============ 音轨 ============
         ListItem() {
           Text('音轨')
-            .fontSize(12)
+            .fontSize(this.panelFont(12))
             .fontColor('rgba(255,255,255,0.50)')
             .width('100%')
-            .padding({ left: 20, top: 6, bottom: 6 })
+            .padding({ left: this.panelPad(20), top: this.panelPad(6), bottom: this.panelPad(6) })
         }
 
         if (this.audioTracks.length === 0) {
           ListItem() {
             Text('当前文件没有可切换的音轨')
-              .fontSize(13)
+              .fontSize(this.panelFont(13))
               .fontColor('rgba(255,255,255,0.45)')
               .width('100%')
-              .padding({ left: 20, top: 10, bottom: 10 })
+              .padding({ left: this.panelPad(20), top: this.panelPad(10), bottom: this.panelPad(10) })
           }
         }
         ForEach(this.audioTracks, (t: SoftAudioTrack, i: number) => {
           ListItem() {
-            Row({ space: 10 }) {
+            Row({ space: this.panelPad(10) }) {
               Text(this.currentAudioIndex === t.index ? '●' : '○')
-                .fontSize(14)
+                .fontSize(this.panelFont(14))
                 .fontColor(this.currentAudioIndex === t.index
                   ? Theme.ACCENT : 'rgba(255,255,255,0.40)')
               Text(this.audioTrackLabel(t, i))
-                .fontSize(13)
+                .fontSize(this.panelFont(13))
                 .fontColor(Color.White)
                 .layoutWeight(1)
                 .maxLines(2)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
             .width('100%')
-            .padding({ left: 20, right: 20, top: 12, bottom: 12 })
+            .padding({
+              left: this.panelPad(20), right: this.panelPad(20),
+              top: this.panelPad(12), bottom: this.panelPad(12)
+            })
             .onClick(() => {
               this.chooseAudioTrack(t.index);
             })
@@ -2408,27 +2927,30 @@ struct PlayerPage {
         // ============ 字幕 ============
         ListItem() {
           Text('字幕')
-            .fontSize(12)
+            .fontSize(this.panelFont(12))
             .fontColor('rgba(255,255,255,0.50)')
             .width('100%')
-            .padding({ left: 20, top: 14, bottom: 6 })
+            .padding({ left: this.panelPad(20), top: this.panelPad(14), bottom: this.panelPad(6) })
         }
 
         // 「关闭字幕」永远在第一项：用户想关字幕时不该还要先找
         ListItem() {
-          Row({ space: 10 }) {
+          Row({ space: this.panelPad(10) }) {
             Text((this.currentSubtitleIndex < 0 && !this.usingExternalSubtitle)
               ? '●' : '○')
-              .fontSize(14)
+              .fontSize(this.panelFont(14))
               .fontColor((this.currentSubtitleIndex < 0 && !this.usingExternalSubtitle)
                 ? Theme.ACCENT : 'rgba(255,255,255,0.40)')
             Text('关闭字幕')
-              .fontSize(13)
+              .fontSize(this.panelFont(13))
               .fontColor(Color.White)
               .layoutWeight(1)
           }
           .width('100%')
-          .padding({ left: 20, right: 20, top: 12, bottom: 12 })
+          .padding({
+            left: this.panelPad(20), right: this.panelPad(20),
+            top: this.panelPad(12), bottom: this.panelPad(12)
+          })
           .onClick(() => {
             // 两条来源都要关：只关一个的话另一个会继续显示，
             // 用户点了"关闭字幕"却还有字，会以为功能坏了
@@ -2440,22 +2962,25 @@ struct PlayerPage {
         // 内嵌字幕轨
         ForEach(this.subtitleTracks, (t: SoftSubtitleTrack, i: number) => {
           ListItem() {
-            Row({ space: 10 }) {
+            Row({ space: this.panelPad(10) }) {
               Text((this.currentSubtitleIndex === t.index && !this.usingExternalSubtitle)
                 ? '●' : '○')
-                .fontSize(14)
+                .fontSize(this.panelFont(14))
                 .fontColor((this.currentSubtitleIndex === t.index
                   && !this.usingExternalSubtitle)
                   ? Theme.ACCENT : 'rgba(255,255,255,0.40)')
               Text('内嵌 · ' + this.subtitleTrackLabel(t, i))
-                .fontSize(13)
+                .fontSize(this.panelFont(13))
                 .fontColor(t.supported ? Color.White : 'rgba(255,255,255,0.42)')
                 .layoutWeight(1)
                 .maxLines(2)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
             .width('100%')
-            .padding({ left: 20, right: 20, top: 12, bottom: 12 })
+            .padding({
+              left: this.panelPad(20), right: this.panelPad(20),
+              top: this.panelPad(12), bottom: this.panelPad(12)
+            })
             .onClick(() => {
               if (!t.supported) {
                 // 明确告知而不是静默忽略：用户点了没反应最让人困惑
@@ -2470,22 +2995,25 @@ struct PlayerPage {
         // 同目录发现的外挂字幕
         ForEach(this.sidecarCandidates, (c: SubtitleCandidate) => {
           ListItem() {
-            Row({ space: 10 }) {
+            Row({ space: this.panelPad(10) }) {
               Text((this.usingExternalSubtitle && this.externalSubtitleName === c.name)
                 ? '●' : '○')
-                .fontSize(14)
+                .fontSize(this.panelFont(14))
                 .fontColor((this.usingExternalSubtitle
                   && this.externalSubtitleName === c.name)
                   ? Theme.ACCENT : 'rgba(255,255,255,0.40)')
               Text('外挂 · ' + c.name)
-                .fontSize(13)
+                .fontSize(this.panelFont(13))
                 .fontColor(Color.White)
                 .layoutWeight(1)
                 .maxLines(2)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
             }
             .width('100%')
-            .padding({ left: 20, right: 20, top: 12, bottom: 12 })
+            .padding({
+              left: this.panelPad(20), right: this.panelPad(20),
+              top: this.panelPad(12), bottom: this.panelPad(12)
+            })
             .onClick(() => {
               this.useSidecarSubtitle(c);
             })
@@ -2495,10 +3023,13 @@ struct PlayerPage {
         // 手动选外挂字幕文件
         ListItem() {
           Text('＋ 从文件选择外挂字幕…')
-            .fontSize(13)
+            .fontSize(this.panelFont(13))
             .fontColor(Theme.ACCENT)
             .width('100%')
-            .padding({ left: 20, right: 20, top: 14, bottom: 14 })
+            .padding({
+              left: this.panelPad(20), right: this.panelPad(20),
+              top: this.panelPad(14), bottom: this.panelPad(14)
+            })
             .onClick(() => {
               this.pickExternalSubtitle();
             })
@@ -2508,24 +3039,380 @@ struct PlayerPage {
         if (this.usingExternalSubtitle) {
           ListItem() {
             Text('关闭外挂字幕')
-              .fontSize(13)
+              .fontSize(this.panelFont(13))
               .fontColor('rgba(255,255,255,0.70)')
               .width('100%')
-              .padding({ left: 20, right: 20, top: 12, bottom: 20 })
+              .padding({
+                left: this.panelPad(20), right: this.panelPad(20),
+                top: this.panelPad(12), bottom: this.panelPad(20)
+              })
               .onClick(() => {
                 this.disableExternalSubtitle();
               })
           }
         }
       }
+      // ★ 全屏（右侧抽屉）：用 layoutWeight(1) 撑满抽屉剩余高度，内部滚动。
+      //   竖屏（底部面板）：layoutWeight(0)（默认）按内容高度，上限 420 ——
+      //   轨道少时不留大片空白，多时内部滚动。
+      //   注意不能在竖屏也用 layoutWeight(1)：竖屏面板是"包裹内容"的高度，
+      //   加权子节点在无固定高度父容器里会被压成 0，列表就整块消失了。
       .width('100%')
-      // 高度给上限：轨道多的时候内部滚动，少的时候也不会留一大片空白
-      .constraintSize({ maxHeight: 420 })
+      .layoutWeight(this.isLandscape ? 1 : 0)
+      .constraintSize({ maxHeight: this.isLandscape ? '100%' : 420 })
     }
-    .width('100%')
+    // ★ 全屏：贴右侧、占 33% 屏宽、满高，左侧两角圆角（右角是屏幕边缘，不用圆）
+    //   竖屏：原来的底部半屏面板（整宽 + 上方两角圆角）
+    .width(this.isLandscape ? '33%' : '100%')
+    // 全屏：满高抽屉；竖屏：'auto' 即按内容高度（不能写 undefined，
+    // ArkTS 的 Length 不接受 undefined，会直接编译失败）
+    .height(this.isLandscape ? '100%' : 'auto')
     .backgroundColor('#F21A1A1E')
-    .borderRadius({ topLeft: 18, topRight: 18 })
-    .padding({ bottom: 12 })
+    .borderRadius(this.isLandscape
+      ? { topLeft: 18, bottomLeft: 18 }
+      : { topLeft: 18, topRight: 18 })
+    .padding({ bottom: this.panelPad(12) })
+    // 弹出方向：全屏从右侧滑入（位移量 = 抽屉宽度 + 余量），竖屏从底部滑入
+    .transition(TransitionEffect.translate({
+      x: this.isLandscape ? (this.areaWidth / 3 + 24) : 0,
+      y: this.isLandscape ? 0 : 520
+    }).animation({ duration: 220, curve: Curve.Friction }))
+  }
+
+  /**
+   * 抽屉外壳（三个面板共用）
+   *
+   * 为什么抽出来：色调 / 均衡器 / 音轨字幕三个面板的**外壳完全相同**
+   * （宽度、圆角、背景、滑入方向），只有内容不同。ArkUI 的 @Builder
+   * 不能把"另一个 @Builder"当参数传，所以这里用三个独立的 if 分支
+   * 各自套同一套属性 —— 属性值全部来自 panelWidth() 等小函数，
+   * 三处保持一致（改尺寸只改那几个函数）。
+   */
+  private panelWidth(): string {
+    return this.isLandscape ? '33%' : '100%';
+  }
+
+  private panelHeight(): string {
+    return this.isLandscape ? '100%' : 'auto';
+  }
+
+  /** 「色调」面板：七项滑块 + 重置 */
+  @Builder
+  ColorPanel() {
+    Column({ space: 0 }) {
+      Row() {
+        Text('色调')
+          .fontSize(this.panelFont(16))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Color.White)
+          .layoutWeight(1)
+        Text('重置')
+          .fontSize(this.panelFont(13))
+          .fontColor(this.colorAdjusted() ? Theme.ACCENT : 'rgba(255,255,255,0.35)')
+          .padding(8)
+          .onClick(() => {
+            this.resetColorAdjust();
+          })
+        Text('✕')
+          .fontSize(this.panelFont(18))
+          .fontColor('rgba(255,255,255,0.70)')
+          .padding(8)
+          .onClick(() => {
+            this.closePanels();
+          })
+      }
+      .width('100%')
+      .padding({
+        left: this.panelPad(20), right: this.panelPad(12),
+        top: this.panelPad(14), bottom: this.panelPad(6)
+      })
+
+      if (this.trackNotice.length > 0) {
+        Text(this.trackNotice)
+          .fontSize(this.panelFont(12))
+          .fontColor(Theme.ACCENT)
+          .width('100%')
+          .padding({ left: this.panelPad(20), right: this.panelPad(20), bottom: this.panelPad(8) })
+      }
+
+      // 七项：亮度 / 对比度 / 饱和度 / 色彩度 / 红 / 绿 / 蓝
+      //
+      // 为什么用"滑块 + 百分比"而不是参考图里的「-1% / +1%」两行：
+      //   功能完全一样（步长就是 1%），但滑块可以一次拖到位 ——
+      //   参考图那套要连点几十次才能看出变化，在手机全屏下不好用。
+      //   数值实时显示成 ±N%，等价于参考图里的百分比读数。
+      List({ space: 0 }) {
+        ForEach(COLOR_ROW_LABELS, (label: string, i: number) => {
+          ListItem() {
+            Column({ space: 0 }) {
+              Row() {
+                Text(label)
+                  .fontSize(this.panelFont(13))
+                  .fontColor(Color.White)
+                  .layoutWeight(1)
+                Text(formatSignedPercent(this.colorValue(i)))
+                  .fontSize(this.panelFont(12))
+                  .fontColor(this.colorValue(i) === 0 ? 'rgba(255,255,255,0.45)' : Theme.ACCENT)
+              }
+              .width('100%')
+
+              Slider({
+                value: this.colorValue(i),
+                min: -100,
+                max: 100,
+                step: 1,
+                style: SliderStyle.OutSet
+              })
+                .width('100%')
+                .height(this.isLandscape ? 24 : 30)
+                .blockColor(Color.White)
+                .trackColor('rgba(255,255,255,0.25)')
+                .selectedColor(Theme.ACCENT)
+                .onChange((v: number, mode: SliderChangeMode) => {
+                  // 拖动中实时生效（不落盘），松手/点击才写设置文件 ——
+                  // 与进度条同一套约定：拖动过程每帧都落盘会把 UI 线程写满
+                  const settled: boolean = (mode === SliderChangeMode.End
+                    || mode === SliderChangeMode.Click);
+                  this.onColorChanged(i, v, settled);
+                })
+            }
+            .width('100%')
+            .padding({
+              left: this.panelPad(20), right: this.panelPad(20),
+              top: this.panelPad(8), bottom: this.panelPad(8)
+            })
+          }
+        }, (label: string) => 'c' + label)
+      }
+      .width('100%')
+      .layoutWeight(this.isLandscape ? 1 : 0)
+      .constraintSize({ maxHeight: this.isLandscape ? '100%' : 460 })
+
+      // ---- 预设（用户要求放在最下方）----
+      //
+      // 用 Flex 换行而不是横向滚动条：抽屉只有 1/3 屏宽，
+      // 换行排两行就能放下 9 个，而且所有预设一眼可见、点一下就到位，
+      // 比"要滑才看得到后面几个"更省事。
+      Text('预设')
+        .fontSize(this.panelFont(12))
+        .fontColor('rgba(255,255,255,0.50)')
+        .width('100%')
+        .padding({
+          left: this.panelPad(20), top: this.panelPad(10), bottom: this.panelPad(6)
+        })
+
+      Flex({ wrap: FlexWrap.Wrap }) {
+        ForEach(COLOR_PRESETS, (p: ColorPreset) => {
+          Text(p.name)
+            .fontSize(this.panelFont(12))
+            .fontColor(this.colorPresetActive(p) ? Theme.ACCENT : Color.White)
+            .padding({
+              left: this.panelPad(12), right: this.panelPad(12),
+              top: this.panelPad(6), bottom: this.panelPad(6)
+            })
+            .borderRadius(12)
+            .backgroundColor(this.colorPresetActive(p)
+              ? 'rgba(0,125,255,0.28)' : 'rgba(255,255,255,0.14)')
+            .margin({
+              right: this.panelPad(8), bottom: this.panelPad(8)
+            })
+            .onClick(() => {
+              this.chooseColorPreset(p);
+            })
+        }, (p: ColorPreset) => 'cp' + p.name)
+      }
+      .width('100%')
+      .padding({ left: this.panelPad(20), right: this.panelPad(12) })
+
+      Text('提示：色调只作用于软解通道的画面')
+        .fontSize(this.panelFont(11))
+        .fontColor('rgba(255,255,255,0.40)')
+        .width('100%')
+        .padding({
+          left: this.panelPad(20), right: this.panelPad(20),
+          top: this.panelPad(2), bottom: this.panelPad(8)
+        })
+    }
+    .width(this.panelWidth())
+    .height(this.panelHeight())
+    .backgroundColor('#F21A1A1E')
+    .borderRadius(this.isLandscape
+      ? { topLeft: 18, bottomLeft: 18 }
+      : { topLeft: 18, topRight: 18 })
+    .padding({ bottom: this.panelPad(12) })
+    .transition(TransitionEffect.translate({
+      x: this.isLandscape ? (this.areaWidth / 3 + 24) : 0,
+      y: this.isLandscape ? 0 : 520
+    }).animation({ duration: 220, curve: Curve.Friction }))
+  }
+
+  /** 「均衡器」面板：开关 + 预置列表 + 频段可视化 */
+  @Builder
+  EqPanel() {
+    Column({ space: 0 }) {
+      Row() {
+        Text('均衡器')
+          .fontSize(this.panelFont(16))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Color.White)
+          .layoutWeight(1)
+        Text('✕')
+          .fontSize(this.panelFont(18))
+          .fontColor('rgba(255,255,255,0.70)')
+          .padding(8)
+          .onClick(() => {
+            this.closePanels();
+          })
+      }
+      .width('100%')
+      .padding({
+        left: this.panelPad(20), right: this.panelPad(12),
+        top: this.panelPad(14), bottom: this.panelPad(6)
+      })
+
+      if (this.trackNotice.length > 0) {
+        Text(this.trackNotice)
+          .fontSize(this.panelFont(12))
+          .fontColor(Theme.ACCENT)
+          .width('100%')
+          .padding({ left: this.panelPad(20), right: this.panelPad(20), bottom: this.panelPad(8) })
+      }
+
+      // ---- 总开关 ----
+      Row() {
+        Text('开启均衡器')
+          .fontSize(this.panelFont(13))
+          .fontColor(Color.White)
+          .layoutWeight(1)
+        Toggle({ type: ToggleType.Switch, isOn: this.eqEnabled })
+          .selectedColor(Theme.ACCENT)
+          .onChange((on: boolean) => {
+            this.setEqEnabled(on);
+          })
+      }
+      .width('100%')
+      .padding({
+        left: this.panelPad(20), right: this.panelPad(20),
+        top: this.panelPad(4), bottom: this.panelPad(8)
+      })
+
+      // ---- 手动调节：10 段竖向滑块（2026-10-04 新增）----
+      //
+      // 为什么用竖向滑块而不是横向列表：
+      //   均衡器的本质就是"一条曲线"，10 根柱子并排摆出来，
+      //   当前曲线一眼可见、哪一段在动也一目了然 —— 和器材上的图形均衡器一致。
+      //   横向 10 行滑块在 1/3 屏宽的抽屉里放不下，也没有曲线的形状感。
+      Text('手动调节')
+        .fontSize(this.panelFont(12))
+        .fontColor('rgba(255,255,255,0.50)')
+        .width('100%')
+        .padding({
+          left: this.panelPad(20), top: this.panelPad(10), bottom: this.panelPad(6)
+        })
+
+      Row() {
+        ForEach(EQ_FREQ_LABELS, (f: string, i: number) => {
+          Column({ space: this.panelPad(4) }) {
+            Slider({
+              value: this.eqBands[i],
+              min: -12,
+              max: 12,
+              step: 1,
+              style: SliderStyle.OutSet,
+              direction: Axis.Vertical
+            })
+              .width(this.isLandscape ? 22 : 30)
+              .height(this.isLandscape ? 92 : 120)
+              .blockColor(Color.White)
+              .trackColor('rgba(255,255,255,0.25)')
+              .selectedColor(Theme.ACCENT)
+              .onChange((v: number, mode: SliderChangeMode) => {
+                // 拖动中实时生效（不落盘），松手才写设置文件
+                const settled: boolean = (mode === SliderChangeMode.End
+                  || mode === SliderChangeMode.Click);
+                this.setEqBand(i, v, settled);
+              })
+
+            Text(f)
+              .fontSize(this.panelFont(10))
+              .fontColor('rgba(255,255,255,0.55)')
+          }
+          .layoutWeight(1)
+        }, (f: string) => 'band' + f)
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      .padding({ left: this.panelPad(12), right: this.panelPad(12) })
+
+      Text('当前：' + this.eqPresetName + '（拖动任一频段即变为自定义）')
+        .fontSize(this.panelFont(11))
+        .fontColor('rgba(255,255,255,0.55)')
+        .width('100%')
+        .padding({
+          left: this.panelPad(20), right: this.panelPad(20), top: this.panelPad(6)
+        })
+
+      // ---- 预置列表 ----
+      List({ space: 0 }) {
+        ListItem() {
+          Text('预置')
+            .fontSize(this.panelFont(12))
+            .fontColor('rgba(255,255,255,0.50)')
+            .width('100%')
+            .padding({
+              left: this.panelPad(20), top: this.panelPad(10), bottom: this.panelPad(6)
+            })
+        }
+
+        ForEach(EQUALIZER_PRESETS, (p: EqPreset) => {
+          ListItem() {
+            Row({ space: this.panelPad(10) }) {
+              Text(this.eqPresetName === p.name ? '●' : '○')
+                .fontSize(this.panelFont(14))
+                .fontColor(this.eqPresetName === p.name
+                  ? Theme.ACCENT : 'rgba(255,255,255,0.40)')
+              Text(p.name)
+                .fontSize(this.panelFont(13))
+                .fontColor(Color.White)
+                .layoutWeight(1)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+            }
+            .width('100%')
+            .padding({
+              left: this.panelPad(20), right: this.panelPad(20),
+              top: this.panelPad(10), bottom: this.panelPad(10)
+            })
+            .onClick(() => {
+              this.chooseEqPreset(p.name);
+            })
+          }
+        }, (p: EqPreset) => 'eqp' + p.name)
+      }
+      .width('100%')
+      .layoutWeight(this.isLandscape ? 1 : 0)
+      .constraintSize({ maxHeight: this.isLandscape ? '100%' : 460 })
+
+      Text('提示：均衡器只作用于软解通道的声音')
+        .fontSize(this.panelFont(11))
+        .fontColor('rgba(255,255,255,0.40)')
+        .width('100%')
+        .padding({
+          left: this.panelPad(20), right: this.panelPad(20),
+          top: this.panelPad(6), bottom: this.panelPad(8)
+        })
+    }
+    .width(this.panelWidth())
+    .height(this.panelHeight())
+    .backgroundColor('#F21A1A1E')
+    .borderRadius(this.isLandscape
+      ? { topLeft: 18, bottomLeft: 18 }
+      : { topLeft: 18, topRight: 18 })
+    .padding({ bottom: this.panelPad(12) })
+    .transition(TransitionEffect.translate({
+      x: this.isLandscape ? (this.areaWidth / 3 + 24) : 0,
+      y: this.isLandscape ? 0 : 520
+    }).animation({ duration: 220, curve: Curve.Friction }))
   }
 
   build() {
@@ -2890,6 +3777,33 @@ struct PlayerPage {
                     this.toggleTrackPanel();
                   })
 
+                // ★ 2026-10-04 新增：色调 / 均衡器（用户要求放在全屏右下角）★
+                //   没做调整时按钮是暗的（和音轨按钮同一套语义：暗 = 当前无效果），
+                //   调过之后亮起，用户一眼能看出"画面/声音被我改过"。
+                Text('色调')
+                  .fontSize(13)
+                  .fontColor(this.colorAdjusted() ? Theme.ACCENT : Color.White)
+                  .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                  .borderRadius(14)
+                  .backgroundColor(this.colorAdjusted()
+                    ? 'rgba(0,125,255,0.28)' : 'rgba(255,255,255,0.14)')
+                  .margin({ right: 10 })
+                  .onClick(() => {
+                    this.toggleColorPanel();
+                  })
+
+                Text('均衡器')
+                  .fontSize(13)
+                  .fontColor(this.eqEnabled ? Theme.ACCENT : Color.White)
+                  .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                  .borderRadius(14)
+                  .backgroundColor(this.eqEnabled
+                    ? 'rgba(0,125,255,0.28)' : 'rgba(255,255,255,0.14)')
+                  .margin({ right: 10 })
+                  .onClick(() => {
+                    this.toggleEqPanel();
+                  })
+
                 // 全屏 / 退出全屏（与参考图同样放在右下角）
                 Text(this.isLandscape ? '⛶' : '⤢')
                   .fontSize(20)
@@ -3027,21 +3941,61 @@ struct PlayerPage {
       // ---------- 5. 音轨 / 字幕面板（最上层） ----------
       //
       // 放在最后：Stack 里"后写的在上层"，面板必须盖住控制栏与字幕层。
-      if (this.showTrackPanel) {
-        Column() {
-          // 半透明遮罩：点空白处关闭面板（下方整块绑定 onClick）
-          Column()
-            .width('100%')
-            .layoutWeight(1)
-            .onClick(() => {
-              this.showTrackPanel = false;
-            })
+      //
+      // ★ 2026-10-04 改版（用户要求）：**全屏时从屏幕右侧弹出，只占 1/3 屏宽** ★
+      //   全屏下画面是"宽而矮"，底部半屏面板会直接把画面中间切掉一大块，
+      //   而且横向明明有富余宽度可用 —— 改成右侧抽屉正好利用这个形状：
+      //     · 抽屉占 33% 屏宽、满高，画面左 2/3 完全不受遮挡；
+      //     · 竖屏宽度紧张，仍然保持原来的底部半屏面板（体验更好）。
+      //   遮罩只做透明度动画、面板自己做位移动画：两者都挂在同一次
+      //   animateTo 里（见 setTrackPanel），所以看起来就是"遮罩渐暗 +
+      //   面板从右侧滑入"。若把位移加在整层遮罩上，会看到一块黑边一起滑进来。
+      if (this.anyPanelOpen()) {
+        if (this.isLandscape) {
+          Row() {
+            // 左侧 2/3 是遮罩：点一下关闭面板（右侧抽屉留给面板本身）
+            Column()
+              .layoutWeight(1)
+              .height('100%')
+              .onClick(() => {
+                this.closePanels();
+              })
 
-          this.TrackPanel()
+            if (this.showTrackPanel) {
+              this.TrackPanel()
+            } else if (this.showColorPanel) {
+              this.ColorPanel()
+            } else {
+              this.EqPanel()
+            }
+          }
+          .width('100%')
+          .height('100%')
+          .backgroundColor('rgba(0,0,0,0.45)')
+          .transition(TransitionEffect.OPACITY.animation({ duration: 160 }))
+        } else {
+          Column() {
+            // 半透明遮罩：点空白处关闭面板（下方整块绑定 onClick）
+            Column()
+              .width('100%')
+              .layoutWeight(1)
+              .onClick(() => {
+                this.closePanels();
+              })
+
+            if (this.showTrackPanel) {
+              this.TrackPanel()
+            } else if (this.showColorPanel) {
+              this.ColorPanel()
+            } else {
+              this.EqPanel()
+            }
+          }
+          .width('100%')
+          .height('100%')
+          .backgroundColor('rgba(0,0,0,0.55)')
+          .transition(TransitionEffect.OPACITY.animation({ duration: 160 }))
         }
-        .width('100%')
-        .height('100%')
-        .backgroundColor('rgba(0,0,0,0.55)')
       }
     }
     .width('100%')

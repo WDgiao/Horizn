@@ -73,6 +73,10 @@ public:
     static napi_value JsGetActiveSubtitle(napi_env env, napi_callback_info info);
     /** 文件里是否有多条可切换音轨 */
     static napi_value JsCanSwitchAudioTrack(napi_env env, napi_callback_info info);
+    /** 色调调整：7 个百分比参数（亮度/对比度/饱和度/色彩度/R/G/B） */
+    static napi_value JsSetColorAdjust(napi_env env, napi_callback_info info);
+    /** 均衡器：setAudioEq(enabled, gainsDb[10]) */
+    static napi_value JsSetAudioEq(napi_env env, napi_callback_info info);
     static napi_value JsPollEvents(napi_env env, napi_callback_info info);
 
 private:
