@@ -424,6 +424,12 @@ int32_t FfmpegEngine::Start() {
     lastDecodeOkMs_ = NowMs();
     stallRecoverCount_ = 0;
 
+    // ★ 音量重新下发：音频流是"按需创建/停止"的，渲染器一换音量就回到默认，
+    //   用户调到 30% 之后暂停再播会突然变回 100% —— 这里补上（见 volume_ 的说明）
+    if (audio_ != nullptr) {
+        audio_->SetVolume(volume_.load());
+    }
+
     // 音频输出：启动失败不算致命（有些设备/权限下拿不到音频流），
     // 静音继续播视频比整个播放失败更合理
     if (audioReady_ && audio_ != nullptr && !audioThreadStarted_) {
@@ -664,8 +670,102 @@ void FfmpegEngine::RefreshColorMatrixIfNeeded() {
    均衡器（声音）
    ============================================================ */
 
-void FfmpegEngine::SetAudioEq(bool enabled, const int32_t *gainsDb, int32_t count) {
-    if (gainsDb != nullptr) {
+/* ============================================================
+   播放速度（倍速）
+   ============================================================ */
+
+void FfmpegEngine::SetSpeed(double speed) {
+    // 非有限值直接忽略：NAPI 侧万一传进 NaN/Infinity，不能让播放烂掉
+    if (!std::isfinite(speed) || speed <= 0.0) {
+        LOGW("忽略非法的播放速度：%{public}f", speed);
+        return;
+    }
+    // 0.25x ~ 4x：再慢等于卡成幻灯片、再快码流根本喂不上，
+    // 夹住比"允许但播不动"更诚实（UI 上只给 0.5~3.0 的档位）。
+    if (speed < 0.25) {
+        speed = 0.25;
+    }
+    if (speed > 4.0) {
+        speed = 4.0;
+    }
+    const int32_t permille = static_cast<int32_t>(speed * 1000.0 + 0.5);
+    const int32_t old = speedPermille_.exchange(permille);
+    if (old != permille) {
+        LOGI("播放速度改为 %{public}d.%{public}03d 倍（只改音频重采样，画面跟着音频时钟走）",
+             permille / 1000, permille % 1000);
+    }
+}
+
+/**
+ * 按倍速重采样一块 S16 立体声音频（线性插值，就地替换）
+ *
+ * 加速 = 少喂样本，减速 = 多喂样本；输出设备始终按 48kHz 消费，
+ * 于是"源时间轴上的进度"就按 speed 倍率推进 —— 音频时钟因此自动变速。
+ * 为什么重采样放在 EQ 之后：滤波器状态是按**源采样率**整定的，
+ * 先滤波再变速，滤波器的工作点才不会随倍速漂移。
+ */
+void FfmpegEngine::ResampleChunkForSpeed(std::vector<uint8_t> &data) {
+    const int32_t permille = speedPermille_.load();
+    if (permille == 1000 || data.size() < 16) {
+        return;
+    }
+    const double factor = static_cast<double>(permille) / 1000.0;
+    const size_t srcFrames = data.size() / 4;   // S16 立体声 = 4 字节/帧
+    if (srcFrames < 2) {
+        return;
+    }
+    size_t dstFrames = static_cast<size_t>(static_cast<double>(srcFrames) / factor + 0.5);
+    if (dstFrames < 1) {
+        dstFrames = 1;
+    }
+    // 兜底：减速时输出变长，理论上最多 4 倍（0.25x），这里再夹一道防爆内存
+    const size_t maxFrames = srcFrames * 4;
+    if (dstFrames > maxFrames) {
+        dstFrames = maxFrames;
+    }
+    std::vector<uint8_t> out(dstFrames * 4);
+    const int16_t *src = reinterpret_cast<const int16_t *>(data.data());
+    int16_t *dst = reinterpret_cast<int16_t *>(out.data());
+    const double step = static_cast<double>(srcFrames) / static_cast<double>(dstFrames);
+    for (size_t i = 0; i < dstFrames; i++) {
+        const double pos = static_cast<double>(i) * step;
+        const size_t i0 = static_cast<size_t>(pos);
+        const size_t i1 = (i0 + 1 < srcFrames) ? (i0 + 1) : i0;
+        const double frac = pos - static_cast<double>(i0);
+        for (int ch = 0; ch < 2; ch++) {
+            const double a = static_cast<double>(src[i0 * 2 + static_cast<size_t>(ch)]);
+            const double b = static_cast<double>(src[i1 * 2 + static_cast<size_t>(ch)]);
+            int32_t v = static_cast<int32_t>(a + (b - a) * frac + (b >= a ? 0.5 : -0.5));
+            if (v < -32768) {
+                v = -32768;
+            } else if (v > 32767) {
+                v = 32767;
+            }
+            dst[i * 2 + static_cast<size_t>(ch)] = static_cast<int16_t>(v);
+        }
+    }
+    // swap 而不是赋值：省一次拷贝（这块每秒要跑四十多次）
+    data.swap(out);
+}
+
+void FfmpegEngine::SetVolume(float volume) {
+    if (!std::isfinite(volume)) {
+        return;
+    }
+    if (volume < 0.0f) {
+        volume = 0.0f;
+    }
+    if (volume > 1.0f) {
+        volume = 1.0f;
+    }
+    volume_.store(volume);
+    // 立即下发（音频流可能还没起：AudioOutput 会记住，起流后再由 Start 重发）
+    if (audio_ != nullptr) {
+        audio_->SetVolume(volume);
+    }
+}
+
+void FfmpegEngine::SetAudioEq(bool enabled, const int32_t *gainsDb, int32_t count) {    if (gainsDb != nullptr) {
         for (int32_t i = 0; i < 10; i++) {
             const int32_t v = (i < count) ? gainsDb[i] : 0;
             eqGainDb_[i].store(v < -12 ? -12 : (v > 12 ? 12 : v));
@@ -1398,11 +1498,17 @@ void FfmpegEngine::DecodeLoop() {
                 const int64_t bytesPerMs = static_cast<int64_t>(codecapi::AudioSampleRate())
                                            * codecapi::AudioChannels() * 2 / 1000;
                 const int64_t notYetPlayedMs = (bytesPerMs > 0)
-                    ? (static_cast<int64_t>(ao->BufferedBytes()) / bytesPerMs) : 0;
+                    ? (static_cast<int64_t>(ao->BufferedBytes()) / bytesPerMs
+                       * SpeedPermille() / 1000) : 0;
                 clockSyncMs = audioWrittenMs_.load() - notYetPlayedMs;
                 waitMs = headPts - clockSyncMs;
             } else if (lastFramePtsMs_ >= 0) {
-                const int64_t targetSysMs = lastFrameSysMs_ + (headPts - lastFramePtsMs_);
+                // 没有可用音频轨时退回单调时钟：源时间轴上的帧间隔，
+                // 在倍速下对应的**真实时间**要除以倍速（2 倍速时 42ms 的帧只等 21ms）
+                const int64_t srcDeltaMs = headPts - lastFramePtsMs_;
+                const int32_t permille = SpeedPermille();
+                const int64_t targetSysMs = lastFrameSysMs_
+                    + (permille > 0 ? (srcDeltaMs * 1000 / permille) : srcDeltaMs);
                 waitMs = targetSysMs - nowMsProbe;
             }
         }
@@ -1465,12 +1571,17 @@ void FfmpegEngine::DecodeLoop() {
                                            * codecapi::AudioChannels() * 2 / 1000;
                 // 缓冲里"还没播出去"的长度
                 const int64_t notYetPlayedMs = (bytesPerMs > 0)
-                    ? (static_cast<int64_t>(ao->BufferedBytes()) / bytesPerMs) : 0;
+                    ? (static_cast<int64_t>(ao->BufferedBytes()) / bytesPerMs
+                       * SpeedPermille() / 1000) : 0;
                 const int64_t audioClockMs = audioWrittenMs_.load() - notYetPlayedMs;
                 audioClockDbg = audioClockMs;
                 waitMs = frame.ptsMs - audioClockMs;
             } else {
-                const int64_t targetSysMs = lastFrameSysMs_ + (frame.ptsMs - lastFramePtsMs_);
+                // 与上面"先看队头"同一套换算：源时间轴的间隔除以倍速才是真实等待时间
+                const int64_t srcDeltaMs = frame.ptsMs - lastFramePtsMs_;
+                const int32_t permille = SpeedPermille();
+                const int64_t targetSysMs = lastFrameSysMs_
+                    + (permille > 0 ? (srcDeltaMs * 1000 / permille) : srcDeltaMs);
                 waitMs = targetSysMs - nowMs;
             }
 
@@ -1899,6 +2010,10 @@ void FfmpegEngine::AudioLoop() {
         //   总开关关闭或全部增益为 0dB 时它立刻返回，等于没有这段代码。
         ApplyAudioEq(chunk.data);
 
+        // ★ 倍速：EQ 之后再做重采样（滤波器按源采样率整定，先滤波后变速）
+        //   原速时它直接返回，零开销。
+        ResampleChunkForSpeed(chunk.data);
+
         // 写入环形缓冲；一次写不完（缓冲满）就分次写，避免丢数据造成断音
         size_t offset = 0;
         const size_t total = chunk.data.size();
@@ -1960,8 +2075,12 @@ void FfmpegEngine::AudioLoop() {
         if (audio_ != nullptr) {
             const int64_t bytesPerMs = static_cast<int64_t>(codecapi::AudioSampleRate())
                                        * codecapi::AudioChannels() * 2 / 1000;
+            // 缓冲里"还没播出去"的部分：缓冲字节是按**设备时间**算的，
+            // 倍速下 1 毫秒设备时间对应的源时间轴是 speed 毫秒，所以要乘回去
+            // （否则倍速播放时上报的位置会比实际听到的靠后/靠前，进度条跟着偏）
             const int64_t notYetPlayedMs = (bytesPerMs > 0)
-                ? (static_cast<int64_t>(audio_->BufferedBytes()) / bytesPerMs) : 0;
+                ? (static_cast<int64_t>(audio_->BufferedBytes()) / bytesPerMs
+                   * SpeedPermille() / 1000) : 0;
             // lastPosMs 是相对量（seek 后会归零），加上 seekTargetMs_ 才是绝对位置
             const int64_t clockMs = lastPosMs - notYetPlayedMs + seekTargetMs_;
             if (clockMs > 0) {

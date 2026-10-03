@@ -79,6 +79,18 @@ public:
     /** 缓冲容量（字节） */
     size_t CapacityBytes() const;
 
+    /**
+     * 设置音量（0.0 ~ 1.0，越界自动夹回）
+     *
+     * 走系统的 OH_AudioRenderer_SetVolume：与其它应用同一套音量曲线，
+     * 也不占用我们的音频线程 CPU。渲染器还没起流时会记住值，
+     * 上层在起流后重新下发一次即可（FfmpegEngine::SetVolume 已经这么做）。
+     */
+    void SetVolume(float volume);
+
+    /** 最近一次设置的音量（渲染器重建后需要重新下发） */
+    float LastVolume() const { return lastVolume_.load(); }
+
     /** 累计欠载次数（数据没跟上导致补静音的次数）——诊断用 */
     int64_t UnderrunCount() const { return underrunCount_.load(); }
 
@@ -114,6 +126,8 @@ private:
     std::atomic<int64_t> framesPlayed_{0};
     std::atomic<int64_t> overflowCount_{0};
     std::atomic<bool> paused_{false};
+    /** 最近一次设置的音量（1.0 = 不衰减；渲染器重建后据此重新下发） */
+    std::atomic<float> lastVolume_{1.0f};
 };
 
 }  // namespace softplayer

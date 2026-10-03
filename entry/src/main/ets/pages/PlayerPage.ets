@@ -122,6 +122,27 @@ const CONTROLS_AUTO_HIDE_MS: number = 5000;
 const SEEK_SETTLE_MS: number = 3000;
 
 /**
+ * 倍速档位（2026-10-04 新增）
+ *
+ * 软解通道支持 0.25~4.0 的连续值，这些档位随便给；
+ * 系统 AVPlayer 通道只有枚举里的几档（0.75/1.0/1.25/1.75/2.0），
+ * 不在这几档上的（0.5/1.5/3.0）会取**最接近的一档**，不会点不动。
+ */
+const SPEED_OPTIONS: number[] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0];
+
+/**
+ * 长按临时加速的倍率规则
+ *
+ * 规则：当前速度 < 2.0 时按住变 2.0，否则变 3.0。
+ * 为什么不写成"按住固定 2x"：用户在 2x 上再长按就没反应了（等于功能失效）；
+ * 也不写成"按住 = 当前 ×2"：0.5x 按住变 1.0x，等于没加速，同样莫名其妙。
+ */
+const TEMP_SPEED_LOW: number = 2.0;
+const TEMP_SPEED_HIGH: number = 3.0;
+/** 按住多久算长按（毫秒）：500ms 与系统长按阈值一致 */
+const LONG_PRESS_MS: number = 500;
+
+/**
  * 均衡器预置表已移到 AppSettings.ets（设置模块）：
  * 那里的加载逻辑要用它做"预置名 ↔ 曲线"的一致性校正，
  * 表放在页面里会让依赖方向反过来（设置模块 import 页面）。
@@ -337,6 +358,57 @@ struct PlayerPage {
    */
   @State eqBands: number[] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
+  /* ==================== 倍速（2026-10-04 新增） ==================== */
+
+  /** 当前播放速度（1.0 = 原速）。不落盘：每次开播回到原速，这也是主流播放器的默认 */
+  @State speed: number = 1.0;
+  /** 是否处于"长按临时加速"中（决定要不要显示角标） */
+  @State tempSpeedActive: boolean = false;
+  /** 是否显示「倍速」抽屉 */
+  @State showSpeedPanel: boolean = false;
+  /** 长按计时器（-1 = 没有在计时）。必须在 aboutToDisappear 里清掉 */
+  private longPressTimer: number = -1;
+  /**
+   * 抑制下一次"点画面显隐控制层"
+   *
+   * 长按结束时手指抬起同样会触发控制层的 onClick，用户会看到"按一下就加速、
+   * 松手后控制栏莫名其妙冒出来"。用这个标志吃掉那一次。
+   */
+  private suppressControlsToggle: boolean = false;
+
+  /* ==================== 音量与手势（2026-10-04 新增） ==================== */
+
+  /** 应用内音量（0.0~1.0）。落盘，下次开播自动恢复 */
+  @State volume: number = 1.0;
+  /** 手势提示文本（'' = 不显示） */
+  @State gestureHint: string = '';
+  /** 手势进度条比例 0~1（-1 = 不显示） */
+  @State gestureBar: number = -1;
+
+  /** 手势起点（像素）与按下时刻 */
+  private touchDownX: number = 0;
+  private touchDownY: number = 0;
+  private touchDownAt: number = 0;
+  /** 上一次抬手时刻（双击判定用） */
+  private lastTapAt: number = 0;
+  /**
+   * 当前手势模式：0=还没定 1=横向（拖进度） 2=纵向（左半屏亮度 / 右半屏音量）
+   *
+   * 为什么"先定模式再动作"：手指落下时无法预知用户要横着还是竖着划，
+   * 若两边同时响应，想调音量的人会把进度也拖乱。所以第一次移动超过阈值时
+   * 按"哪个方向位移更大"定死一种模式，本次手势内不再切换。
+   */
+  private gestureMode: number = 0;
+  /** 手势起始播放位置（横向拖动时的基准） */
+  private gestureBaseMs: number = 0;
+  /** 手势起始参数值（亮度或音量的基准） */
+  private gestureBaseValue: number = 0;
+  /** 纵向手势落在右半屏 = 音量，左半屏 = 亮度 */
+  private gestureOnRightHalf: boolean = false;
+  /** 手势提示的自动收起计时器（-1 = 没有在计时） */
+  private gestureTimer: number = -1;
+
+  /* ==================== 倍速：应用与交互 ==================== */
   /**
    * 控制层最近一次"被唤出/被操作"的时刻（Date.now()，毫秒）
    *
@@ -544,6 +616,8 @@ struct PlayerPage {
       // 手调的 10 段曲线也要读回来：它是真正生效的曲线，
       // 少了这一句就会出现"界面显示默认、耳朵听到超重低音"的不一致
       this.eqBands = st.eqBands.slice();
+      // 音量（0~100 → 0.0~1.0）：手势调过之后重启要能恢复
+      this.volume = st.volumePercent / 100;
       this.diag.log('Player', 'aboutToAppear path=' + this.videoPath
         + ' startMs=' + this.startPositionMs.toString());
     } catch (err) {
@@ -663,6 +737,15 @@ struct PlayerPage {
     if (this.subtitleTimer >= 0) {
       clearInterval(this.subtitleTimer);
       this.subtitleTimer = -1;
+    }
+    // 长按/手势的两个 setTimeout 同理：销毁后回调里会去碰已释放的播放器
+    if (this.longPressTimer !== -1) {
+      clearTimeout(this.longPressTimer);
+      this.longPressTimer = -1;
+    }
+    if (this.gestureTimer !== -1) {
+      clearTimeout(this.gestureTimer);
+      this.gestureTimer = -1;
     }
     // 等首帧的兜底定时器也要撤掉：页面没了它还可能触发，
     // 那时会去调用已经释放的软解控制器
@@ -1483,6 +1566,9 @@ struct PlayerPage {
       //   这样"上次调过的画面/声音"在新文件里自动延续，用户不必每次重调。
       this.applyColorAdjust();
       this.applyAudioEq();
+      // 音量也在这一刻下发：软解通道的音频流是 Prepare 时才建的，
+      // 早于此时调用只会写进引擎的记忆值（也能生效，但这里补一次更直白）
+      this.applyVolume(this.volume);
       this.writeDiag('色调/均衡已应用：' + this.colBrightness.toString() + '/'
         + this.colContrast.toString() + '/' + this.colSaturation.toString() + '/'
         + this.colHue.toString() + '/' + this.colRGain.toString() + '/'
@@ -1948,6 +2034,12 @@ struct PlayerPage {
    * 挂在全屏控制层的 onClick 上（不挂在 XComponent 上，原因见文件头注释）。
    */
   private toggleControls(): void {
+    // 长按加速结束时手指抬起也会走到这里：吃掉这一次，
+    // 否则用户"按一下加速、松手后控制栏自己冒出来"
+    if (this.suppressControlsToggle) {
+      this.suppressControlsToggle = false;
+      return;
+    }
     if (this.showControls) {
       this.showControls = false;
       return;
@@ -1955,6 +2047,106 @@ struct PlayerPage {
     this.showControls = true;
     // 唤出来的那一刻重新计时，避免"刚点出来立刻又被自动隐藏"
     this.noteControlsActivity();
+  }
+
+  /**
+   * 画面长按/抬手：长按临时加速，松手还原
+   *
+   * 为什么挂在控制层这个铺满全屏的 Column 上：
+   *   XComponent(SURFACE) 的触摸事件不回 ArkUI（文件头注释里记过实测结论），
+   *   而控制层始终铺满全屏且位于视频层之上，是唯一可靠的手势落点。
+   *
+   * 与 onClick 的配合：长按抬手同样会触发 onClick，所以结束时置
+   * suppressControlsToggle，由 toggleControls 吃掉那一次（见那里的说明）。
+   */
+  /**
+   * 安全取触点坐标
+   *
+   * ★ 踩过的坑：抬手（TouchType.Up）时 event.touches 可能是**空数组** ——
+   *   它表示"当前还按在屏幕上的手指"，抬手那一刻当然没有了，
+   *   真正离开的那个点在 changedTouches 里。直接写 touches[0].x 会在抬手时
+   *   抛异常（被 ArkUI 吞掉，表现为"滑动生效了但松手那一下什么都没有"：
+   *   音量确实变了、却没落盘，进度也没跳）。所以两个都试，优先 changedTouches。
+   */
+  private touchX(event: TouchEvent): number {
+    if (event.changedTouches.length > 0) {
+      return event.changedTouches[0].x;
+    }
+    if (event.touches.length > 0) {
+      return event.touches[0].x;
+    }
+    return this.touchDownX;
+  }
+
+  private touchY(event: TouchEvent): number {
+    if (event.changedTouches.length > 0) {
+      return event.changedTouches[0].y;
+    }
+    if (event.touches.length > 0) {
+      return event.touches[0].y;
+    }
+    return this.touchDownY;
+  }
+
+  private onVideoTouch(event: TouchEvent): void {
+    if (event.type === TouchType.Down) {
+      // 抽屉开着时不接管：那时用户是在操作面板
+      if (this.anyPanelOpen()) {
+        return;
+      }
+      this.touchDownX = this.touchX(event);
+      this.touchDownY = this.touchY(event);
+      this.touchDownAt = Date.now();
+      this.gestureMode = 0;
+      // ★ 双击 = 播放/暂停 ★
+      //   判定放在 Down 上而不是 Up：双击的第二次按下就该立刻响应，
+      //   等抬手才响应会有"点了没反应"的迟滞感。300ms 是通行阈值。
+      if (this.touchDownAt - this.lastTapAt < 300) {
+        this.lastTapAt = 0;   // 吃掉，避免三击被当成两次双击
+        this.togglePlay();
+        return;
+      }
+      this.lastTapAt = this.touchDownAt;
+      if (this.longPressTimer !== -1) {
+        clearTimeout(this.longPressTimer);
+      }
+      this.longPressTimer = setTimeout(() => {
+        this.longPressTimer = -1;
+        this.enterTempSpeed();
+      }, LONG_PRESS_MS);
+    } else if (event.type === TouchType.Move) {
+      if (this.anyPanelOpen()) {
+        return;
+      }
+      // ★ 手指一动就取消长按计时 ★
+      //   原来只在"方向判定成功"之后才取消，而判定要等位移超过 18px ——
+      //   真机上首次 Move 可能已经在 500ms 之后才到（也就是长按计时器先到期），
+      //   于是"边拖边被当成长按"：抬手时走进还原倍速的分支，手势当场作废。
+      //   移动永远不可能是长按，所以任何 Move 都该取消，不必等判定。
+      if (this.longPressTimer !== -1) {
+        clearTimeout(this.longPressTimer);
+        this.longPressTimer = -1;
+      }
+      this.handleGestureMove(this.touchX(event) - this.touchDownX,
+        this.touchY(event) - this.touchDownY);
+    } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+      if (this.longPressTimer !== -1) {
+        clearTimeout(this.longPressTimer);
+        this.longPressTimer = -1;
+      }
+      // ★ 长按还原与手势结束是**两件独立的事**，不能写成 else if ★
+      //   原来写成互斥分支，结果"拖动过程中长按先触发"时手势结束被整段跳过，
+      //   表现就是"滑了半天松手什么都不发生"（音量变了不落盘、进度压根不跳）。
+      if (this.tempSpeedActive) {
+        this.exitTempSpeed();
+        this.suppressControlsToggle = true;
+      }
+      if (this.gestureMode !== 0) {
+        this.suppressControlsToggle = true;
+        this.handleGestureEnd(this.touchX(event) - this.touchDownX,
+          this.touchY(event) - this.touchDownY);
+      }
+    }
   }
 
   /** 记一次"用户刚操作/唤出过控制层"，把自动隐藏的倒计时推后 */
@@ -2064,6 +2256,227 @@ struct PlayerPage {
       this.positionMs = ms;
     }
   }
+
+  /* ==================== 音量：应用与落盘 ==================== */
+
+  /** 把音量推给当前通道（软解走系统音频渲染器，系统通道走 player.volume） */
+  private applyVolume(v: number): void {
+    const clamped: number = v < 0 ? 0 : (v > 1 ? 1 : v);
+    this.volume = clamped;
+    if (this.usingSoft) {
+      this.softCtl?.setVolume(clamped);
+      return;
+    }
+    const p = this.player;
+    if (p !== undefined) {
+      try {
+        // AVPlayer 没有 volume 属性，用 setVolume(单参数，0.0~1.0) 设置
+        p.setVolume(clamped);
+      } catch (err) {
+        this.trackNotice = '音量设置失败';
+      }
+    }
+  }
+
+  /** 音量写进设置文件（松手时调用，拖动过程不落盘） */
+  private persistVolume(): void {
+    const s: AppSettings | undefined = this.settings;
+    if (s === undefined) {
+      return;
+    }
+    s.update({ volumePercent: Math.round(this.volume * 100) } as SettingsPatch);
+  }
+
+  /* ==================== 手势 ==================== */
+
+  /** 手势提示的统一展示（自动在 900ms 后收起） */
+  private showGestureHint(hint: string, bar: number): void {
+    this.gestureHint = hint;
+    this.gestureBar = bar;
+    if (this.gestureTimer !== -1) {
+      clearTimeout(this.gestureTimer);
+    }
+    this.gestureTimer = setTimeout(() => {
+      this.gestureTimer = -1;
+      this.gestureHint = '';
+      this.gestureBar = -1;
+    }, 900);
+  }
+
+  /**
+   * 处理画面上的滑动手势
+   *
+   * @param dx 相对按下点的横向位移（px，右为正）
+   * @param dy 相对按下点的纵向位移（px，下为正）
+   *
+   * 设计取舍（移动端播放器的通用做法）：
+   *   · 横滑 = 拖进度：**不边拖边 seek**，只在提示上显示目标时间，松手才跳 ——
+   *     每动一下就 seek 会让解码器反复重启（软解代价尤其高）；
+   *   · 竖滑 = 调参数：实时生效（调音量/亮度就是要边调边听/看），
+   *     滑动手感才跟手；松手才落盘。
+   */
+  private handleGestureMove(dx: number, dy: number): void {
+    // 位移超过阈值才决定模式（避免手指微抖就误判方向）
+    if (this.gestureMode === 0) {
+      if (Math.abs(dx) < 18 && Math.abs(dy) < 18) {
+        return;
+      }
+      // 长按计时器要取消：手指已经在滑了，不该再触发"长按加速"
+      if (this.longPressTimer !== -1) {
+        clearTimeout(this.longPressTimer);
+        this.longPressTimer = -1;
+      }
+      if (Math.abs(dx) > Math.abs(dy)) {
+        this.gestureMode = 1;
+        this.gestureBaseMs = this.positionMs;
+      } else {
+        this.gestureMode = 2;
+        this.gestureOnRightHalf = this.touchDownX > this.areaWidth / 2;
+        this.gestureBaseValue = this.gestureOnRightHalf ? this.volume : this.colBrightness / 100.0;
+      }
+    }
+
+    if (this.gestureMode === 1) {
+      // 横向：整屏宽度对应 ±6 分钟（手机上最长也就拖这么远，再长不跟手）
+      const spanMs: number = 6 * 60 * 1000;
+      const deltaMs: number = Math.round(dx / this.areaWidth * spanMs);
+      const target: number = this.clampToDuration(this.gestureBaseMs + deltaMs);
+      const sign: string = deltaMs >= 0 ? '+' : '−';
+      this.showGestureHint(formatTime(target) + '  ' + sign + formatTime(Math.abs(deltaMs)),
+        this.durationMs > 0 ? target / this.durationMs : 0);
+      return;
+    }
+
+    // 纵向：整屏高度对应 100% 的变化量（从下往上滑 = 变大）
+    const delta: number = -dy / this.areaHeight;
+    const v: number = this.clamp01(this.gestureBaseValue + delta);
+    if (this.gestureOnRightHalf) {
+      this.applyVolume(v);
+      this.showGestureHint('音量 ' + Math.round(v * 100).toString() + '%', v);
+    } else {
+      // 左半屏调"亮度"：用色调里的亮度参数实现（播放器拿不到系统亮度，
+      // 而色调亮度是逐像素运算，效果等价且不需要任何权限）
+      const pct: number = Math.round(v * 100);
+      this.colBrightness = pct < -100 ? -100 : (pct > 100 ? 100 : pct);
+      this.applyColorAdjust();
+      this.showGestureHint('亮度 ' + formatSignedPercent(this.colBrightness), v);
+    }
+  }
+
+  /** 手势结束：横滑在这里才真正 seek；竖滑落盘 */
+  private handleGestureEnd(dx: number, dy: number): void {
+    if (this.gestureMode === 1) {
+      const spanMs: number = 6 * 60 * 1000;
+      const target: number = this.clampToDuration(
+        this.gestureBaseMs + Math.round(dx / this.areaWidth * spanMs));
+      this.seekTo(target);
+    } else if (this.gestureMode === 2) {
+      if (this.gestureOnRightHalf) {
+        this.persistVolume();
+      } else {
+        this.persistColorSettings();
+      }
+    }
+    this.gestureMode = 0;
+  }
+
+  private clamp01(v: number): number {
+    return v < 0 ? 0 : (v > 1 ? 1 : v);
+  }
+
+  private clampToDuration(ms: number): number {
+    if (ms < 0) {
+      return 0;
+    }
+    if (this.durationMs > 0 && ms > this.durationMs) {
+      return this.durationMs;
+    }
+    return ms;
+  }
+
+
+  /** 倍速文本：1.0 → "1.0x"，1.25 → "1.25x" */
+  private speedLabel(v: number): string {
+    return v.toString() + 'x';
+  }
+
+  /**
+   * 把速度推给当前通道
+   *
+   * 软解：直接给倍率，引擎按比例重采样音频（画面跟着音频时钟走）。
+   * 系统 AVPlayer：只有枚举里的几档，取最接近的一档。
+   */
+  private applySpeed(v: number): void {
+    this.speed = v;
+    if (this.usingSoft) {
+      this.softCtl?.setSpeed(v);
+      return;
+    }
+    const p = this.player;
+    if (p !== undefined) {
+      try {
+        p.setSpeed(this.avSpeedOf(v));
+      } catch (err) {
+        this.trackNotice = '系统解码通道不支持该倍速';
+      }
+    }
+  }
+
+  /** 取系统通道最接近的倍速档（枚举只有 0.75/1.0/1.25/1.75/2.0 这几档） */
+  private avSpeedOf(v: number): media.PlaybackSpeed {
+    if (v <= 0.85) {
+      return media.PlaybackSpeed.SPEED_FORWARD_0_75_X;
+    }
+    if (v <= 1.12) {
+      return media.PlaybackSpeed.SPEED_FORWARD_1_00_X;
+    }
+    if (v <= 1.37) {
+      return media.PlaybackSpeed.SPEED_FORWARD_1_25_X;
+    }
+    if (v <= 1.87) {
+      return media.PlaybackSpeed.SPEED_FORWARD_1_75_X;
+    }
+    return media.PlaybackSpeed.SPEED_FORWARD_2_00_X;
+  }
+
+  /** 选择档位（面板里点一下） */
+  private chooseSpeed(v: number): void {
+    this.applySpeed(v);
+    this.writeDiag('倍速=' + this.speedLabel(v) + ' 通道=' + (this.usingSoft ? 'soft' : 'avplayer'));
+  }
+
+  /** 长按开始：临时加速（不写 @State.speed，松手要还原） */
+  private enterTempSpeed(): void {
+    const target: number = (this.speed < TEMP_SPEED_LOW) ? TEMP_SPEED_LOW : TEMP_SPEED_HIGH;
+    if (this.usingSoft) {
+      this.softCtl?.setSpeed(target);
+    } else if (this.player !== undefined) {
+      try {
+        this.player.setSpeed(this.avSpeedOf(target));
+      } catch (err) {
+        return;
+      }
+    }
+    this.tempSpeedActive = true;
+  }
+
+  /** 长按结束：还原到用户选定的速度 */
+  private exitTempSpeed(): void {
+    if (!this.tempSpeedActive) {
+      return;
+    }
+    this.tempSpeedActive = false;
+    if (this.usingSoft) {
+      this.softCtl?.setSpeed(this.speed);
+    } else if (this.player !== undefined) {
+      try {
+        this.player.setSpeed(this.avSpeedOf(this.speed));
+      } catch (err) {
+        // 还原失败不用打扰用户：下一次点档位会重新设置
+      }
+    }
+  }
+
 
   /* ==================== 色调 / 均衡器：状态与应用 ==================== */
 
@@ -2385,29 +2798,50 @@ struct PlayerPage {
    * （见 build() 里那段 if/else），所以切换时必须**互相排除**，
    * 否则会出现两层遮罩叠在一起、点一下只关掉一层的怪现象。
    */
+  /**
+   * 打开某一个右侧抽屉（0=音轨字幕 1=色调 2=均衡器 3=倍速），互斥
+   *
+   * 四个面板共用同一套"全屏从右侧滑出 / 竖屏从底部滑上"的容器
+   * （见 build() 里那段 if/else），所以切换时必须**互相排除**，
+   * 否则会出现两层遮罩叠在一起、点一下只关掉一层的怪现象。
+   */
   private openPanel(which: number): void {
     this.getUIContext().animateTo({ duration: 220, curve: Curve.Friction }, () => {
       this.showTrackPanel = (which === 0);
       this.showColorPanel = (which === 1);
       this.showEqPanel = (which === 2);
+      this.showSpeedPanel = (which === 3);
     });
   }
 
   /** 关闭所有抽屉（点遮罩、点 ✕、再点一次按钮都走这里） */
   private closePanels(): void {
-    if (!this.showTrackPanel && !this.showColorPanel && !this.showEqPanel) {
+    if (!this.anyPanelOpen()) {
       return;
     }
     this.getUIContext().animateTo({ duration: 220, curve: Curve.Friction }, () => {
       this.showTrackPanel = false;
       this.showColorPanel = false;
       this.showEqPanel = false;
+      this.showSpeedPanel = false;
     });
   }
 
   /** 是否有任意抽屉开着（控制层自动隐藏要避开它） */
   private anyPanelOpen(): boolean {
-    return this.showTrackPanel || this.showColorPanel || this.showEqPanel;
+    return this.showTrackPanel || this.showColorPanel || this.showEqPanel
+      || this.showSpeedPanel;
+  }
+
+  /** 打开/关闭「倍速」抽屉 */
+  private toggleSpeedPanel(): void {
+    if (this.showSpeedPanel) {
+      this.closePanels();
+      return;
+    }
+    this.trackNotice = '';
+    this.openPanel(3);
+    this.noteControlsActivity();
   }
 
   /**
@@ -3415,6 +3849,80 @@ struct PlayerPage {
     }).animation({ duration: 220, curve: Curve.Friction }))
   }
 
+  /** 「倍速」面板：档位列表 + 长按加速说明 */
+  @Builder
+  SpeedPanel() {
+    Column({ space: 0 }) {
+      Row() {
+        Text('倍速')
+          .fontSize(this.panelFont(16))
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Color.White)
+          .layoutWeight(1)
+        Text('✕')
+          .fontSize(this.panelFont(18))
+          .fontColor('rgba(255,255,255,0.70)')
+          .padding(8)
+          .onClick(() => {
+            this.closePanels();
+          })
+      }
+      .width('100%')
+      .padding({
+        left: this.panelPad(20), right: this.panelPad(12),
+        top: this.panelPad(14), bottom: this.panelPad(6)
+      })
+
+      List({ space: 0 }) {
+        ForEach(SPEED_OPTIONS, (v: number) => {
+          ListItem() {
+            Row({ space: this.panelPad(10) }) {
+              Text(this.speed === v ? '●' : '○')
+                .fontSize(this.panelFont(14))
+                .fontColor(this.speed === v ? Theme.ACCENT : 'rgba(255,255,255,0.40)')
+              Text(this.speedLabel(v) + (v === 1.0 ? '（原速）' : ''))
+                .fontSize(this.panelFont(13))
+                .fontColor(Color.White)
+                .layoutWeight(1)
+            }
+            .width('100%')
+            .padding({
+              left: this.panelPad(20), right: this.panelPad(20),
+              top: this.panelPad(12), bottom: this.panelPad(12)
+            })
+            .onClick(() => {
+              this.chooseSpeed(v);
+            })
+          }
+        }, (v: number) => 'sp' + v.toString())
+      }
+      .width('100%')
+      .layoutWeight(this.isLandscape ? 1 : 0)
+      .constraintSize({ maxHeight: this.isLandscape ? '100%' : 420 })
+
+      Text('提示：长按画面可临时加速（松开还原）；'
+        + (this.usingSoft ? '当前为软解通道' : '当前为系统解码通道，档位会取最接近的一档'))
+        .fontSize(this.panelFont(11))
+        .fontColor('rgba(255,255,255,0.40)')
+        .width('100%')
+        .padding({
+          left: this.panelPad(20), right: this.panelPad(20),
+          top: this.panelPad(6), bottom: this.panelPad(8)
+        })
+    }
+    .width(this.panelWidth())
+    .height(this.panelHeight())
+    .backgroundColor('#F21A1A1E')
+    .borderRadius(this.isLandscape
+      ? { topLeft: 18, bottomLeft: 18 }
+      : { topLeft: 18, topRight: 18 })
+    .padding({ bottom: this.panelPad(12) })
+    .transition(TransitionEffect.translate({
+      x: this.isLandscape ? (this.areaWidth / 3 + 24) : 0,
+      y: this.isLandscape ? 0 : 520
+    }).animation({ duration: 220, curve: Curve.Friction }))
+  }
+
   build() {
     // ===================== 布局要点（踩过三次坑后的最终做法） =====================
     //
@@ -3564,6 +4072,58 @@ struct PlayerPage {
         .justifyContent(FlexAlign.Center)
         // 半透明底：既不彻底遮住画面（用户能看到"有画面了"），又能压住噪声
         .backgroundColor('rgba(0,0,0,0.35)')
+        .hitTestBehavior(HitTestMode.Transparent)
+      }
+
+      // ---------- 1.6 长按临时加速角标（2026-10-04 新增） ----------
+      //
+      //   "加速中"必须看得见：否则用户松手前后画面速度不同、又没有任何提示，
+      //   只会以为播放器在抽风。角标放左上角（与顶栏返回键错开），
+      //   同样不吃点击（Transparent），不影响"点画面显隐控制层"和长按判定。
+      if (this.tempSpeedActive) {
+        Text(this.speedLabel(this.speed < TEMP_SPEED_LOW ? TEMP_SPEED_LOW : TEMP_SPEED_HIGH))
+          .fontSize(14)
+          .fontColor(Color.White)
+          .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+          .borderRadius(10)
+          .backgroundColor('rgba(0,125,255,0.75)')
+          .position({ x: 84, y: 96 })
+          .hitTestBehavior(HitTestMode.Transparent)
+      }
+
+      // ---------- 1.7 手势提示（2026-10-04 新增） ----------
+      //
+      //   横滑显示目标时间与进度、竖滑显示音量/亮度百分比 —— 手势是"盲操作"，
+      //   没有反馈用户不知道滑到哪了。整块 Transparent，不干扰手势本身。
+      if (this.gestureHint.length > 0) {
+        Column({ space: 8 }) {
+          Text(this.gestureHint)
+            .fontSize(15)
+            .fontColor(Color.White)
+          if (this.gestureBar >= 0) {
+            Row() {
+              Row()
+                .width(Math.round(this.clamp01(this.gestureBar) * 160))
+                .height(5)
+                .backgroundColor(Theme.ACCENT)
+                .borderRadius(3)
+            }
+            .width(160)
+            .height(5)
+            .backgroundColor('rgba(255,255,255,0.30)')
+            .borderRadius(3)
+            .justifyContent(FlexAlign.Start)
+          }
+        }
+        .padding({ left: 18, right: 18, top: 12, bottom: 12 })
+        .backgroundColor('rgba(0,0,0,0.62)')
+        .borderRadius(12)
+        .position({
+          x: this.areaWidth / 2 - 100,
+          y: this.areaHeight / 2 - 40
+        })
+        .width(200)
+        .alignItems(HorizontalAlign.Center)
         .hitTestBehavior(HitTestMode.Transparent)
       }
 
@@ -3777,9 +4337,21 @@ struct PlayerPage {
                     this.toggleTrackPanel();
                   })
 
-                // ★ 2026-10-04 新增：色调 / 均衡器（用户要求放在全屏右下角）★
+                // ★ 2026-10-04 新增：倍速 / 色调 / 均衡器（用户要求放在全屏右下角）★
                 //   没做调整时按钮是暗的（和音轨按钮同一套语义：暗 = 当前无效果），
                 //   调过之后亮起，用户一眼能看出"画面/声音被我改过"。
+                Text(this.speedLabel(this.speed))
+                  .fontSize(13)
+                  .fontColor(this.speed !== 1.0 ? Theme.ACCENT : Color.White)
+                  .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                  .borderRadius(14)
+                  .backgroundColor(this.speed !== 1.0
+                    ? 'rgba(0,125,255,0.28)' : 'rgba(255,255,255,0.14)')
+                  .margin({ right: 10 })
+                  .onClick(() => {
+                    this.toggleSpeedPanel();
+                  })
+
                 Text('色调')
                   .fontSize(13)
                   .fontColor(this.colorAdjusted() ? Theme.ACCENT : Color.White)
@@ -3865,6 +4437,19 @@ struct PlayerPage {
                   .onClick(() => {
                     this.toggleTrackPanel();
                   })
+
+                // ★ 2026-10-04：倍速在竖屏也给入口 —— 它是基础播放控制，
+                //   不该"只有全屏才能用"（竖屏第二行本来就有空位）
+                Text(this.speedLabel(this.speed))
+                  .fontSize(13)
+                  .fontColor(this.speed !== 1.0 ? Theme.ACCENT : Color.White)
+                  .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+                  .borderRadius(14)
+                  .backgroundColor(this.speed !== 1.0
+                    ? 'rgba(0,125,255,0.28)' : 'rgba(255,255,255,0.14)')
+                  .onClick(() => {
+                    this.toggleSpeedPanel();
+                  })
               }
               .justifyContent(FlexAlign.Center)
               .width('100%')
@@ -3896,6 +4481,11 @@ struct PlayerPage {
       //        不会被这个父级 onClick 抢走（实机已验：拖进度条与各按钮均正常）。
       .onClick(() => {
         this.toggleControls();
+      })
+      // ★ 2026-10-04：长按画面 = 临时加速 ★
+      //   理由见 onVideoTouch 的注释：这是全屏唯一可靠的触摸落点。
+      .onTouch((event: TouchEvent) => {
+        this.onVideoTouch(event);
       })
 
       // ---------- 3. 准备中遮罩（铺满并居中） ----------
@@ -3965,8 +4555,10 @@ struct PlayerPage {
               this.TrackPanel()
             } else if (this.showColorPanel) {
               this.ColorPanel()
-            } else {
+            } else if (this.showEqPanel) {
               this.EqPanel()
+            } else {
+              this.SpeedPanel()
             }
           }
           .width('100%')
@@ -3987,8 +4579,10 @@ struct PlayerPage {
               this.TrackPanel()
             } else if (this.showColorPanel) {
               this.ColorPanel()
-            } else {
+            } else if (this.showEqPanel) {
               this.EqPanel()
+            } else {
+              this.SpeedPanel()
             }
           }
           .width('100%')

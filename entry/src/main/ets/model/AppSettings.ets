@@ -147,6 +147,14 @@ export function findEqPresetOrUndefined(name: string): EqPreset | undefined {
    *   真正生效的永远是这 10 个数（手调之后预置名会变成"自定义"）。
    */
   eqBands: number[];
+
+  /**
+   * 应用内音量（0 ~ 100 的百分比）
+   *
+   * ★ 2026-10-04 新增（手势调音量）。存百分比而不是 0.0~1.0 的小数，
+   *   是为了复用 pickNumber 的整数校验；下发时除 100 即可。
+   */
+  volumePercent: number;
 }
 
 /** 默认值（首次使用、字段缺失、类型不对时都用它） */
@@ -170,7 +178,8 @@ export function defaultSettings(): SettingsData {
     colorBGain: 0,
     eqEnabled: false,
     eqPreset: '默认',
-    eqBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    eqBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    volumePercent: 100
   };
 }
 
@@ -203,6 +212,7 @@ export interface SettingsPatch {
   eqEnabled?: boolean;
   eqPreset?: string;
   eqBands?: number[];
+  volumePercent?: number;
 }
 
 /**
@@ -333,7 +343,8 @@ export class AppSettings {
       colorBGain: pickNumber(patch.colorBGain, cur.colorBGain, -100, 100),
       eqEnabled: pickBool(patch.eqEnabled, cur.eqEnabled),
       eqPreset: pickString(patch.eqPreset, cur.eqPreset),
-      eqBands: pickNumberArray(patch.eqBands, cur.eqBands, 10, -12, 12)
+      eqBands: pickNumberArray(patch.eqBands, cur.eqBands, 10, -12, 12),
+      volumePercent: pickNumber(patch.volumePercent, cur.volumePercent, 0, 100)
     };
     this.cache = next;
     this.persist(next);
@@ -389,7 +400,8 @@ export class AppSettings {
       colorBGain: pickNumber(r.colorBGain, def.colorBGain, -100, 100),
       eqEnabled: pickBool(r.eqEnabled, def.eqEnabled),
       eqPreset: loadedPreset,
-      eqBands: loadedBands
+      eqBands: loadedBands,
+      volumePercent: pickNumber(r.volumePercent, def.volumePercent, 0, 100)
     };
   }
 

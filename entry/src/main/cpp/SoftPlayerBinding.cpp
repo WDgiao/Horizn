@@ -371,6 +371,60 @@ napi_value SoftPlayerBinding::JsSetAudioEq(napi_env env, napi_callback_info info
     return undef;
 }
 
+/**
+ * setSpeed(speed)
+ *
+ * 倍速（1.0 = 原速）。软解通道按速度重采样音频，画面跟着音频时钟走；
+ * 系统 AVPlayer 通道由 JS 侧改用 player.setSpeed（见 PlayerPage）。
+ */
+napi_value SoftPlayerBinding::JsSetSpeed(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    SoftPlayerBinding *self = Unwrap(env, info, &argc, argv);
+    if (self == nullptr) {
+        return ThrowError(env, "player object is invalid");
+    }
+    if (self->released_.load() || !self->engine_) {
+        return ThrowError(env, "player already released");
+    }
+    double speed = 1.0;
+    if (argc >= 1 && napi_get_value_double(env, argv[0], &speed) != napi_ok) {
+        return ThrowError(env, "setSpeed expects a number");
+    }
+    self->engine_->SetSpeed(speed);
+    napi_value undef = nullptr;
+    napi_get_undefined(env, &undef);
+    return undef;
+}
+
+/**
+ * setVolume(volume)
+ *
+ * 应用内音量（0.0 ~ 1.0）。软解通道交给系统音频渲染器；
+ * 系统 AVPlayer 通道由 JS 侧改用 player.volume。
+ */
+napi_value SoftPlayerBinding::JsSetVolume(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    SoftPlayerBinding *self = Unwrap(env, info, &argc, argv);
+    if (self == nullptr) {
+        return ThrowError(env, "player object is invalid");
+    }
+    if (self->released_.load() || !self->engine_) {
+        return ThrowError(env, "player already released");
+    }
+    double volume = 1.0;
+    if (argc >= 1 && napi_get_value_double(env, argv[0], &volume) != napi_ok) {
+        return ThrowError(env, "setVolume expects a number");
+    }
+    self->engine_->SetVolume(static_cast<float>(volume));
+    napi_value undef = nullptr;
+    napi_get_undefined(env, &undef);
+    return undef;
+}
+
 napi_value SoftPlayerBinding::JsRelease(napi_env env, napi_callback_info info)
 {
     size_t argc = 0;
@@ -617,6 +671,8 @@ napi_value SoftPlayerBinding::Init(napi_env env, napi_value exports)
         { "canSwitchAudioTrack", nullptr, JsCanSwitchAudioTrack, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setColorAdjust", nullptr, JsSetColorAdjust, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "setAudioEq", nullptr, JsSetAudioEq, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setSpeed", nullptr, JsSetSpeed, nullptr, nullptr, nullptr, napi_default, nullptr },
+        { "setVolume", nullptr, JsSetVolume, nullptr, nullptr, nullptr, napi_default, nullptr },
         { "pollEvents", nullptr, JsPollEvents, nullptr, nullptr, nullptr, napi_default, nullptr }
     };
     napi_value cls = nullptr;

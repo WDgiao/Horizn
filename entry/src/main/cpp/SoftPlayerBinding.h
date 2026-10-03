@@ -77,6 +77,10 @@ public:
     static napi_value JsSetColorAdjust(napi_env env, napi_callback_info info);
     /** 均衡器：setAudioEq(enabled, gainsDb[10]) */
     static napi_value JsSetAudioEq(napi_env env, napi_callback_info info);
+    /** 播放速度：setSpeed(1.0 = 原速) */
+    static napi_value JsSetSpeed(napi_env env, napi_callback_info info);
+    /** 应用内音量：setVolume(0.0 ~ 1.0) */
+    static napi_value JsSetVolume(napi_env env, napi_callback_info info);
     static napi_value JsPollEvents(napi_env env, napi_callback_info info);
 
 private:

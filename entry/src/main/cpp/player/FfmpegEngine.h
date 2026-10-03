@@ -78,6 +78,25 @@ public:
     void SetAudioEq(bool enabled, const int32_t *gainsDb, int32_t count) override;
 
     /**
+     * 播放速度（1.0 = 原速）
+     *
+     * ★ 2026-10-04 新增。实现思路见 ResampleChunkForSpeed 的说明：
+     *   只改音频（按速度重采样），画面**不用单独变速** ——
+     *   软解的画面本来就是跟着音频时钟走的，音频快了画面自然跟着快，
+     *   音画同步也天然保持（这是这套架构少有的"免费"好处）。
+     */
+    void SetSpeed(double speed) override;
+
+    /**
+     * 应用内音量（0.0 ~ 1.0）
+     *
+     * 交给系统音频渲染器（OH_AudioRenderer_SetVolume），不自己乘样本：
+     * 与其它应用同一套音量曲线，也不占音频线程 CPU。
+     * 值会记住：渲染器在 Stop/重建之后由 Start() 重新下发。
+     */
+    void SetVolume(float volume) override;
+
+    /**
      * 解绑 surface
      *
      * 实现要点：置空 surfaceId_ 并销毁 native window，全部在 surfaceMutex_ 下做，
@@ -204,6 +223,26 @@ private:
 
     /** 按 eqGainDb_ 重建双二阶系数（音频线程内部调用，参数变化时一次） */
     void RebuildEqCoeffs();
+
+    /**
+     * 按当前播放速度重采样一块音频（就地替换，S16 立体声）
+     *
+     * 为什么"只改音频"就能实现倍速：
+     *   · 输出设备固定 48kHz，放快就**少喂样本**、放慢就多喂样本 ——
+     *     线性插值重采样即可，设备侧一行都不用改；
+     *   · 软解的画面节流以「音频时钟」为准（waitMs = 帧 pts − 音频时钟），
+     *     音频时钟按源时间轴以 speed 倍速推进，画面于是自动跟着变速；
+     *   · 画面与声音用的是同一个时钟，所以倍速下音画同步天然保持
+     *     —— 这是这套架构少有的"免费"好处。
+     *
+     * 代价（如实说明）：线性插值不修音高，1.25x 以上会有"快放"的升调感。
+     * 要消除得做 WSOLA / 时间伸缩，那是另一个量级的工程；
+     * VLC / MX 默认也是这种不做音高修正的做法。
+     */
+    void ResampleChunkForSpeed(std::vector<uint8_t> &data);
+
+    /** 当前倍速的千分数（1000 = 原速）：整数便于原子读写与比较 */
+    int32_t SpeedPermille() const { return speedPermille_.load(); }
 
     /** 内联的映射缓存项 */
     struct SurfaceMap {
@@ -438,6 +477,26 @@ private:
     double eqX2_[20] = {0};
     double eqY1_[20] = {0};
     double eqY2_[20] = {0};
+
+    /* ==================== 播放速度状态 ==================== */
+
+    /**
+     * 播放速度的千分数（1000 = 1.0x），由 UI 线程写、音频/解码线程读
+     *
+     * 用整数而不是 double：原子读写更省事，比较也不会有浮点误差
+     * （"速度没变就不做重采样"这个判断必须稳）。
+     */
+    std::atomic<int32_t> speedPermille_{1000};
+
+    /**
+     * 应用内音量（0.0 ~ 1.0）
+     *
+     * 存在引擎侧而不是只丢给 AudioOutput：音频流是"按需创建/停止"的
+     * （Prepare 起流、Stop/重建后要重来），渲染器一换，音量设置就没了。
+     * 引擎记住它，起流时重新下发 —— 否则用户调到 30% 之后暂停再播，
+     * 音量会自己弹回 100%。
+     */
+    std::atomic<float> volume_{1.0f};
 
     /* ==================== 音频 ==================== */
 

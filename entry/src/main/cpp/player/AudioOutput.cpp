@@ -123,8 +123,35 @@ void AudioOutput::Resume() {
     }
 }
 
-void AudioOutput::Stop() {
+/**
+ * 设置音量（0.0 ~ 1.0）
+ *
+ * 用系统渲染器的音量接口（OH_AudioRenderer_SetVolume）而不是自己乘样本：
+ *   · 由系统统一处理，和其它应用走同一套音量曲线（听感一致）；
+ *   · 不占用解码/上屏线程的 CPU（我们的音频线程每 10ms 左右就要写一块数据）；
+ *   · 记忆值存在引擎侧，Stop/重建渲染器之后由上层重新下发（见 FfmpegEngine::SetVolume）。
+ * 越界值直接夹回 —— 传 2.0 进去系统会报参数错误，不如自己夹。
+ */
+void AudioOutput::SetVolume(float volume) {
+    if (volume < 0.0f) {
+        volume = 0.0f;
+    }
+    if (volume > 1.0f) {
+        volume = 1.0f;
+    }
+    lastVolume_.store(volume);
     OH_AudioRenderer *r = renderer_;
+    if (r == nullptr) {
+        return;   // 还没起流：记住值，起流后由 SetVolume 再调一次
+    }
+    const OH_AudioStream_Result res = OH_AudioRenderer_SetVolume(r, volume);
+    if (res != AUDIOSTREAM_SUCCESS) {
+        LOGW("设置音量失败: %{public}d（音量=%{public}d%%）",
+             static_cast<int>(res), static_cast<int>(volume * 100));
+    }
+}
+
+void AudioOutput::Stop() {    OH_AudioRenderer *r = renderer_;
     renderer_ = nullptr;
     if (r == nullptr) {
         return;

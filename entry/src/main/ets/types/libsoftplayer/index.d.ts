@@ -153,6 +153,28 @@ export class SoftPlayer {
    */
   setAudioEq(enabled: boolean, gainsDb: number[]): void;
 
+  /**
+   * 播放速度（2026-10-04 新增）
+   *
+   * @param speed 倍率，1.0 = 原速（软解通道支持 0.25 ~ 4.0，越界夹回）
+   *
+   * 软解通道的做法是"按速度重采样音频"：输出设备固定 48kHz，
+   * 放快就少喂样本、放慢就多喂样本；画面本来就以音频时钟为准，
+   * 于是自动跟着变速，音画同步天然保持。
+   * 注意：线性插值不修音高，1.25x 以上会听到"快放"的升调感。
+   */
+  setSpeed(speed: number): void;
+
+  /**
+   * 应用内音量（2026-10-04 新增）
+   *
+   * @param volume 0.0 ~ 1.0（1.0 = 不衰减，越界夹回）
+   *
+   * 走系统音频渲染器的音量接口，与其它应用同一套音量曲线；
+   * 值会记住，音频流重建后由引擎在 Start 时重新下发。
+   */
+  setVolume(volume: number): void;
+
   pollEvents(): SoftPlayerEvent[];
 }
 

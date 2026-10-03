@@ -39,7 +39,8 @@ struct SubtitleSettingsPage {
     colorBGain: 0,
     eqEnabled: false,
     eqPreset: '默认',
-    eqBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    eqBands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    volumePercent: 100
   };
 
   private store: AppSettings | undefined = undefined;

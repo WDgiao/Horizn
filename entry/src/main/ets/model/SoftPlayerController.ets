@@ -255,6 +255,37 @@ export class SoftPlayerController {
   }
 
   /**
+   * 播放速度（1.0 = 原速）
+   *
+   * 异常只记诊断、不打断播放：变速是锦上添花，不能因为一次调用失败
+   * 让正在播的视频停下来。
+   */
+  setSpeed(speed: number): void {
+    const p: SoftPlayer | undefined = this.player;
+    if (p === undefined || this.released) {
+      return;
+    }
+    try {
+      p.setSpeed(speed);
+    } catch (err) {
+      this.fail('setSpeed 异常：' + JSON.stringify(err));
+    }
+  }
+
+  /** 应用内音量（0.0 ~ 1.0） */
+  setVolume(volume: number): void {
+    const p: SoftPlayer | undefined = this.player;
+    if (p === undefined || this.released) {
+      return;
+    }
+    try {
+      p.setVolume(volume);
+    } catch (err) {
+      this.fail('setVolume 异常：' + JSON.stringify(err));
+    }
+  }
+
+  /**
    * 解绑渲染 surface（页面销毁前必须调用，且要在 release 之前）
    *
    * 为什么不能只靠 release：

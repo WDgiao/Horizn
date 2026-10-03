@@ -222,6 +222,23 @@ public:
         (void)enabled; (void)gainsDb; (void)count;
     }
 
+    /**
+     * 播放速度（2026-10-04 新增）
+     *
+     * @param speed 倍率，1.0 = 原速（软解通道支持 0.25 ~ 4.0，越界会夹回）
+     *
+     * 默认实现什么都不做：系统 AVPlayer 通道的倍速由它自己的 setSpeed 负责。
+     */
+    virtual void SetSpeed(double speed) { (void)speed; }
+
+    /**
+     * 应用内音量（0.0 ~ 1.0，1.0 = 不衰减）
+     *
+     * 软解通道交给系统音频渲染器的音量接口；系统 AVPlayer 通道由它自己的
+     * player.volume 负责。默认实现什么都不做。
+     */
+    virtual void SetVolume(float volume) { (void)volume; }
+
     /** 释放全部资源，之后不可再调用其它方法 */
     virtual void Release() = 0;
 };
