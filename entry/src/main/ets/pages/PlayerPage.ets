@@ -79,11 +79,31 @@ function channelLabel(ch: number): string {
  *   - 顶部信息栏 + 返回按钮：贴顶（Stack 默认 TopStart 对齐）
  *   - 视频渲染层：铺满整屏，由 videoScaleType 保证不拉伸变形
  *   - 底部控制栏：贴底（alignContent: Alignment.Bottom）
- * 三者显隐由 showControls 统一控制。
+ * 顶栏与底栏的显隐由 showControls 统一控制。
+ *
+ * ★ 控制层显隐（2026-10-03 修）★
+ *   原来是"点 XComponent 切换 showControls"，但真机实测**点了没反应**：
+ *   XComponent(SURFACE) 的 onClick 在该平台上不派发（surface 由原生渲染，
+ *   触摸事件不回到 ArkUI 的点击回调），而铺满全屏的控制层 Column 又会把
+ *   落在空白处的触摸吞掉，于是控制栏一旦显示就再也藏不掉。
+ *   现在把 click 挂在**控制层 Column 自己**身上：
+ *     · 它始终存在（两个 if 只包住顶栏/底栏，Column 本身不受显隐影响），
+ *       所以隐藏之后仍然有满屏的点击目标可以把它唤回来；
+ *     · ArkUI 里子组件优先响应，所以进度条、按钮、返回键的点击不受影响；
+ *     · 播放中若干秒无操作自动隐藏（见 tickControlsAutoHide），
+ *       暂停时不隐藏（那时控制栏是必需品）。
  *
  * 横竖屏：通过 window.setPreferredOrientation 切换，
  * 方向变化时 XComponent 的 surface 会重建，因此 onLoad 里做了幂等处理。
  */
+
+/**
+ * 播放中控制层的自动隐藏延时（毫秒）
+ *
+ * 取值理由：太短（<3 秒）用户还没点到按钮就没了；太长（>8 秒）等于没做。
+ * 5 秒是主流播放器的量级，也足够"看一眼进度"。
+ */
+const CONTROLS_AUTO_HIDE_MS: number = 5000;
 @Entry
 @Component
 struct PlayerPage {
@@ -155,6 +175,20 @@ struct PlayerPage {
 
   /** 用户是否正在拖动进度条 */
   private dragging: boolean = false;
+
+  /**
+   * 控制层最近一次"被唤出/被操作"的时刻（Date.now()，毫秒）
+   *
+   * 用途：播放中若干秒无操作就把控制层自动隐藏。
+   *
+   * 为什么不用一次性的 setTimeout（并在每个交互回调里重置）：
+   *   那种写法要在 togglePlay / seekTo / toggleTrackPanel / 进度条拖动
+   *   等每一处都记得重置定时器，漏一处就会出现"刚点完按钮控制栏自己没了"。
+   *   本页本来就有一个 100ms 的字幕轮询（subtitleTimer），把"该不该隐藏"
+   *   挂在那个 tick 上判断，天然每 100ms 重新判断一次、随时可重置，
+   *   也省掉一个需要在 aboutToDisappear 里清理的定时器。
+   */
+  private controlsActiveAt: number = 0;
   /** XComponent 控制器 */
   private surfaceController: XComponentController = new XComponentController();
   /** AVPlayer 实例 */
@@ -292,8 +326,10 @@ struct PlayerPage {
     }
     // 字幕刷新定时器。100ms 与事件轮询同频 —— 字幕的时间精度本来
     // 就在几十毫秒量级，再密也没有意义，反而白耗电。
+    // 顺带驱动控制层的自动隐藏（同一个 tick，不额外起定时器）。
     this.subtitleTimer = setInterval(() => {
       this.refreshSubtitle();
+      this.tickControlsAutoHide();
     }, 100);
   }
 
@@ -1227,8 +1263,64 @@ struct PlayerPage {
     }
   }
 
+  // ==================== 控制层显隐（2026-10-03 新增） ====================
+
+  /**
+   * 点画面：显示 / 隐藏控制层
+   *
+   * 挂在全屏控制层的 onClick 上（不挂在 XComponent 上，原因见文件头注释）。
+   */
+  private toggleControls(): void {
+    if (this.showControls) {
+      this.showControls = false;
+      return;
+    }
+    this.showControls = true;
+    // 唤出来的那一刻重新计时，避免"刚点出来立刻又被自动隐藏"
+    this.noteControlsActivity();
+  }
+
+  /** 记一次"用户刚操作/唤出过控制层"，把自动隐藏的倒计时推后 */
+  private noteControlsActivity(): void {
+    this.controlsActiveAt = Date.now();
+  }
+
+  /**
+   * 自动隐藏判断，由 100ms 的字幕轮询顺带驱动
+   *
+   * 为什么不隐藏的三种情况：
+   *   · 暂停中 —— 那时控制栏是必需品（要靠它继续播放），藏起来等于没法播；
+   *   · 正在拖进度条 —— 拖到一半把控制栏藏掉是最恼人的行为；
+   *   · 音轨/字幕面板打开 —— 那是模态面板，底下藏不藏没意义，还会让关闭后一脸懵。
+   * 后两种情况顺便把计时基准重置成"现在"，这样操作结束后是完整的 5 秒，
+   * 而不是"松手立刻隐藏"。
+   */
+  private tickControlsAutoHide(): void {
+    if (!this.playing) {
+      this.controlsActiveAt = Date.now();
+      return;
+    }
+    if (!this.showControls) {
+      return;
+    }
+    if (this.dragging || this.showTrackPanel) {
+      this.controlsActiveAt = Date.now();
+      return;
+    }
+    // 首次进入（或刚恢复播放）还没有基准：先打一个，下一轮才开始计时
+    if (this.controlsActiveAt <= 0) {
+      this.controlsActiveAt = Date.now();
+      return;
+    }
+    if (Date.now() - this.controlsActiveAt >= CONTROLS_AUTO_HIDE_MS) {
+      this.showControls = false;
+    }
+  }
+
   /** 播放 / 暂停 */
   private togglePlay(): void {
+    // 用户刚点过播放/暂停，控制层再留一会儿（不然会出现"刚点完就消失"）
+    this.noteControlsActivity();
     // 软解通道：状态由快照维护，直接按快照反转
     if (this.usingSoft) {
       const c: SoftPlayerController | undefined = this.softCtl;
@@ -1272,6 +1364,8 @@ struct PlayerPage {
     if (this.durationMs <= 0) {
       return;
     }
+    // 跳转之后控制层再多留一会儿，方便连续调
+    this.noteControlsActivity();
     if (this.usingSoft) {
       this.softCtl?.seekTo(ms);
       this.positionMs = ms;
@@ -1320,6 +1414,8 @@ struct PlayerPage {
     }
     this.trackNotice = '';
     this.showTrackPanel = true;
+    // 打开面板时把控制层的倒计时推后：关掉面板后控制栏还在，用户不用再点一次
+    this.noteControlsActivity();
   }
 
   /** 切换音轨 */
@@ -2011,7 +2107,13 @@ struct PlayerPage {
               this.onSurfaceCreated();
             })
             .onClick(() => {
-              this.showControls = !this.showControls;
+              // ⚠️ 这个回调在真机上**不会被触发**：XComponent(SURFACE) 的
+              //    surface 由原生渲染，触摸事件不回到 ArkUI 的点击回调
+              //    （实测点了没反应，正是"控制栏藏不掉"的原因）。
+              //    真正生效的切换挂在下面控制层 Column 的 onClick 上。
+              //    这里保留是为了：万一后续换成 Texture 类型或平台行为变化，
+              //    这条路径也仍然是"点画面切换"的语义。
+              this.toggleControls();
             })
 
           // ===== 字幕层（贴画面下沿） =====
@@ -2121,29 +2223,29 @@ struct PlayerPage {
         Blank()
 
         // ===== 2.4 底部控制栏（贴底） =====
+        //
+        // ★★ 2026-10-03：全屏（横屏）改成单行结构，对齐主流播放器的样子 ★★
+        //
+        //   横屏下屏幕是"宽而矮"，原来那套三行堆叠（进度条行 + 按钮行 +
+        //   音轨/字幕行）会把画面下方切掉一大块，而横向明明有大量富余宽度。
+        //   现在横屏改为：
+        //       第一行：进度条（整行只有滑块，时间挪到第二行去，滑块更长）
+        //       第二行：⏪ ⏸ ⏩  12:34 / 1:30:27 ……… 音轨 1/2  字幕  ⛶
+        //   也就是「左边一排播放控制 + 时间，右边一排工具项」，与参考图一致。
+        //   竖屏保持原来的三行结构不动 —— 竖屏本来就没有横向空间可借。
         if (this.showControls) {
           Column({ space: 10 }) {
-            // ---- 进度条行 ----
-            Row({ space: 12 }) {
-              Text(formatTime(this.positionMs))
-                .fontSize(12)
-                .fontColor(Color.White)
-                .width(56)
-                .textAlign(TextAlign.Center)
-
-              // 注意：不要设置 step。
-              // 之前写 step: 100 会把 4 秒的视频量化成约 40 个离散档位，
-              // 滑块位置被"吸附"到整百毫秒，看起来与实际进度对不上。
-              // 不设 step 即为连续取值，滑块位置与 positionMs 严格成比例。
+            // ---- 2.4.1 进度条行 ----
+            if (this.isLandscape) {
+              // 横屏：占满整行，不放两侧时间（时间已移到下面的控制行）
               Slider({
                 value: this.positionMs,
                 min: 0,
                 max: this.durationMs > 0 ? this.durationMs : 1,
                 style: SliderStyle.OutSet
               })
-                .layoutWeight(1)
                 .width('100%')
-                .height(32)
+                .height(28)
                 .blockColor(Color.White)
                 .trackColor('rgba(255,255,255,0.30)')
                 .selectedColor(Theme.ACCENT)
@@ -2156,72 +2258,183 @@ struct PlayerPage {
                     this.seekTo(value);
                   }
                 })
+            } else {
+              Row({ space: 12 }) {
+                Text(formatTime(this.positionMs))
+                  .fontSize(12)
+                  .fontColor(Color.White)
+                  .width(56)
+                  .textAlign(TextAlign.Center)
 
-              Text(formatTime(this.durationMs))
-                .fontSize(12)
-                .fontColor('rgba(255,255,255,0.70)')
-                .width(56)
-                .textAlign(TextAlign.Center)
+                // 注意：不要设置 step。
+                // 之前写 step: 100 会把 4 秒的视频量化成约 40 个离散档位，
+                // 滑块位置被"吸附"到整百毫秒，看起来与实际进度对不上。
+                // 不设 step 即为连续取值，滑块位置与 positionMs 严格成比例。
+                Slider({
+                  value: this.positionMs,
+                  min: 0,
+                  max: this.durationMs > 0 ? this.durationMs : 1,
+                  style: SliderStyle.OutSet
+                })
+                  .layoutWeight(1)
+                  .width('100%')
+                  .height(32)
+                  .blockColor(Color.White)
+                  .trackColor('rgba(255,255,255,0.30)')
+                  .selectedColor(Theme.ACCENT)
+                  .onChange((value: number, mode: SliderChangeMode) => {
+                    if (mode === SliderChangeMode.Begin || mode === SliderChangeMode.Moving) {
+                      this.dragging = true;
+                      this.positionMs = value;
+                    } else if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                      this.dragging = false;
+                      this.seekTo(value);
+                    }
+                  })
+
+                Text(formatTime(this.durationMs))
+                  .fontSize(12)
+                  .fontColor('rgba(255,255,255,0.70)')
+                  .width(56)
+                  .textAlign(TextAlign.Center)
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Center)
             }
-            .width('100%')
-            .alignItems(VerticalAlign.Center)
 
-            // ---- 按钮行 ----
-            Row({ space: 32 }) {
-              Text('⏪')
-                .fontSize(24)
-                .onClick(() => {
-                  this.seekBackward();
-                })
+            // ---- 2.4.2 控制行 ----
+            if (this.isLandscape) {
+              // 横屏单行：左「播放控制 + 时间」，右「工具项」
+              Row() {
+                Text('⏪')
+                  .fontSize(22)
+                  .fontColor(Color.White)
+                  .padding({ left: 4, right: 10 })
+                  .onClick(() => {
+                    this.seekBackward();
+                  })
 
-              Text(this.playing ? '⏸' : '▶')
-                .fontSize(34)
-                .onClick(() => {
-                  this.togglePlay();
-                })
+                Text(this.playing ? '⏸' : '▶')
+                  .fontSize(30)
+                  .fontColor(Color.White)
+                  .padding({ left: 4, right: 10 })
+                  .onClick(() => {
+                    this.togglePlay();
+                  })
 
-              Text('⏩')
-                .fontSize(24)
-                .onClick(() => {
-                  this.seekForward();
-                })
+                Text('⏩')
+                  .fontSize(22)
+                  .fontColor(Color.White)
+                  .padding({ left: 4, right: 14 })
+                  .onClick(() => {
+                    this.seekForward();
+                  })
+
+                // 时间：与参考图一致，写成「当前 / 总长」贴在播放键右侧
+                Text(formatTime(this.positionMs) + ' / ' + formatTime(this.durationMs))
+                  .fontSize(13)
+                  .fontColor('rgba(255,255,255,0.85)')
+
+                // Blank() 吃掉中间的全部宽度，把工具组顶到最右边
+                Blank()
+
+                // 工具组：只用真正有实现的能力，不放点了没反应的按钮
+                //   （倍速需要软解引擎的变速能力、音量需要音频音量 API、
+                //     投屏/画中画需要平台侧集成 —— 这些目前都没有，故不摆）
+                Text(this.audioTracksLabel())
+                  .fontSize(13)
+                  .fontColor(this.audioTracks.length > 1 ? Color.White : 'rgba(255,255,255,0.40)')
+                  .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                  .borderRadius(14)
+                  .backgroundColor('rgba(255,255,255,0.14)')
+                  .margin({ right: 10 })
+                  .onClick(() => {
+                    this.toggleTrackPanel();
+                  })
+
+                Text(this.subtitleLabel())
+                  .fontSize(13)
+                  .fontColor(Color.White)
+                  .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                  .borderRadius(14)
+                  .backgroundColor('rgba(255,255,255,0.14)')
+                  .margin({ right: 10 })
+                  .onClick(() => {
+                    this.toggleTrackPanel();
+                  })
+
+                // 全屏 / 退出全屏（与参考图同样放在右下角）
+                Text(this.isLandscape ? '⛶' : '⤢')
+                  .fontSize(20)
+                  .fontColor(Color.White)
+                  .padding({ left: 10, right: 4 })
+                  .onClick(() => {
+                    this.toggleOrientation();
+                  })
+              }
+              .width('100%')
+              .alignItems(VerticalAlign.Center)
+            } else {
+              // 竖屏维持原样：按钮居中一行、音轨/字幕居中一行
+              Row({ space: 32 }) {
+                Text('⏪')
+                  .fontSize(24)
+                  .onClick(() => {
+                    this.seekBackward();
+                  })
+
+                Text(this.playing ? '⏸' : '▶')
+                  .fontSize(34)
+                  .onClick(() => {
+                    this.togglePlay();
+                  })
+
+                Text('⏩')
+                  .fontSize(24)
+                  .onClick(() => {
+                    this.seekForward();
+                  })
+              }
+              .justifyContent(FlexAlign.Center)
+              .width('100%')
+
+              // ---- 音轨 / 字幕入口 ----
+              //
+              // 为什么单独占一行而不是塞进上面的按钮行：
+              //   播放按钮那一行已经占了 24+34+24 的字号和 32 的间距，
+              //   再塞进去会在窄屏（竖屏 360vp）上挤成一团。
+              //   而且这两个是"低频但重要"的操作，独立一行更好点中。
+              Row({ space: 28 }) {
+                Text(this.audioTracksLabel())
+                  .fontSize(13)
+                  .fontColor(this.audioTracks.length > 1 ? Color.White : 'rgba(255,255,255,0.40)')
+                  .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+                  .borderRadius(14)
+                  .backgroundColor('rgba(255,255,255,0.14)')
+                  .onClick(() => {
+                    this.toggleTrackPanel();
+                  })
+
+                Text(this.subtitleLabel())
+                  .fontSize(13)
+                  .fontColor(Color.White)
+                  .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+                  .borderRadius(14)
+                  .backgroundColor('rgba(255,255,255,0.14)')
+                  .onClick(() => {
+                    this.toggleTrackPanel();
+                  })
+              }
+              .justifyContent(FlexAlign.Center)
+              .width('100%')
             }
-            .justifyContent(FlexAlign.Center)
-            .width('100%')
-
-            // ---- 音轨 / 字幕入口 ----
-            //
-            // 为什么单独占一行而不是塞进上面的按钮行：
-            //   播放按钮那一行已经占了 24+34+24 的字号和 32 的间距，
-            //   再塞进去会在窄屏（竖屏 360vp）上挤成一团。
-            //   而且这两个是"低频但重要"的操作，独立一行更好点中。
-            Row({ space: 28 }) {
-              Text(this.audioTracksLabel())
-                .fontSize(13)
-                .fontColor(this.audioTracks.length > 1 ? Color.White : 'rgba(255,255,255,0.40)')
-                .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-                .borderRadius(14)
-                .backgroundColor('rgba(255,255,255,0.14)')
-                .onClick(() => {
-                  this.toggleTrackPanel();
-                })
-
-              Text(this.subtitleLabel())
-                .fontSize(13)
-                .fontColor(Color.White)
-                .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-                .borderRadius(14)
-                .backgroundColor('rgba(255,255,255,0.14)')
-                .onClick(() => {
-                  this.toggleTrackPanel();
-                })
-            }
-            .justifyContent(FlexAlign.Center)
-            .width('100%')
           }
           .width('100%')
           .alignItems(HorizontalAlign.Center)
-          .padding({ left: 20, right: 20, top: 20, bottom: 28 })
+          // 横屏控制栏只有两行，上下留白比竖屏收紧，避免压住画面
+          .padding(this.isLandscape
+            ? { left: 24, right: 24, top: 10, bottom: 12 }
+            : { left: 20, right: 20, top: 20, bottom: 28 })
           .linearGradient({
             angle: 0,
             colors: [['rgba(0,0,0,0.80)', 0.0], ['rgba(0,0,0,0.00)', 1.0]]
@@ -2230,6 +2443,19 @@ struct PlayerPage {
       }
       .width('100%')
       .height('100%')
+      // ★★ 2026-10-03：控制层的显隐切换挂在这里 ★★
+      //
+      //   为什么挂在这个铺满全屏的 Column 上，而不是 XComponent 上：
+      //     ① XComponent(SURFACE) 的 onClick 真机上根本不派发（实测点了没反应）；
+      //     ② 这个 Column 铺满整屏且位于视频层之上，空白处的触摸本来就被它
+      //        吃掉 —— 不挂处理函数时那些点击就是"点哪都没反应"；
+      //     ③ 它始终存在（下面两个 if 只包住顶栏/底栏），所以控制层藏起来之后
+      //        仍然有满屏的点击目标把它唤回来 —— 这是能"藏了还能点回来"的关键；
+      //     ④ ArkUI 里子组件优先响应点击，所以进度条 / 播放按钮 / 返回键
+      //        不会被这个父级 onClick 抢走（实机已验：拖进度条与各按钮均正常）。
+      .onClick(() => {
+        this.toggleControls();
+      })
 
       // ---------- 3. 准备中遮罩（铺满并居中） ----------
       if (this.preparing && this.errorMsg.length === 0) {
