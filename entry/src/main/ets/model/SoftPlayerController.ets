@@ -31,6 +31,25 @@ export interface SoftPlayerSnapshot {
   currentAudioIndex: number;
   /** 当前字幕轨流下标；-1 表示未启用 */
   currentSubtitleIndex: number;
+  /**
+   * 首帧是否已经上屏（2026-10-03 新增）
+   *
+   * 用途：起播流程改成"先出画面，再开始播"（见 PlayerPage 的 beginFirstFrameWait）。
+   *   上层不能靠 play() 去催首帧 —— 那正是要避免的（声音先响、画面还是黑的）。
+   *   原生侧在渲染第一帧后会发一条 POSITION 事件并把 data2 置 1，
+   *   这里转成布尔量给界面用。
+   */
+  firstFrameRendered: boolean;
+  /**
+   * 「首帧已上屏」那一帧自己的 pts（毫秒）
+   *
+   * 为什么要单独带出来：续播时引擎先预渲染了**seek 之前**的一帧（文件开头），
+   * 随后 seek 完成又会发一条 POSITION（内容是续播目标）。两条事件落在同一次
+   * 轮询里时，快照的 positionMs 会被后者覆盖 —— 只看 positionMs 就没法分辨
+   * "报信号的那一帧到底是开头那帧还是续播位置的帧"。
+   * 单独记下首帧自己的 pts，续播时就能要求"首帧确实落在目标附近"才开播。
+   */
+  firstFramePtsMs: number;
 }
 
 /**
@@ -65,7 +84,9 @@ export class SoftPlayerController {
     audioTracks: [],
     subtitleTracks: [],
     currentAudioIndex: -1,
-    currentSubtitleIndex: -1
+    currentSubtitleIndex: -1,
+    firstFrameRendered: false,
+    firstFramePtsMs: -1
   };
   /** 状态变化通知（由 UI 传入） */
   private onUpdate: (snap: SoftPlayerSnapshot) => void;
@@ -105,7 +126,9 @@ export class SoftPlayerController {
       audioTracks: s.audioTracks.slice(0),
       subtitleTracks: s.subtitleTracks.slice(0),
       currentAudioIndex: s.currentAudioIndex,
-      currentSubtitleIndex: s.currentSubtitleIndex
+      currentSubtitleIndex: s.currentSubtitleIndex,
+      firstFrameRendered: s.firstFrameRendered,
+      firstFramePtsMs: s.firstFramePtsMs
     };
   }
 
@@ -136,16 +159,19 @@ export class SoftPlayerController {
   /**
    * 打开媒体文件
    * @param path 沙箱内绝对路径
+   * @param startPositionMs 起播位置（毫秒，可选）。续播必须在这里给：
+   *        引擎会在"打开之后、预渲染第一帧之前"跳到位，于是首帧就是续播位置那一帧；
+   *        若等 READY 之后再 seek，首帧会是文件开头，上层就没法用它判断画面是否就绪。
    * @returns 是否成功发起（真正就绪要等 PREPARED 事件）
    */
-  prepare(path: string): boolean {
+  prepare(path: string, startPositionMs: number = 0): boolean {
     const p: SoftPlayer | undefined = this.player;
     if (p === undefined || this.released) {
       return false;
     }
     try {
       this.snapshot.error = '';
-      const r: number = p.prepare(path);
+      const r: number = p.prepare(path, startPositionMs > 0 ? Math.floor(startPositionMs) : 0);
       if (r !== 0) {
         this.fail('prepare 返回错误码 ' + r.toString());
         return false;
@@ -300,6 +326,11 @@ export class SoftPlayerController {
     }
     if (ev.type === SoftPlayerEventType.POSITION) {
       this.snapshot.positionMs = ev.data1;
+      // data2 == 1 表示"这是首帧上屏时上报的那一条"（见引擎里的预渲染说明）
+      if (ev.data2 === 1) {
+        this.snapshot.firstFrameRendered = true;
+        this.snapshot.firstFramePtsMs = ev.data1;
+      }
       return true;
     }
     if (ev.type === SoftPlayerEventType.DURATION) {

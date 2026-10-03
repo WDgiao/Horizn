@@ -6,12 +6,17 @@ import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { common as commonKit } from '@kit.AbilityKit';
 import { Theme } from '../common/Theme';
+import { showToast } from '../common/Toast';
 import { formatDuration } from '../common/MediaData';
 import { MediaTier, mediaTierOf, isVideoContainer } from '../common/MediaType';
 import { WatchHistory } from '../model/WatchHistory';
 import { DiagLog } from '../model/DiagLog';
 import { SoftPlayerController, SoftPlayerSnapshot } from '../model/SoftPlayerController';
 import { SoftPlayerState, SoftAudioTrack, SoftSubtitleTrack } from '../model/SoftPlayerTypes';
+import {
+  appSettings, AppSettings, SettingsData, defaultSettings, DecodePreference, SubtitleLanguage,
+  subtitleFontPx, trackMatchesLanguage
+} from '../model/AppSettings';
 import {
   ExternalSubtitle, SubtitleCandidate, current as externalSubtitle,
   findSidecarSubtitles, loadSubtitleFile, pickSubtitleFile, SUBTITLE_EXTENSIONS,
@@ -121,6 +126,16 @@ struct PlayerPage {
   @State showControls: boolean = true;
   /** 是否正在准备 */
   @State preparing: boolean = true;
+
+  /**
+   * 是否显示"加载/缓冲"指示（2026-10-03 新增）
+   *
+   * 两种用途：
+   *   ① 起播阶段：文件已就绪但**首帧还没上屏** —— 这时不该开始播（见 awaitFirstFrame）；
+   *   ② 播放途中：一小段时间没有任何位置更新（解码跟不上/临时缺数据）——
+   *      给用户一个"在加载"的反馈，而不是看着画面发呆以为卡死了。
+   */
+  @State buffering: boolean = false;
   /** 错误信息，非空时显示错误层 */
   @State errorMsg: string = '';
   /** 是否横屏，用于切换按钮图标 */
@@ -230,6 +245,83 @@ struct PlayerPage {
   private history: WatchHistory | undefined = undefined;
   /** 诊断日志 */
   private diag: DiagLog | undefined = undefined;
+
+  /**
+   * 应用设置（播放 / 字幕）
+   *
+   * 为什么每次用都重新 get() 而不是缓存一份字段：
+   *   本页可能被"压"在路由栈里（用户从这里返回首页 → 进设置改一项 → 回来），
+   *   那时页面不会重建、@State 也不会刷新，缓存下来的旧值就会一直生效。
+   *   get() 读的是内存缓存，没有磁盘开销，所以每次按需要读最新的最省心。
+   */
+  private settings: AppSettings | undefined = undefined;
+
+  /**
+   * 是否已经按设置自动选过字幕轨
+   *
+   * 一个文件只自动选一次：快照是每 100ms 来的，不加这个闸门就会
+   * 反复把用户手动关掉的字幕又打开（那是最典型的"设置项打架"）。
+   */
+  private subtitleAutoApplied: boolean = false;
+
+  /**
+   * 是否在等"首帧上屏"才开播（2026-10-03 新增）
+   *
+   * 为什么要有这一步（用户反馈："点开东西还没渲染完就在放了"）：
+   *   原来软解一到 READY 就立刻 play()，音频与主时钟先跑起来，
+   *   而首帧还在解码/转换（有时还要等 surface 就绪）——
+   *   结果先响声音、画面还是黑的。
+   *   现在改成：READY 后**不立刻播**，等引擎把首帧渲染上屏
+   *   （快照里的 firstFrameRendered，由原生 POSITION 事件的 data2 带上来）再 play()。
+   *   引擎侧为此做了"预渲染"：未播放状态下也允许上屏一帧，否则会互等。
+   */
+  private awaitFirstFrame: boolean = false;
+
+  /**
+   * 等首帧的兜底超时（毫秒）
+   *
+   * 为什么必须有：纯音频文件、解码异常、surface 一直不就绪等情况永远不会
+   * 出现"首帧"。没有兜底就会**永远停在加载界面**——那比先响声音更糟。
+   * 超时后照常开播，让既有的错误处理去决定要不要报错。
+   *
+   * ★ 为什么是 20 秒（先后写过 3 秒、8 秒，都被真机打回）：
+   *   起播首帧的耗时取决于"seek + 从存储读那一帧"，实测同一台机器、
+   *   同一个 842MB 的 rmvb、同一个续播位置附近：快的时候 255ms，
+   *   慢的时候 18 秒（内存吃紧时页缓存被换出，要重新读盘）。
+   *   兜底超时短于它，就会在首帧之前开播 —— 正是要修掉的现象。实测日志：
+   *     · 3 秒版：发起等待后 3 秒内没有任何首帧信号 → 兜底先开播；
+   *     · 8 秒版：16:15:07.854 丢弃残留帧 → 16:15:15.903 超时开播（音频先响）
+   *               → 16:15:25.593 首帧才上屏（画面晚了 10 秒）。
+   *   而等待期间画面本来就是黑的、用户看到的是"正在缓冲…" ——
+   *   转圈等 seek 完成是播放器的常规行为，比"先响声音、画面还黑着"好。
+   *   纯音频文件不会等：beginFirstFrameWait 里有"没有视频轨就直接开播"的分支。
+   */
+  private static readonly FIRST_FRAME_TIMEOUT_MS: number = 20000;
+  private firstFrameTimer: number = -1;
+
+  /** 最近一次"位置发生变化"的时刻（毫秒），用于判定播放途中是否卡住 */
+  private lastPositionAtMs: number = 0;
+  /** 最近一次位置值（用于判断"变了没有"） */
+  private lastPositionValue: number = -1;
+
+  /**
+   * 收到首帧后要不要调用软解的 play()
+   *
+   * 软解：READY 时不立刻播，等首帧上屏后再 play（本标志为 true）。
+   * 系统 AVPlayer：prepared 时就得 play 才会出画，所以为 false。
+   */
+  private pendingSoftPlay: boolean = false;
+
+  /** 本场是否已经处理过 READY（READY 分支每 100ms 都会跑，必须闸住，见那里说明） */
+  private readyHandled: boolean = false;
+
+  /**
+   * 是否已经试过「软解失败 → 回退系统播放器」
+   *
+   * 只在"优先内置软解"这条我们自己选的通道上才允许回退，
+   * 且只回退一次，避免两个通道互相踢皮球。
+   */
+  private softToSystemTried: boolean = false;
   /** 本次续播的起点（毫秒） */
   private startPositionMs: number = 0;
   /** 上次落盘的时间戳，用于限制写盘频率 */
@@ -288,6 +380,8 @@ struct PlayerPage {
       const appCtx = this.getUIContext().getHostContext() as commonKit.UIAbilityContext;
       this.diag = new DiagLog(appCtx);
       this.history = new WatchHistory(appCtx);
+      // 应用设置（播放/字幕）也用同一个上下文创建；单例，别的页面改过就立刻可见
+      this.settings = appSettings(appCtx);
       this.diag.log('Player', 'aboutToAppear path=' + this.videoPath
         + ' startMs=' + this.startPositionMs.toString());
     } catch (err) {
@@ -317,12 +411,19 @@ struct PlayerPage {
           this.subtitleText = externalSubtitle.textAt(this.positionMs);
           this.writeDiag('已恢复外挂字幕: ' + externalSubtitle.name
             + ' 共 ' + count.toString() + ' 条');
+          return;
         }
+        // 没有"上次选中的外挂字幕"可恢复时，才轮到设置里的自动加载。
+        // 顺序不能反：用户手动选过的字幕优先级高于自动策略。
+        this.autoLoadSidecarSubtitle();
       }).catch((err: object) => {
         // 原先没有 catch：读盘失败会产生 unhandled rejection，
         // 而且失败原因彻底看不到。这里至少把它记进诊断日志。
         this.writeDiag('恢复外挂字幕失败: ' + JSON.stringify(err));
       });
+    } else {
+      // 本来就没有可恢复的外挂字幕，直接看设置要不要自动加载
+      this.autoLoadSidecarSubtitle();
     }
     // 字幕刷新定时器。100ms 与事件轮询同频 —— 字幕的时间精度本来
     // 就在几十毫秒量级，再密也没有意义，反而白耗电。
@@ -330,6 +431,8 @@ struct PlayerPage {
     this.subtitleTimer = setInterval(() => {
       this.refreshSubtitle();
       this.tickControlsAutoHide();
+      // 播放途中的卡顿判定（缺数据/解码跟不上 → 显示加载指示）
+      this.tickBuffering();
     }, 100);
   }
 
@@ -345,26 +448,41 @@ struct PlayerPage {
   private refreshSubtitle(): void {
     const sc: SoftPlayerController | undefined = this.softCtl;
     const extReady: boolean = this.usingExternalSubtitle && externalSubtitle.loaded;
+    const embeddedReady: boolean = sc !== undefined && this.currentSubtitleIndex >= 0;
     if (this.showTrackPanel) {
       // 面板打开时不刷新：面板是模态的，字幕跟着动反而干扰阅读
       return;
     }
-    if (extReady) {
+    // ★ 2026-10-03：来源优先级改为按设置决定（原来是把"外挂优先"写死的）。
+    //   为什么默认仍然是外挂优先：用户主动去选一个外挂字幕，就是明确表示
+    //   "我要用这个"；但有些用户就是想要内嵌的（外挂可能是机翻），
+    //   所以给一个开关。两边都有内容时按设置选一个，绝不同时显示两行。
+    const preferExt: boolean = this.cfg().preferExternalSubtitle;
+    const useExt: boolean = extReady && (preferExt || !embeddedReady);
+    if (useExt) {
       const t: string = externalSubtitle.textAt(this.positionMs);
       if (t !== this.subtitleText) {
         this.subtitleText = t;
       }
       return;
     }
-    if (sc === undefined) {
-      if (this.subtitleText.length > 0) {
-        this.subtitleText = '';
+    if (embeddedReady) {
+      const t2: string = sc!.getActiveSubtitle();
+      if (t2 !== this.subtitleText) {
+        this.subtitleText = t2;
       }
       return;
     }
-    const t2: string = sc.getActiveSubtitle();
-    if (t2 !== this.subtitleText) {
-      this.subtitleText = t2;
+    if (extReady) {
+      // 内嵌不可用而外挂可用（例如内嵌是位图字幕）—— 仍然显示外挂
+      const t3: string = externalSubtitle.textAt(this.positionMs);
+      if (t3 !== this.subtitleText) {
+        this.subtitleText = t3;
+      }
+      return;
+    }
+    if (this.subtitleText.length > 0) {
+      this.subtitleText = '';
     }
   }
 
@@ -384,6 +502,10 @@ struct PlayerPage {
       clearInterval(this.subtitleTimer);
       this.subtitleTimer = -1;
     }
+    // 等首帧的兜底定时器也要撤掉：页面没了它还可能触发，
+    // 那时会去调用已经释放的软解控制器
+    this.awaitFirstFrame = false;
+    this.clearFirstFrameTimer();
     // ★ 第一步：先解绑 surface，再往下走。
     //
     //   顺序在这里是决定性的。XComponent 随页面销毁时，ArkUI 会析构它的
@@ -459,8 +581,13 @@ struct PlayerPage {
         this.mainWindow = win;
         win.setWindowLayoutFullScreen(true);
         win.setWindowSystemBarEnable([]);
-        // 进入播放页时允许随传感器自动旋转
-        win.setPreferredOrientation(window.Orientation.AUTO_ROTATION_UNSPECIFIED);
+        // ★ 2026-10-03：设置里的「允许跟随设备旋转」在这里生效。
+        //   允许 → AUTO_ROTATION_UNSPECIFIED（跟随传感器）
+        //   不允许 → PORTRAIT（固定竖屏，仍可用右上角按钮手动全屏）
+        const allowRotate: boolean = this.cfg().allowAutoRotate;
+        win.setPreferredOrientation(allowRotate
+          ? window.Orientation.AUTO_ROTATION_UNSPECIFIED
+          : window.Orientation.PORTRAIT);
       }).catch((err: BusinessError) => {
         console.error('setupWindow failed: ' + JSON.stringify(err));
       });
@@ -508,6 +635,151 @@ struct PlayerPage {
       || lower.startsWith('rtmps://');
   }
 
+  /** 当前设置（未初始化时用默认值，保证任何路径下都有确定行为） */
+  private cfg(): SettingsData {
+    const s: AppSettings | undefined = this.settings;
+    return s !== undefined ? s.get() : defaultSettings();
+  }
+
+  // ==================== 起播等待首帧 + 缓冲指示（2026-10-03 新增） ====================
+
+  /**
+   * 开始等首帧：显示加载指示，等引擎报"首帧已上屏"后才真正开播
+   *
+   * @param startSoftPlay 收到首帧后要不要调用软解的 play()
+   *        （系统 AVPlayer 那条路不需要——它在 prepared 时就得 play 才会出画）
+   */
+  /**
+   * 开始等首帧：显示加载指示，等引擎报"首帧已上屏"后才真正开播
+   *
+   * @param startSoftPlay 收到首帧后要不要调用软解的 play()
+   *        （系统 AVPlayer 那条路不需要——它在 prepared 时就得 play 才会出画）
+   * @param videoWidth 视频宽（软解快照里的画面宽度）。<= 0 表示这个文件
+   *        根本没有视频轨（纯音频），那就**不该等首帧** —— 等不到，白等 8 秒。
+   */
+  private beginFirstFrameWait(startSoftPlay: boolean, videoWidth: number): void {
+    this.clearFirstFrameTimer();
+
+    if (startSoftPlay && videoWidth <= 0) {
+      this.writeDiag('该文件没有视频轨，不等待首帧，直接开播');
+      this.softCtl?.play();
+      return;
+    }
+    this.awaitFirstFrame = true;
+    this.buffering = true;
+    this.pendingSoftPlay = startSoftPlay;
+    this.writeDiag('等首帧：startSoftPlay=' + startSoftPlay.toString()
+      + ' startMs=' + this.startPositionMs.toString());
+    this.firstFrameTimer = setTimeout(() => {
+      this.firstFrameTimer = -1;
+      if (this.disposed || !this.awaitFirstFrame) {
+        return;
+      }
+      // 兜底：等不到首帧也必须开播（否则永远停在加载界面）
+      this.writeDiag('等首帧超时 ' + PlayerPage.FIRST_FRAME_TIMEOUT_MS.toString()
+        + 'ms，照常开播');
+      this.awaitFirstFrame = false;
+      this.buffering = false;
+      if (this.pendingSoftPlay) {
+        this.softCtl?.play();
+      }
+    }, PlayerPage.FIRST_FRAME_TIMEOUT_MS);
+  }
+
+  /** 撤掉等首帧的兜底定时器 */
+  private clearFirstFrameTimer(): void {
+    if (this.firstFrameTimer >= 0) {
+      clearTimeout(this.firstFrameTimer);
+      this.firstFrameTimer = -1;
+    }
+  }
+
+  /**
+   * 位置更新统一入口（软解与系统 AVPlayer 两条路都走这里）
+   *
+   * 职责：
+   *   ① 记录"位置在动"，用于判定播放途中是否卡住；
+   *   ② 若在等首帧，且位置已经到达目标（续播 seek 时不能停在旧位置的画面上），
+   *      就结束等待、开始播放。
+   *
+   * @param posMs 当前位置
+   * @param firstFrameSignal 原生是否明确报了"首帧已上屏"
+   */
+  private notePosition(posMs: number, firstFrameSignal: boolean, firstFramePtsMs: number): void {
+    if (posMs !== this.lastPositionValue) {
+      this.lastPositionValue = posMs;
+      this.lastPositionAtMs = Date.now();
+      // 位置一动，就不再是"缓冲中"
+      if (this.buffering && !this.awaitFirstFrame) {
+        this.buffering = false;
+      }
+    }
+    if (!this.awaitFirstFrame) {
+      return;
+    }
+
+    // 续播时：引擎的预渲染发生在 seek 之前，报上来的很可能是"文件开头"那一帧。
+    // 判定要用**首帧自己的 pts**（firstFramePtsMs），不能用快照的 positionMs ——
+    // seek 完成后引擎还会发一条 POSITION（内容是续播目标），
+    // 两条事件落在同一次轮询里时 positionMs 会被那条覆盖，
+    // 于是"开头那一帧"会被误判成"已到续播位置"，用户先看到开头闪一下。
+    if (this.startPositionMs > 0 && firstFramePtsMs < this.startPositionMs - 1000) {
+      return;
+    }
+    // ★★ 只认原生明确的"首帧已上屏"信号（POSITION 事件 data2 == 1）★★
+    //
+    //   ⚠️ 不能拿"位置是个有效值"当依据 —— 这是一个实测踩到的真 bug：
+    //     · seek 完成时引擎也会发一条 POSITION（内容就是续播目标位置）；
+    //     · 那条的 data2 = 0（不是首帧信号），而当时我的判断写成
+    //       `!firstFrameSignal && posMs < 0` —— posMs 明明是正的目标位置，
+    //       于是这条被当成了"首帧就绪"，play() 提前发出：
+    //         [Buf] beginFirstFrameWait videoWidth=1024 startMs=3233277
+    //         [Buf] notePosition pos=3233277 signal=false   ← 这就是 seek 那条
+    //         音频线程已启动                                ← 比"已上屏 1 帧"早 155ms
+    //     结果就是声音仍然抢在画面之前 —— 正是要修掉的现象。
+    //   现在只认 data2 带来的信号，位置值仅用于"续播是否已到位"的附加判断。
+    if (!firstFrameSignal) {
+      return;
+    }
+    this.writeDiag('首帧已上屏 pos=' + posMs.toString()
+      + ' firstFrameSignal=' + firstFrameSignal.toString() + ' → 开始播放');
+    this.awaitFirstFrame = false;
+    this.buffering = false;
+    this.clearFirstFrameTimer();
+    if (this.pendingSoftPlay) {
+      this.softCtl?.play();
+    }
+  }
+
+  /**
+   * 播放途中的卡顿判定（由 100ms 轮询驱动）
+   *
+   * ★ 判定写成**对称**的：位置超过 900ms 没动 → 显示；位置又动了 → 撤掉。
+   *   为什么不能只在 notePosition 里去撤：那条路只在快照有变化时才会跑到，
+   *   实测出现过"引擎明明在出帧、进度条也在走，加载指示却一直挂着"的情况
+   *   （暂停/继续之后触发）。tick 是每 100ms 无条件跑的，用它兜住最稳。
+   */
+  private tickBuffering(): void {
+    if (this.disposed || this.awaitFirstFrame) {
+      return;
+    }
+    if (!this.playing || this.dragging || this.errorMsg.length > 0) {
+      if (this.buffering) {
+        this.buffering = false;
+      }
+      return;
+    }
+    if (this.lastPositionAtMs <= 0) {
+      return;
+    }
+    const idleMs: number = Date.now() - this.lastPositionAtMs;
+    if (idleMs > 900) {
+      this.buffering = true;
+    } else if (this.buffering) {
+      this.buffering = false;
+    }
+  }
+
   /** 创建 AVPlayer 并注册回调 */
   private createPlayer(): void {
     // ---- 第零步：网络流单独一条通道 ----
@@ -523,12 +795,42 @@ struct PlayerPage {
     // 实测「系统解不开」的后缀直接交给软解，不让用户先看到一次格式不支持的错误
     const tier: MediaTier = mediaTierOf(this.videoPath);
     this.writeDiag('tier=' + tier.toString() + ' for ' + this.videoPath);
+
+    // ★ 2026-10-03：设置里的「解码方式」在这里生效。
+    //   PREFER_SOFT = 连系统本来能播的格式（mp4/mkv…）也先走内置软解 ——
+    //   好处是字幕/音轨的控制完全统一（系统那条通道的自字幕我们管不了），
+    //   代价是更耗电。失败时会自动回退系统（见 onSoftUpdate 的软解失败分支）。
+    const preferSoft: boolean = this.cfg().decodePreference === DecodePreference.PREFER_SOFT;
+    // ★ 通道决策日志：这台播放器有"系统硬解"和"内置软解"两条通道，
+    //   出问题时第一个要回答的就是"这次走了哪条、为什么"。
+    //   把设置原值和"设置存储是否就绪"一起打出来 —— 少任何一项都得靠猜。
+    console.info('[Route] tier=' + tier.toString()
+      + ' preferSoft=' + preferSoft.toString()
+      + ' decodeCfg=' + this.cfg().decodePreference.toString()
+      + ' settingsReady=' + (this.settings !== undefined).toString()
+      + ' path=' + this.videoPath);
     if (tier === MediaTier.NEEDS_SOFT_DECODE) {
       this.writeDiag('后缀属于系统不支持的容器，直接走软解');
       this.startSoftPlayer();
       return;
     }
+    if (preferSoft) {
+      this.writeDiag('设置：优先内置软解 → 本文件也先走软解');
+      this.startSoftPlayer();
+      return;
+    }
 
+    this.createSystemPlayer();
+  }
+
+  /**
+   * 走系统播放器（AVPlayer）通道
+   *
+   * 为什么从 createPlayer 里拆出来：
+   *   「优先内置软解」失败时需要回退到这条通道，而那时不能重跑 createPlayer
+   *   —— 它会再次按设置判断、又切回软解，变成两个通道互相踢皮球。
+   */
+  private createSystemPlayer(): void {
     // ---- 第一步：打开文件拿到 fd ----
     // AVPlayer 的 url 只接受 fd:// 或 http(s):// 形式，绝对路径会直接报
     // 「401 Invalid Parameter: not fd:// or network address」，
@@ -707,6 +1009,15 @@ struct PlayerPage {
       this.writeDiag('看门狗触发：playing 但 ' + this.videoPath
         + ' 始终无画面尺寸 dur=' + this.durationMs.toString()
         + ' aspect 仍为占位值 → 判定为容器能开、编码解不了，回退软解');
+      // ★ 2026-10-03：设置里关掉自动回退时，看门狗只提示、不切通道。
+      //   为什么不直接强制回退：那样这个开关就没有意义了。
+      //   为什么也不报错页：音频还在正常播，报错页会把"能听"也一起停掉，
+      //   用户只是看不到画面而已 —— 提示一句、让用户自己去设置里打开回退更合适。
+      if (!this.cfg().autoFallbackSoft) {
+        this.writeDiag('自动回退软解已在设置中关闭，保持系统通道');
+        showToast('画面可能无法显示：系统解码不支持该编码，且已在设置里关闭自动回退软解');
+        return;
+      }
       this.fallbackToSoft('播放中始终无画面（疑似视频编码不支持）');
     }, 3500);
   }
@@ -740,6 +1051,141 @@ struct PlayerPage {
   }
 
   /**
+   * 「优先内置软解」失败时回退到系统播放器
+   *
+   * 为什么必须有这一步：
+   *   「优先软解」是用户在设置里选的策略，不是"这个文件只能软解"的结论。
+   *   如果软解对它无能为力（罕见编码、软解构建里没带的格式），
+   *   一个设置项就把本来能播的文件变成播不了 —— 那不能接受。
+   *   所以软解失败时给系统播放器一次机会。
+   *
+   * 只在两种情况下回退：
+   *   · 确实是"优先软解"策略把我们带到这条通道的
+   *   · 且该容器系统本来就可能支持（TIER_PLAYABLE）；RMVB/WMV 这类
+   *     系统必然不支持，回退只会白白多等一次失败
+   */
+  private shouldFallbackToSystem(): boolean {
+    if (this.softToSystemTried || this.isNetworkUrl(this.videoPath)) {
+      return false;
+    }
+    if (this.cfg().decodePreference !== DecodePreference.PREFER_SOFT) {
+      return false;
+    }
+    // PLAYABLE / MAYBE_PLAYABLE 都值得让系统试一次；
+    // NEEDS_SOFT_DECODE（RMVB/WMV 这类）系统必然不支持，回退只会白等一次失败
+    const tier: MediaTier = mediaTierOf(this.videoPath);
+    return tier === MediaTier.PLAYABLE || tier === MediaTier.MAYBE_PLAYABLE;
+  }
+
+  /** 释放软解、改走系统播放器（只做一次） */
+  private fallbackToSystem(reason: string): void {
+    if (this.softToSystemTried) {
+      return;
+    }
+    this.softToSystemTried = true;
+    this.writeDiag('回退到系统播放器，原因：' + reason);
+    const c: SoftPlayerController | undefined = this.softCtl;
+    this.softCtl = undefined;
+    this.usingSoft = false;
+    if (c !== undefined) {
+      c.release();
+    }
+    this.errorMsg = '';
+    this.preparing = true;
+    this.prepared = false;
+    this.avState = 'idle';
+    this.usingExternalSubtitle = false;
+    this.currentSubtitleIndex = -1;
+    this.createSystemPlayer();
+  }
+
+  /**
+   * 按设置自动加载同目录外挂字幕
+   *
+   * 只在"用户没有手动选过字幕"的路径上调用（见 aboutToAppear），
+   * 且只在设置打开时才动作。同名文件优先 —— 同名的几乎一定就是它。
+   */
+  private autoLoadSidecarSubtitle(): void {
+    if (!this.cfg().autoLoadSidecar) {
+      return;
+    }
+    const list: SubtitleCandidate[] = this.sidecarCandidates;
+    if (list.length === 0) {
+      return;
+    }
+    let pick: SubtitleCandidate = list[0];
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].sameName) {
+        pick = list[i];
+        break;
+      }
+    }
+    this.writeDiag('设置：自动加载同目录外挂字幕 ' + pick.name);
+    this.useSidecarSubtitle(pick).catch((err: object) => {
+      this.writeDiag('自动加载外挂字幕失败: ' + JSON.stringify(err));
+    });
+  }
+
+  /**
+   * 按设置挑一条内嵌字幕轨（一个文件只做一次）
+   *
+   * 三种策略：
+   *   跟随文件默认 —— 优先容器标记的默认轨，没有就取第一条可解码的
+   *   中文优先 / 英文优先 —— 只挑语言匹配的；一条都不匹配时**不启用**
+   *     （宁可不显示，也不要给用户一条语言不对的字幕）
+   *   不自动启用 —— 完全不碰
+   *
+   * @param tracks 文件里的字幕轨
+   * @param current 引擎当前生效的轨下标（>=0 说明引擎自己选了，我们不抢）
+   */
+  private applySubtitlePreference(tracks: SoftSubtitleTrack[], current: number): void {
+    if (this.subtitleAutoApplied || tracks.length === 0) {
+      return;   // 还没有轨道信息时等下一次快照，不消耗这一次机会
+    }
+    this.subtitleAutoApplied = true;
+    const cfg: SettingsData = this.cfg();
+    if (cfg.subtitleLanguage === SubtitleLanguage.OFF) {
+      this.writeDiag('设置：不自动启用字幕');
+      return;
+    }
+    if (current >= 0 || this.usingExternalSubtitle) {
+      // 引擎已经选了一条，或外挂字幕已经在用 —— 都不该再叠一条上去
+      return;
+    }
+    let pick: number = -1;
+    if (cfg.subtitleLanguage === SubtitleLanguage.AUTO) {
+      for (let i = 0; i < tracks.length; i++) {
+        if (tracks[i].isDefault && tracks[i].supported) {
+          pick = tracks[i].index;
+          break;
+        }
+      }
+      if (pick < 0) {
+        for (let i = 0; i < tracks.length; i++) {
+          if (tracks[i].supported) {
+            pick = tracks[i].index;
+            break;
+          }
+        }
+      }
+    } else {
+      for (let i = 0; i < tracks.length; i++) {
+        const t: SoftSubtitleTrack = tracks[i];
+        if (t.supported && trackMatchesLanguage(t.language, t.title, cfg.subtitleLanguage)) {
+          pick = t.index;
+          break;
+        }
+      }
+    }
+    if (pick < 0) {
+      this.writeDiag('设置：没找到匹配的内嵌字幕轨，保持关闭');
+      return;
+    }
+    this.chooseEmbeddedSubtitle(pick);
+    this.writeDiag('设置：自动启用内嵌字幕 index=' + pick.toString());
+  }
+
+  /**
    * 启动软解通道
    * 软解直接按文件路径打开（FFmpeg 自己处理解封装），不走 fd
    */
@@ -761,7 +1207,10 @@ struct PlayerPage {
       this.errorMsg = '软解播放器创建失败';
       return;
     }
-    if (!ctl.prepare(this.videoPath)) {
+    // ★ 2026-10-03：续播起点**在这里**交给引擎（而不是等 READY 后再 seek）。
+    //   引擎会"打开 → 跳到起点 → 预渲染第一帧"，于是上层拿到的首帧
+    //   就是续播位置那一帧；否则首帧是文件开头，只能靠超时兜底才敢开播。
+    if (!ctl.prepare(this.videoPath, this.startPositionMs)) {
       // prepare 的同步失败已经在 onSoftUpdate 里通过 error 快照报出来了
       this.preparing = false;
     }
@@ -770,6 +1219,12 @@ struct PlayerPage {
   /** 软解状态更新（在 JS 线程被调用） */
   private onSoftUpdate(snap: SoftPlayerSnapshot): void {
     if (snap.error.length > 0) {
+      // ★ 2026-10-03：软解失败时，如果是"优先软解"策略把它带到这条通道的，
+      //   给系统播放器一次机会（否则一个设置项就能让能播的文件播不了）。
+      if (this.shouldFallbackToSystem()) {
+        this.fallbackToSystem('软解失败：' + snap.error);
+        return;
+      }
       this.preparing = false;
       this.errorMsg = '软解失败：' + snap.error;
       return;
@@ -798,6 +1253,10 @@ struct PlayerPage {
     if (!this.dragging) {
       this.positionMs = snap.positionMs;
     }
+    // ★ 2026-10-03：位置更新统一走 notePosition —— 它负责
+    //   ①判定"播放途中是否卡住"（卡住就显示加载指示）
+    //   ②起播时等到首帧上屏/位置到位后才真正开播
+    this.notePosition(snap.positionMs, snap.firstFrameRendered, snap.firstFramePtsMs);
 
     // ★ 轨道状态跟着快照同步，不要只在打开面板时才刷新。
     //
@@ -838,6 +1297,24 @@ struct PlayerPage {
     if (st === SoftPlayerState.READY) {
       this.preparing = false;
       this.errorMsg = '';
+      // ★★ 2026-10-03：READY 分支**每 100ms 都会跑一次**，里面的动作必须闸住 ★★
+      //
+      //   这是一个实测抓到的真 bug：原来这里无脑做两件事 ——
+      //     · `seekTo(startPositionMs)`（续播）
+      //     · 起播（现在改成"等首帧"）
+      //   状态从 READY 走到 PLAYING 期间会经过很多次快照，于是**seek 被反复下发**：
+      //     日志实测每 100ms 一条「解复用线程已 seek 到 3273325 ms 并清空队列」，
+      //     解码器被一次次拉回目标点，首帧永远来不及解出来，
+      //     最终只能靠上层的兜底超时开播 —— 而那时声音又抢在了画面之前。
+      //   以前 READY 只停留几十毫秒，这个重复恰好没被看见；等首帧把 READY
+      //   拉长到几秒之后它就成了主要矛盾。
+      //   现在整场只处理一次（换文件会重建页面，标志随之重置）。
+      if (this.readyHandled) {
+        return;
+      }
+      this.readyHandled = true;
+      // 按字幕设置挑内嵌字幕轨（内部还有一次自己的闸门，双保险）
+      this.applySubtitlePreference(snap.subtitleTracks, snap.currentSubtitleIndex);
       // 就绪即播：续播起点用 seekTo 处理（软解在 READY 态接受 seek）
       //
       // 诊断：这里必须记下"决定要不要 seek"的三个输入。
@@ -848,11 +1325,14 @@ struct PlayerPage {
         + ' snapDur=' + snap.durationMs.toString()
         + ' thisDur=' + this.durationMs.toString()
         + ' 将seek=' + ((this.startPositionMs > 0 && snap.durationMs > 0) ? '是' : '否'));
-      if (this.startPositionMs > 0 && snap.durationMs > 0) {
-        this.softCtl?.seekTo(this.startPositionMs);
-        this.writeDiag('soft 已发起 seekTo(' + this.startPositionMs.toString() + ')');
-      }
-      this.softCtl?.play();
+      // ★ 续播 seek 已经在 startSoftPlayer 里通过 prepare(path, startMs) 交给引擎了
+      //   （引擎在预渲染之前完成跳转），这里刻意**不再补一次 seek** ——
+      //   补的话会把刚预渲染好的位置再次打乱。
+      this.writeDiag('soft READY: 续播位置由引擎在 Prepare 阶段处理 startMs='
+        + this.startPositionMs.toString());
+      // ★ 2026-10-03：不在这里直接 play() —— 先等首帧上屏再播（见 beginFirstFrameWait）。
+      //   引擎已做"预渲染"：未播放状态也允许上屏一帧，所以不会互等。
+      this.beginFirstFrameWait(true, snap.width);
     } else if (st === SoftPlayerState.PLAYING) {
       this.playing = true;
       this.preparing = false;
@@ -931,6 +1411,13 @@ struct PlayerPage {
         p.play().catch((err: BusinessError) => {
           this.writeDiag('自动播放失败: ' + err.code.toString() + ' ' + err.message);
         });
+        // ★ 2026-10-03：系统 AVPlayer 这条通道**不能**像软解那样"等首帧再播"
+        //   —— 它必须先 play() 才会解码出画。所以这里照旧立即 play()，
+        //   但把加载指示挂起来：等第一条 timeUpdate（首位位置更新）到达才撤掉，
+        //   那之前用户看到的是"正在缓冲"，而不是黑屏。
+        //   同样带兜底超时：万一位置一直不来，也必须撤掉指示，不能一直挡着。
+        //   第二个参数传 1（当作"有视频轨"）：系统通道不靠它判断，只是为了接口统一。
+        this.beginFirstFrameWait(false, 1);
       } else if (state === 'playing') {
         this.playing = true;
         this.preparing = false;
@@ -969,6 +1456,10 @@ struct PlayerPage {
       if (!this.dragging) {
         this.positionMs = time;
       }
+      // ★ 2026-10-03：系统通道也走统一的位置入口 —— 它的"首帧已上屏"信号
+      //   就是第一条 timeUpdate（AVPlayer 没有首帧回调，这是最接近的等价物）。
+      // 系统通道没有"首帧 pts"这个概念，直接用它自己的位置（timeUpdate 的 time）
+      this.notePosition(time, true, time);
       // 进度诊断：每 10 次回调记一次，用于核对滑块数值与总长是否匹配
       this.tickCount++;
       if (this.tickCount % 10 === 0) {
@@ -1014,7 +1505,9 @@ struct PlayerPage {
       // ★ 系统不支持这个格式时，自动换软解再试一次。
       //   只对「格式不支持」这一类回退：其它错误（权限、文件损坏）软解也救不了，
       //   盲目回退只会把真实错误掩盖成一个更慢的失败。
-      if (this.isUnsupportedFormat(err.code) && !this.usingSoft && !this.softFallbackTried) {
+      //   2026-10-03：回退开关受设置控制（默认开）。
+      if (this.isUnsupportedFormat(err.code) && !this.usingSoft && !this.softFallbackTried
+          && this.cfg().autoFallbackSoft) {
         this.fallbackToSoft('AVPlayer ' + err.code.toString());
         return;
       }
@@ -1151,6 +1644,11 @@ struct PlayerPage {
   private persistProgress(position: number, duration: number): void {
     if (this.isNetworkUrl(this.videoPath)) {
       return;   // 静默跳过，不必写诊断日志刷屏
+    }
+    // ★ 2026-10-03：设置里的「记住播放进度」在这里生效。
+    //   关掉之后不再写观看历史 —— 首页的「继续观看」也就不会再出现新记录。
+    if (!this.cfg().rememberProgress) {
+      return;
     }
     if (this.history === undefined) {
       this.writeDiag('persist SKIPPED: history undefined, pos=' + position.toString());
@@ -2130,15 +2628,18 @@ struct PlayerPage {
           //   alignContent(Bottom) 就是"贴底"，余量用 margin 给。
           if (this.subtitleText.length > 0) {
             Text(this.subtitleText)
-              .fontSize(18)
+              // ★ 2026-10-03：字号与底衬来自「字幕设置」（默认 18px、底衬开）
+              .fontSize(subtitleFontPx(this.cfg().subtitleFontSize))
               .fontColor(Color.White)
               .maxLines(3)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .textAlign(TextAlign.Center)
               .padding({ left: 12, right: 12, top: 6, bottom: 6 })
               // 半透明底衬：白色字幕压在亮画面上会看不清，
-              // 而描边在 ArkUI 里要配多个 Text 叠放，代价大于收益
-              .backgroundColor('rgba(0,0,0,0.45)')
+              // 而描边在 ArkUI 里要配多个 Text 叠放，代价大于收益。
+              // 关掉后字幕直接压在画面上（有些用户就是不喜欢那条黑底）。
+              .backgroundColor(this.cfg().subtitleBackground
+                ? 'rgba(0,0,0,0.45)' : 'rgba(0,0,0,0.0)')
               .borderRadius(6)
               .width('92%')
               // 离画面底边留一点距离，避免紧贴边缘
@@ -2151,6 +2652,32 @@ struct PlayerPage {
         .height(this.computeVideoHeight())
         // position 以父容器左上角为原点，算出居中偏移
         .position({ x: this.computeVideoX(), y: this.computeVideoY() })
+      }
+
+      // ---------- 1.5 加载/缓冲指示（2026-10-03 新增） ----------
+      //
+      //   ⚠️ 位置很重要：**在视频层之上、控制层之下**。
+      //     · 在视频层之上：才能盖住"还没画出来的黑屏"和预渲染的那一帧；
+      //     · 在控制层之下：底部的进度条/按钮依然可点，用户能照常操作；
+      //     · hitTestBehavior(Transparent)：不吃点击，"点画面显隐控制层"照旧生效。
+      //   什么时候出现：① 已就绪但首帧还没上屏（起播等待）；
+      //                ② 播放途中 900ms 没有任何位置更新（缺数据/解码跟不上）。
+      if (this.buffering) {
+        Column({ space: 12 }) {
+          LoadingProgress()
+            .width(46)
+            .height(46)
+            .color(Theme.ACCENT)
+          Text('正在缓冲…')
+            .fontSize(13)
+            .fontColor('rgba(255,255,255,0.85)')
+        }
+        .width('100%')
+        .height('100%')
+        .justifyContent(FlexAlign.Center)
+        // 半透明底：既不彻底遮住画面（用户能看到"有画面了"），又能压住噪声
+        .backgroundColor('rgba(0,0,0,0.35)')
+        .hitTestBehavior(HitTestMode.Transparent)
       }
 
       // ---------- 2. 控制层：顶栏 ⟶ Blank 撑开 ⟶ 底栏 ----------

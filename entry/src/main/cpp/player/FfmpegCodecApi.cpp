@@ -105,6 +105,26 @@ struct PacketQueue {
     std::deque<AVPacket *> packets;
     /** 容量上限 */
     size_t limit = 512;
+    /** 累计"因队列满而阻塞"的微秒数（诊断：谁卡住了单解复用线程） */
+    std::atomic<int64_t> blockedUs{0};
+    /** 累计入队包数（诊断） */
+    int64_t pushedCount = 0;
+    /** 当前队列深度（诊断用，加锁读） */
+    size_t Depth() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return packets.size();
+    }
+    /** 取走累计阻塞时长（微秒）并清零（按窗口统计） */
+    int64_t TakeBlockedUs() {
+        return blockedUs.exchange(0);
+    }
+    /** 取走累计入队包数并清零 */
+    int64_t TakePushedCount() {
+        std::lock_guard<std::mutex> lock(mutex);
+        const int64_t n = pushedCount;
+        pushedCount = 0;
+        return n;
+    }
     /** 生产者已结束（到达文件尾） */
     bool eof = false;
     /** 会话正在关闭：唤醒所有等待者并让它们退出 */
@@ -132,13 +152,21 @@ struct PacketQueue {
             return false;
         }
         std::unique_lock<std::mutex> lock(mutex);
+        // ★ 2026-10-03：统计"队列满导致生产者阻塞"的时长。
+        //   为什么必须量出来：本工程是**单解复用线程按文件顺序读包**，
+        //   任何一条队列满都会把这条线程整体卡住 —— 音频队列一满，
+        //   视频包就断了供，表现为"画面一阵一阵"（真机实测视频侧
+        //   30 帧里有 1 秒在等包）。没有这个数字就只能猜是谁卡的谁。
+        const int64_t waitT0 = NowUs();
         notFull.wait(lock, [this] { return abort || packets.size() < limit; });
+        blockedUs.fetch_add(NowUs() - waitT0);
         if (abort) {
             lock.unlock();
             av_packet_free(&copy);
             return false;
         }
         packets.push_back(copy);
+        pushedCount++;
         lock.unlock();
         notEmpty.notify_one();
         return true;
@@ -553,6 +581,14 @@ struct DecoderSession {
      * 报 AVERROR_INVALIDDATA。详见 DecodeVideoFrame 开头的说明。
      */
     int64_t videoPacketGen = 0;
+    /**
+     * 解复用线程上一次打印"供包情况"的时间（毫秒）
+     *
+     * 见 DemuxLoop 里那段 2 秒一次的诊断：它把"供包慢"和"解码慢"分开，
+     * 这是"画面一卡一快"最容易走错方向的地方。
+     */
+    int64_t demuxLogMs = 0;
+
     /** 音频侧同理 */
     int64_t audioPacketGen = 0;
 
@@ -1830,7 +1866,30 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
     s->videoQueue = std::make_unique<PacketQueue>();
     s->audioQueue = std::make_unique<PacketQueue>();
     s->videoQueue->limit = 512;
-    s->audioQueue->limit = 512;
+    // ★★ 2026-10-03：音频队列从 512 提到 1024 —— 修「画面一卡一快 + 越播越不同步」★★
+    //
+    //   真机实测（第五指令BD1024高清中英双字.rmvb，加了供包诊断后）：
+    //     demux(近2043ms): 视频包=44 音频包=88 |
+    //     阻塞: 视频=0ms 音频=2036ms | 深度: 视频=296 音频=512
+    //   也就是：**音频队列 100% 时间是满的**，而单解复用线程是按文件顺序读包的
+    //   ——音频队列一满，整条解复用线程就被卡住（每次推音频包要等 23ms，
+    //   正好等于音频的实时消费速率），视频包只能"搭着"音频包一起往前挪。
+    //
+    //   为什么这会让画面一卡一快：
+    //     · 音频解码端能消费多少，取决于环形缓冲（2 秒），
+    //       而队列容量 512 包 ≈ 11 秒音频 —— 远超它真正能吃掉的数量。
+    //       于是队列开场就被填满并长期保持满，解复用线程等于被"焊死"，
+    //       视频队列能攒下多少包，全看开场那一下的运气。
+    //     · 运气不好（视频队列 ≈ 0）时，视频线程每解一帧都要等包（实测
+    //       30 帧里有 1 秒在等、空转 62%），一帧一帧被供包节奏推着走，
+    //       解码+转换+上屏再也叠不起来 → 表现为忽快忽慢，且平均速度
+    //       低于片源帧率 → 越播越落后（实测落后音频 4~5 秒）。
+    //     · 而环形缓冲只有 2 秒、音频解码本来就吃不下 11 秒的队列，
+    //       所以把队列开大**不会**让音频更超前，只是让解复用线程能继续往前读、
+    //       把视频包也一并攒进视频队列（视频队列会先于音频队列填满，
+    //       之后解复用的节奏就由视频消费驱动，音频仍然供得上）。
+    //   取值：1024 包 ≈ 47 秒音频、约 2MB；配合视频 512 包，总量可控。
+    s->audioQueue->limit = 1024;
     // 字幕队列只在启用字幕时才建。容量小得多（128）：
     // 字幕包很小，而且一次只需要"当前时间附近"的几条 ——
     // 队列太长只会让已经过期的字幕堆积（消费端会丢弃过期的，见 ReadSubtitleEvent）。
@@ -1869,6 +1928,34 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
                     LOGI("解复用线程已 seek 到 %{public}lld ms 并清空队列",
                          static_cast<long long>(target));
                 }
+                // ①.5 每 2 秒打一次供包情况（2026-10-03 新增，用于定位
+                //     "画面一卡一快"到底是解码慢还是供包慢）：
+                //       · 视频/音频各自的入队包数
+                //       · 两条队列的**阻塞时长**——单线程解复用，谁满都卡住整条线
+                //       · 当前队列深度（深度长期贴 0 说明消费端抢得凶；
+                //         深度长期贴上限说明生产端被对面的队列卡住）
+                //     ⚠️ 别用"包 pts 推进量"当供片速率：实测视频包 pts 的推进
+                //        只有 0.90x，看着像"供片不足"，但同期引擎侧帧时间戳
+                //        明明是 1.00x（24.4 帧/秒 × 41ms）—— 因为一个包不等于
+                //        一帧、pts 也不是每个包都推进。这个坑我踩过，别再加回来。
+                {
+                    const int64_t nowDm = NowUs() / 1000;
+                    if (nowDm - s->demuxLogMs >= 2000) {
+                        const int64_t windowMs = nowDm - s->demuxLogMs;
+                        s->demuxLogMs = nowDm;
+                        const int64_t vb = s->videoQueue->TakeBlockedUs() / 1000;
+                        const int64_t ab = s->audioQueue->TakeBlockedUs() / 1000;
+                        const int64_t vc = s->videoQueue->TakePushedCount();
+                        const int64_t ac = s->audioQueue->TakePushedCount();
+                        LOGI("demux(近%{public}lldms): 视频包=%{public}lld 音频包=%{public}lld | "
+                             "阻塞: 视频=%{public}lldms 音频=%{public}lldms | "
+                             "深度: 视频=%{public}zu 音频=%{public}zu",
+                             static_cast<long long>(windowMs),
+                             static_cast<long long>(vc), static_cast<long long>(ac),
+                             static_cast<long long>(vb), static_cast<long long>(ab),
+                             s->videoQueue->Depth(), s->audioQueue->Depth());
+                    }
+                }
                 // ② 读一个包
                 av_packet_unref(pkt);
                 const int rret = av_read_frame(s->fmtCtx, pkt);
@@ -1899,10 +1986,12 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
                 bool pushed = true;
                 if (pkt->stream_index == s->videoStreamIndex) {
                     s->videoPacketGen = curGen;
+
                     pushed = s->videoQueue->Push(pkt);
                 } else if (s->audioStreamIndex >= 0
                            && pkt->stream_index == s->audioStreamIndex) {
                     s->audioPacketGen = curGen;
+
                     pushed = s->audioQueue->Push(pkt);
                 } else if (s->subtitleStreamIndex >= 0
                            && pkt->stream_index == s->subtitleStreamIndex

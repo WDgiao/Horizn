@@ -112,6 +112,15 @@ public:
      */
     virtual int32_t Prepare(const std::string &path) = 0;
 
+    /**
+     * 设置起播位置（毫秒），必须在 Prepare 之前调用
+     *
+     * 为什么要在 Prepare 之前给：续播时引擎要"打开后先跳到目标位置，
+     * 再预渲染第一帧"，这样上层拿到的首帧就是续播位置那一帧。
+     * 默认实现是空操作，方便不支持的原生实现（如 StubEngine）不受影响。
+     */
+    virtual void SetStartPositionMs(int64_t positionMs) { (void)positionMs; }
+
     /** 开始/继续播放 */
     virtual int32_t Start() = 0;
 

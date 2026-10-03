@@ -218,8 +218,8 @@ napi_value SoftPlayerBinding::JsDetachSurface(napi_env env, napi_callback_info i
 
 napi_value SoftPlayerBinding::JsPrepare(napi_env env, napi_callback_info info)
 {
-    size_t argc = 1;
-    napi_value argv[1] = {nullptr};
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
     SoftPlayerBinding *self = Unwrap(env, info, &argc, argv);
     if (self == nullptr) {
         return ThrowError(env, "player object is invalid");
@@ -230,6 +230,15 @@ napi_value SoftPlayerBinding::JsPrepare(napi_env env, napi_callback_info info)
     std::string path;
     if (argc < 1 || !GetStringArg(env, argv[0], path)) {
         return ThrowError(env, "prepare expects a string path");
+    }
+    // ★ 2026-10-03：可选的第 2 个参数 = 起播位置（毫秒）。
+    //   续播必须在 Prepare 之前把位置交给引擎，这样"预渲染的第一帧"
+    //   就是续播位置那一帧（详见 FfmpegEngine::SetStartPositionMs 的说明）。
+    if (self->engine_ != nullptr && argc >= 2 && argv[1] != nullptr) {
+        int64_t startMs = 0;
+        if (napi_get_value_int64(env, argv[1], &startMs) == napi_ok && startMs > 0) {
+            self->engine_->SetStartPositionMs(startMs);
+        }
     }
     napi_value ret = nullptr;
     napi_create_int32(env, self->engine_ ? self->engine_->Prepare(path) : -1, &ret);

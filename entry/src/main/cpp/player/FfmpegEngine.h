@@ -57,6 +57,14 @@ public:
     // ---------- IPlayerEngine 实现 ----------
     void SetCallback(EventCallback cb) override;
     int32_t Prepare(const std::string &path) override;
+
+    /**
+     * 设置起播位置（毫秒），必须在 Prepare 之前调用
+     *
+     * 用途见 IPlayerEngine 里的说明：续播要在"打开之后、预渲染之前"就跳到位，
+     * 否则预渲染出来的第一帧是文件开头那一帧。
+     */
+    void SetStartPositionMs(int64_t positionMs) override;
     int32_t Start() override;
     int32_t Pause() override;
     int32_t SeekTo(int64_t positionMs) override;
@@ -182,6 +190,15 @@ private:
     std::atomic<bool> quitting_{false};
     /** 待处理的 seek 目标（毫秒）；< 0 表示无 */
     std::atomic<int64_t> pendingSeekMs_{-1};
+
+    /**
+     * Prepare 之前设置好的起播位置（毫秒），< 0 表示从头播
+     *
+     * 为什么单独存一份而不是直接用 pendingSeekMs_：
+     *   Prepare 时点还没开会话，SeekTo 会被"会话为空"直接拒绝；
+     *   所以先把值存在这里，等会话建好、解码线程起来之前再转成一次内部 seek。
+     */
+    std::atomic<int64_t> startPositionMs_{-1};
     /** 播放位置（毫秒），解码线程写 */
     std::atomic<int64_t> positionMs_{0};
 
@@ -221,6 +238,16 @@ private:
 
     /** 时间基准重置日志已打印次数（坏时间戳导致基准被带偏时，见 DecodeLoop） */
     int32_t tsRealignLog_ = 0;
+
+    /**
+     * 上一次"为追进度而丢帧"的系统时刻（毫秒）
+     *
+     * 见 DecodeLoop 里的分档丢帧：真落后时允许丢帧，但丢帧间隔不得小于 200ms
+     * （即最多 5 帧/秒），既能追上正常帧缺口，又不会在时钟异常时把整段丢光。
+     */
+    int64_t lastCatchUpDropMs_ = 0;
+    /** 累计"追进度丢帧"次数（与"落后丢帧"分开计，便于区分原因） */
+    std::atomic<int64_t> catchUpDrops_{0};
 
     /**
      * 性能统计（诊断用，2026-09-28 加）
@@ -269,6 +296,35 @@ private:
 
     /** 累计成功上屏的帧数（诊断用：区分"没渲染"与"渲染了但内容不对"） */
     std::atomic<int64_t> framesRendered_{0};
+
+    /**
+     * seek 世代号：每次 SeekTo 递增
+     *
+     * 配合 renderedGen_ 表达"**当前播放位置的第一帧**还没上屏"这个状态。
+     * 为什么要按世代算而不是"整场第一帧"（2026-10-03 实测踩到）：
+     *   上层要求"先出画面再出声"，靠的是引擎报"首帧已上屏"。
+     *   但续播流程是「READY → 上层发起 seek → 引擎预渲染」——
+     *   如果只认整场第一帧，预渲染报上来的很可能是 **seek 之前**那一帧
+     *   （文件开头，实测就是这样：先上屏 1 帧、20ms 后才 seek 到位），
+     *   上层据此开播就会先闪一下开头，或者干脆误判。
+     *   按世代算之后，"首帧"= 这个位置的第一帧，语义才对得上。
+     */
+    std::atomic<int64_t> seekGen_{0};
+    /**
+     * 已经渲染过的那一帧属于哪个 seek 世代；-1 表示还没有
+     *
+     * 只在解码线程里读写，不需要原子。
+     */
+    int64_t renderedGen_ = -1;
+    /**
+     * 最近一次 seek 的目标位置（毫秒）；-1 表示"没有 seek 过"
+     *
+     * 用途：刚 seek 完时滤掉流水线里残留的旧帧（pts 与目标对不上的），
+     * 详见 DecodeLoop 里那段判断。
+     */
+    int64_t lastSeekTargetMs_ = -1;
+    /** 已经因为"位置不符"丢掉多少帧（防呆上限，见 DecodeLoop） */
+    int32_t staleFrameDropCount_ = 0;
 
     /* ==================== 音频 ==================== */
 

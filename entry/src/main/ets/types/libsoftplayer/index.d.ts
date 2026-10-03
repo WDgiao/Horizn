@@ -83,7 +83,17 @@ export class SoftPlayer {
    * （实测崩溃栈 RSSurfaceNode::~RSSurfaceNode，主线程）。
    */
   detachSurface(): number;
-  prepare(path: string): number;
+  /**
+   * 打开文件并准备解码
+   *
+   * @param path 文件绝对路径
+   * @param startPositionMs 起播位置（毫秒，可选）。
+   *        ★ 为什么要有这个参数：续播必须在**开播之前**就把位置交给引擎，
+   *        这样引擎"预渲染的第一帧"就是续播位置那一帧。
+   *        如果等 READY 之后再 seek，预渲染会先把"文件开头"那帧渲染出去，
+   *        上层就没法用它判断"画面已经就绪"，只能靠超时兜底。
+   */
+  prepare(path: string, startPositionMs?: number): number;
   start(): number;
   pause(): number;
   seekTo(positionMs: number): number;

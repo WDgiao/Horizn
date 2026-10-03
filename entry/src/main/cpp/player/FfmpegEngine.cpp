@@ -335,6 +335,50 @@ int32_t FfmpegEngine::PrepareWithTracks(const std::string &path,
     LOGI("Prepare 成功: %{public}s %{public}s/%{public}s %{public}dx%{public}d 旋转%{public}d度",
          path_.c_str(), info_.videoCodec.c_str(), info_.audioCodec.c_str(),
          info_.width, info_.height, info_.rotationDeg);
+
+    // ★★ 2026-10-03：视频解码线程提前到 Prepare 启动（原来在 Start 里）★★
+    //
+    //   为什么必须提前：上层改成了"先等首帧上屏，再开始播"（避免先响声音、
+    //   画面还黑着），而首帧是**解码线程**渲染的 —— 如果解码线程要等 play()
+    //   才起来，就会变成
+    //     「等首帧 → 才 play → 才有解码线程 → 才有首帧」
+    //   互相等，只能靠上层 8 秒兜底超时打破。真机实测就是这个现象：
+    //     native window 就绪 16:01:47.48
+    //     （整整 8.0 秒空档 = 兜底超时）
+    //     解码线程启动      16:01:55.52
+    //     已上屏 1 帧       16:01:55.82
+    //   提前启动之后，READY 时就能预渲染出一帧，上层立刻收到信号开始播，
+    //   起播只花解码这一帧的时间。
+    //
+    //   代价：准备阶段解码线程会先把帧队列填满（最多 kFrameQueueSize 帧）然后
+    //   停在"未播放"的等待里 —— 这点解码量换来的是"点开即出画面"，
+    //   而且它本来在 play() 之后也要做同样的工作。
+    //   音频线程**不提前**：音频设备虽然在 Prepare 就开着（环形缓冲是空的、
+    //   没有声音），但音频解码线程仍在 Start 里启动，声音因此不会抢在画面之前。
+    if (!threadStarted_ && info_.hasVideo) {
+        quitting_.store(false);
+        lastFramePtsMs_ = -1;
+        lastFrameSysMs_ = 0;
+        // ★ 2026-10-03：如果上层在 Prepare 之前给了起播位置（续播），
+        //   在这里把它转成一次内部 seek —— 解码线程一启动就会处理它
+        //   （见 DecodeLoop ①），于是"预渲染的第一帧"就是续播位置那一帧。
+        //   为什么不能等上层 READY 之后再 seek：那时候预渲染早就把
+        //   "文件开头"那帧渲染出去了，上层据此判断"画面已就绪"会出错，
+        //   实测只能靠上层 8 秒兜底超时才能开播。
+        const int64_t startMs = startPositionMs_.load();
+        if (startMs > 0) {
+            pendingSeekMs_.store(startMs);
+            LOGI("起播位置 %{public}lld ms（解码线程启动后立即执行内部 seek）",
+                 static_cast<long long>(startMs));
+        }
+        // 顺序同下面 Start() 里的说明：先置标志再构造线程，否则清理路径
+        // 可能跳过 join，导致线程持有已释放的会话（真机 SIGABRT）
+        threadStarted_ = true;
+        decodeThread_ = std::thread(&FfmpegEngine::DecodeLoop, this);
+        LOGI("解码线程已启动（Prepare 阶段，用于预渲染首帧）");
+    } else if (!threadStarted_ && !info_.hasVideo) {
+        LOGI("该文件没有视频轨，不启动视频解码线程（仅音频播放）");
+    }
     return 0;
 }
 
@@ -429,6 +473,11 @@ int32_t FfmpegEngine::Pause() {
     return 0;
 }
 
+void FfmpegEngine::SetStartPositionMs(int64_t positionMs) {
+    // 只在 Prepare 之前有意义：Prepare 会把它转成一次内部 seek（见那里的说明）。
+    startPositionMs_.store(positionMs < 0 ? -1 : positionMs);
+}
+
 int32_t FfmpegEngine::SeekTo(int64_t positionMs) {
     if (state_.load() == PlayerState::RELEASED || session_ == nullptr) {
         return -1;
@@ -439,6 +488,17 @@ int32_t FfmpegEngine::SeekTo(int64_t positionMs) {
     pendingSeekMs_.store(positionMs);
     // seek 要清掉排队的旧帧，否则会先闪几帧旧画面
     frameQueue_->Clear();
+    // ★ 2026-10-03：seek 世代号**刻意不在这里递增**，而是在解码线程真正把
+    //   seek 交给解码器的那一刻（见 DecodeLoop 的 seek 处理段）。
+    //
+    //   为什么位置这么讲究（真机踩过两轮）：
+    //     本轮的目标是"先出画面再出声"：上层发起续播 seek 之后等引擎报
+    //     "这个位置的第一帧已上屏"。如果世代号在**请求** seek 时就加，
+    //     预渲染会立刻放行，而此刻解码器还没收到 seek（包队列里还有旧包）
+    //     → 渲染出来的是 **seek 之前**那一帧（实测就是文件开头那帧），
+    //     位置对不上、上层只能用兜底超时开播。
+    //     改成"解码器真正收到 seek 之后再算新一代"，
+    //     预渲染出来的一定是新位置的第一帧。
     // 音频缓冲也要清：不清的话 seek 之后会先播出跳转前的残音
     if (audio_ != nullptr) {
         audio_->FlushBuffer();
@@ -780,6 +840,14 @@ void FfmpegEngine::DecodeLoop() {
             // 否则跳到文件后半段会立刻误判为"播完了"
             eofReached = false;
             queue->Clear();
+            // ★ 这里才是"新一代"的开始：解码器已经收到 seek（上面 codecapi::Seek
+            //   会清解码器内部状态并等待关键帧），此后解出来的帧才属于新位置。
+            //   递增之后 renderedGen_ 自然变得不相等 → 解码线程会预渲染一帧
+            //   并把"位置首帧已上屏"报上去（见 ③ 取帧上屏那段）。
+            seekGen_.fetch_add(1);
+            // 记下目标位置：③ 取帧上屏那段据此滤掉残留的旧帧
+            lastSeekTargetMs_ = seekTarget;
+            staleFrameDropCount_ = 0;
             positionMs_.store(seekTarget);
             lastFramePtsMs_ = -1;
             lastFrameSysMs_ = 0;
@@ -828,8 +896,32 @@ void FfmpegEngine::DecodeLoop() {
         }
 
         // ---------- ③ 取帧上屏 ----------
-        // 暂停时不去取帧，让队列保持满的状态，恢复播放能立刻出画面
-        if (!playing_.load()) {
+        // 暂停时不去取帧，让队列保持满的状态，恢复播放能立刻出画面。
+        //
+        // ★★ 2026-10-03：「首帧」是例外 —— 即使还没开始播放，也要先渲染一帧 ★★
+        //
+        //   起因（用户反馈）："点开东西还没渲染完就在放了" —— 原来 READY 就立刻
+        //   play()，音频与主时钟先跑起来，而首帧还在解码/转换（还得等 surface 就绪），
+        //   于是先响声音、画面还是黑的。
+        //
+        //   要修就得让上层"先等首帧上屏，再开始播"。但上层不能靠 play() 去催首帧
+        //   ——那正是要避免的；所以这里由引擎**预渲染**一帧：未播放状态下也允许
+        //   走一次解码+上屏，并把"首帧已上屏"通过 POSITION 事件（data2=1）报上去。
+        //   上层收到后才调 play()，此时画面已经在屏幕上了。
+        //
+        //   只预渲染一帧（framesRendered_ == 0 才放行），之后照旧等待播放：
+        //   否则会变成"未播放也一直解码上屏"，白烧 CPU 且打乱暂停语义。
+        //
+        //   ★ 2026-10-03 改按**seek 世代**算（原来按"整场第一帧"）：
+        //     续播流程是「READY → 上层发起 seek → 引擎预渲染」，
+        //     按整场第一帧算的话，预渲染很可能抢在 seek 生效之前，
+        //     把"文件开头那一帧"渲染出去（实测：先上屏 1 帧、20ms 后 seek 到位），
+        //     上层据此就会提前开播、或先闪一下开头。
+        //     改成"这个位置的第一帧还没上屏"之后，语义才对得上。
+        const int64_t curSeekGen = seekGen_.load();
+        const bool firstFrameOfGenMissing = (renderedGen_ != curSeekGen);
+        const bool preRollFirstFrame = !playing_.load() && firstFrameOfGenMissing;
+        if (!playing_.load() && !preRollFirstFrame) {
             sleeper->Sleep(20);
             continue;
         }
@@ -887,10 +979,26 @@ void FfmpegEngine::DecodeLoop() {
             }
         }
 
+        // ★★ 预渲染首帧时**绝不等时钟**（2026-10-03 实测踩到的坑）★★
+        //
+        //   预渲染发生在"还没播放"的时候：此时**音频解码线程还没启动**
+        //   （它在 Start/play 里才起来），所以 audioWrittenMs_ 是 0、环形缓冲是空的，
+        //   主时钟就等于 0。而首帧的 pts 是续播位置（本例 3316819ms），
+        //   于是 waitMs = 3316819 —— 按下面的逻辑就是"睡 50ms 再看一眼"，
+        //   永远等不到，首帧永远出不来。
+        //   真机日志正是这样：READY 之后 8 秒什么都没有，直到上层兜底超时开播
+        //   （play() 一启动音频线程，第一帧 52ms 内就上屏了）。
+        //   预渲染的目的就是"先把画面显示出来"，它没有时钟可依，也不该依。
+        if (preRollFirstFrame) {
+            waitMs = 0;
+        }
+
         if (waitMs > 2) {
             // 还没到显示时刻：只睡一小段，不取帧。
             // 为什么分片：seek / 暂停 / 退出都要能立刻响应，
             // 睡一个几秒的长觉会让这些操作全部变迟钝。
+            // ★ 预渲染首帧例外：见下面 preRollFirstFrame 的说明，它必须立刻上屏。
+           
             const int64_t napMs = (waitMs > 50) ? 50 : waitMs;
             sleeper->Sleep(static_cast<int>(napMs));
             continue;
@@ -1008,8 +1116,38 @@ void FfmpegEngine::DecodeLoop() {
             // 否则整个视频会被瞬间播完，进度条也永远停在 0。
             const int64_t frameSpanMs = (frame.durationMs > 0) ? frame.durationMs : 40;
             const int64_t deltaClamp = (frameDeltaMs > 0) ? frameDeltaMs : frameSpanMs;
+            // ★★ 2026-10-03：把"落后"分成两档，并允许**限速丢帧追上** ★★
+            //
+            //   现场（第五指令BD1024高清中英双字.rmvb，加供包诊断后实测）：
+            //     · 文件每秒只给 21.6 个视频包，而视频是 24.6 帧/秒
+            //       （视频线程是"1 包解 1 帧"：调用=30 出帧=30 等包=0）
+            //       —— 也就是说这个片的视频流比它自己的时间戳**少约 12% 的帧**。
+            //     · 原来 waitMs 被夹到 [-deltaClamp, +deltaClamp]（±41ms），
+            //       于是 `waitMs < -100` 永不成立 → **永不丢帧** →
+            //       画面只能以 0.88x 的速度推进 → 越播越落后音频（实测 4~5 秒），
+            //       同时视频包队列被慢慢抽干（实测 490 → 33，约 4 分钟见底），
+            //       见底后每帧都要等包，画面就变成"一卡一快"。
+            //
+            //   为什么当年要夹：注释里记着一次真实事故 —— 音频时钟超前时
+            //   夹子失效会导致"整段画面被一次丢光"（10 秒样本 65 帧只上屏 1 帧）。
+            //   所以这次不是简单地把夹子删掉，而是**分档 + 限速**：
+            //     · 落后 ≤ 200ms：仍按抖动处理，夹到一帧间隔，照常显示；
+            //     · 落后 > 200ms：这是真落后，保留真实差值交给下面的丢帧分支，
+            //       但**丢帧速率限制在 1 帧/200ms（5 帧/秒）**：
+            //         - 12% 的帧缺口只需要丢约 3 帧/秒 → 能稳稳追上并保持同步；
+            //         - 而"时钟异常超前几秒"那种病态情况最多丢 5 帧/秒，
+            //           不会一次丢光，几十秒内自然收敛。
+            const int64_t kRealLagMs = 200;
+            const int64_t kMinDropIntervalMs = 200;
+            int64_t waitForDrop = waitMs;
             if (waitMs < -deltaClamp) {
-                waitMs = -deltaClamp;
+                if (waitMs > -kRealLagMs) {
+                    waitMs = -deltaClamp;                 // 抖动：吸收掉
+                } else if (nowMs - lastCatchUpDropMs_ < kMinDropIntervalMs) {
+                    waitMs = -deltaClamp;                 // 真落后，但丢得太密：这一帧先不丢
+                } else {
+                    waitMs = waitForDrop;                 // 允许这一帧被丢（下面判 waitMs < -100）
+                }
             }
             if (frameDeltaMs > 0 && waitMs > frameDeltaMs) {
                 waitMs = frameDeltaMs;
@@ -1037,6 +1175,11 @@ void FfmpegEngine::DecodeLoop() {
                 // 落后太多：丢掉这一帧直接追进度。
                 // 不丢的话会越积越多，表现为"越播越延迟"
                 droppedFrames_.fetch_add(1);
+                // 若这一帧是"分档逻辑"放行的追进度丢帧，单独计一个数：
+                // 排查时"因抖动丢帧"和"因片源帧缺口追进度丢帧"是完全不同的两件事
+                if (waitMs <= -200) {
+                    catchUpDrops_.fetch_add(1);
+                }
                 // 先取 pts 再回收 —— 回收会把 ptsMs 归零，
                 // 顺序反了基准就变成 0，之后所有帧都会算成"落后"而全被丢掉
                 const int64_t droppedPts = frame.ptsMs;
@@ -1055,9 +1198,41 @@ void FfmpegEngine::DecodeLoop() {
         }
 
         const int64_t renderT0 = NowUs();
-        RenderFrame(frame);
+        // ★★ 刚 seek 完时，只认"位置对得上"的帧 ★★（2026-10-03 实测）
+        //
+        //   现象：引擎已经把 seek 交给解码器、队列也清了，但**流水线里已经算完的
+        //   那一帧拦不住** —— 实测上屏的"位置首帧"pts=0，而 seek 目标是 3600853ms，
+        //   也就是文件开头那一帧。上层看到这个位置对不上就会拒绝开播，
+        //   结果又只能靠超时兜底（声音与画面一起、但要等 8 秒）。
+        //   处理：在"这个位置的首帧还没上屏"期间，pts 与 seek 目标差得离谱的帧
+        //   直接丢掉、不上屏也不报信号，继续等真正属于新位置的那一帧。
+        //   加计数上限是防呆：万一某个文件的时间戳整体不可信（比如 pts 恒为 0），
+        //   不能无限丢下去，丢掉 60 帧后就照常放行。
+        if (firstFrameOfGenMissing && lastSeekTargetMs_ >= 0) {
+            const bool ptsPlausible = (frame.ptsMs >= lastSeekTargetMs_ - 3000)
+                && (frame.ptsMs <= lastSeekTargetMs_ + 60000);
+            if (!ptsPlausible && staleFrameDropCount_ < 60) {
+                staleFrameDropCount_++;
+                LOGW("seek 后丢弃位置不符的残留帧: pts=%{public}lld 目标=%{public}lldms（第 %{public}d 次）",
+                     static_cast<long long>(frame.ptsMs),
+                     static_cast<long long>(lastSeekTargetMs_),
+                     staleFrameDropCount_);
+                codecapi::RecycleFrameBuffer(session_, frame);
+                continue;
+            }
+        }
+        const bool renderOk = RenderFrame(frame);
         perfRenderUs_ += (NowUs() - renderT0);
         perfFrames_++;
+        // ★ 只有**这一次渲染成功**，才算"这个位置的第一帧已经上屏"
+        //   （失败时不能置位，否则上层会收到一个画面其实没出来的"首帧信号"）
+        const bool firstFrameOfThisGen = firstFrameOfGenMissing;
+        if (renderOk && firstFrameOfThisGen) {
+            renderedGen_ = curSeekGen;
+            LOGI("位置首帧已上屏（seek 世代 %{public}lld, pts=%{public}lldms），上报给上层以便开始播放",
+                 static_cast<long long>(curSeekGen),
+                 static_cast<long long>(frame.ptsMs));
+        }
 
         // ★★ 2026-10-03：补上一直漏掉的"渲染后更新时钟基准" ★★
         //
@@ -1112,13 +1287,15 @@ void FfmpegEngine::DecodeLoop() {
             //   一旦出现 wait 长时间贴 -deltaClamp（全速跑）或贴 +deltaClamp（定住），
             //   就是时钟基准被带偏了。
             LOGI("clock: pts=%{public}lld delta=%{public}lld audioClock=%{public}lld "
-                 "writtenMs=%{public}lld wait=%{public}lld 丢帧=%{public}lld 队列=%{public}zu",
+                 "writtenMs=%{public}lld wait=%{public}lld 丢帧=%{public}lld(追进度 %{public}lld) "
+                 "队列=%{public}zu",
                  static_cast<long long>(frame.ptsMs),
                  static_cast<long long>(frameDeltaMs),
                  static_cast<long long>(audioClockDbg),
                  static_cast<long long>(audioWrittenMs_.load()),
                  static_cast<long long>(waitMs),
                  static_cast<long long>(droppedFrames_.load()),
+                 static_cast<long long>(catchUpDrops_.load()),
                  queue->Size());
 
             if (session_ != nullptr) {
@@ -1153,7 +1330,15 @@ void FfmpegEngine::DecodeLoop() {
         // 位置按 pts 上报，而不是按解到第几帧 ——
         // 这样 seek 之后进度条能立刻跳到正确位置
         positionMs_.store(frame.ptsMs);
-        if (frame.ptsMs - lastPositionReportMs >= 200 || frame.ptsMs < lastPositionReportMs) {
+        // ★ 2026-10-03：首帧（本位置的第一帧）必须无条件上报一次，
+        //   并在 data2 带上"位置首帧已上屏"标记 —— 上层靠它决定"可以开始播了"。
+        //   为什么不能只靠 200ms 节流条件：pts 小于 200ms 的文件（很多测试片段
+        //   就是从 0 开始的）永远不满足 `pts - 上次上报 >= 200`，上层就永远等不到信号。
+        if (firstFrameOfThisGen && renderOk) {
+            Emit(PlayerEvent::POSITION, frame.ptsMs, 1, "");
+            lastPositionReportMs = frame.ptsMs;
+        } else if (frame.ptsMs - lastPositionReportMs >= 200
+                   || frame.ptsMs < lastPositionReportMs) {
             Emit(PlayerEvent::POSITION, frame.ptsMs, 0, "");
             lastPositionReportMs = frame.ptsMs;
         }

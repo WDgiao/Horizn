@@ -9,6 +9,8 @@
     "pages/FileDetailPage",
     "pages/NetworkStreamPage",
     "pages/StreamEditPage",
-    "pages/DeveloperModePage"
+    "pages/DeveloperModePage",
+    "pages/PlaybackSettingsPage",
+    "pages/SubtitleSettingsPage"
   ]
 }
