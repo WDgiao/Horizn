@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 /** 前向声明，避免把 external_window.h 带进所有包含者 */
 struct NativeWindow;
 
@@ -128,6 +129,36 @@ private:
     /** 渲染一帧到 surface，返回是否成功 */
     bool RenderFrame(VideoFrame &frame);
 
+    /**
+     * 取得某个 surface buffer 的可写映射（带缓存，2026-10-03）
+     *
+     * 为什么必须缓存：原实现是**每帧** mmap + munmap 一次 3.7MB 的 buffer。
+     *   mmap 本身要建页表，munmap 还要做 TLB 失效；更要命的是新映射的页
+     *   在第一次写入时逐页触发缺页异常 —— 1280x720 RGBA = 3.7MB ÷ 4KB
+     *   ≈ 900 次缺页/帧。真机实测 RenderFrame 平均 8~13ms，其中大部分
+     *   耗在这里，而不是那趟 memcpy。
+     *
+     * surface 只会循环使用固定的几块 buffer（每个 buffer 有各自的 fd），
+     * 所以按 (fd, size) 缓存映射即可：每块只 mmap 一次，之后每帧白拿。
+     *
+     * @param handle 其实是 BufferHandle*（native_window/buffer_handle.h 里
+     *        BufferHandle 是 typedef 出来的匿名字段结构，没法前向声明，
+     *        所以这里用 void* 传，函数内再转回来）
+     */
+    void *MapSurfaceBuffer(void *handle);
+
+    /** 清空映射缓存（窗口重建 / 释放时必须调用，否则会用到野映射） */
+    void ClearSurfaceMapCache();
+
+    /** 内联的映射缓存项 */
+    struct SurfaceMap {
+        int fd = -1;
+        int32_t size = 0;
+        void *ptr = nullptr;
+    };
+    /** surface buffer 的映射缓存（少量项，线性查找足够） */
+    std::vector<SurfaceMap> surfaceMaps_;
+
     /** 按 surfaceId 打开 native window（幂等） */
     bool EnsureWindow();
 
@@ -188,6 +219,9 @@ private:
     /** sync 诊断日志已打印次数（只打印前几次"落后"，避免刷屏） */
     int32_t dropDbgCount_ = 0;
 
+    /** 时间基准重置日志已打印次数（坏时间戳导致基准被带偏时，见 DecodeLoop） */
+    int32_t tsRealignLog_ = 0;
+
     /**
      * 性能统计（诊断用，2026-09-28 加）
      *
@@ -203,6 +237,24 @@ private:
     int64_t perfDecodeUs_ = 0;
     int64_t perfRenderUs_ = 0;
     int64_t perfFrames_ = 0;
+
+    /**
+     * 上屏耗时细分（2026-10-03 加）
+     *
+     * 为什么要在 8~13ms 的"上屏均"里再拆一层：
+     *   它可能来自三个完全不同的地方，而只有第一处能优化：
+     *     · reqUs   —— RequestBuffer：拿不到空闲 buffer 时会**等合成器**，
+     *                  这部分是等待，不是干活，优化代码没用；
+     *     · mapUs   —— mmap/munmap + 首写缺页（已改为缓存，见 MapSurfaceBuffer）；
+     *     · copyUs  —— 逐行 memcpy 3.7MB 进（通常是 uncached 的）显示缓冲；
+     *     · flushUs —— FlushBuffer 送显，同样可能阻塞等合成器。
+     *   不拆开就会把"等合成器"误判成"拷贝太慢"，然后去做一场
+     *   毫无收益的零拷贝改造。
+     */
+    int64_t perfReqUs_ = 0;
+    int64_t perfMapUs_ = 0;
+    int64_t perfCopyUs_ = 0;
+    int64_t perfFlushUs_ = 0;
 
     /**
      * surface 实际分配的 buffer 尺寸（显示区域尺寸，不是视频尺寸）

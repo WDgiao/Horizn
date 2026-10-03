@@ -865,6 +865,13 @@ struct PlayerPage {
         this.preparing = false;
         // 已经真正准备好，清掉此前累积的错误信息
         this.errorMsg = '';
+        // ★ 2026-10-03：顺手把轨道列表拉一次。
+        //   否则底部按钮要等用户点开面板才显示"音轨 1/2"，
+        //   而"这个文件有几条音轨"本来就该在进播放页时就知道。
+        //   AVPlayer 路径专用；软解路径的轨道来自快照，不需要这一步。
+        if (this.softCtl === undefined) {
+          this.refreshAvTracks();
+        }
         // 有续播起点则先跳转再播（此时已在 prepared 态，可以 seek）
         //
         // ★ 网络流不做续播 seek：
@@ -1302,6 +1309,14 @@ struct PlayerPage {
       this.subtitleTracks = snap.subtitleTracks;
       this.currentAudioIndex = snap.currentAudioIndex;
       this.currentSubtitleIndex = snap.currentSubtitleIndex;
+    } else if (this.player !== undefined) {
+      // ★ 2026-10-03：系统 AVPlayer 那条路也要列音轨。
+      //   以前这里只处理软解，于是走 AVPlayer 的文件面板永远显示
+      //   「当前文件没有可切换的音轨」—— 而 .mkv 属于 TIER_PLAYABLE，
+      //   也就是**必然走 AVPlayer**，于是"双音轨 mkv"这个最典型的场景
+      //   反而完全用不了音轨切换（真机反馈就是这个现象）。
+      //   这里是异步填充：面板立刻打开，列表拉到之后由 @State 驱动重绘。
+      this.refreshAvTracks();
     }
     this.trackNotice = '';
     this.showTrackPanel = true;
@@ -1311,6 +1326,11 @@ struct PlayerPage {
   private chooseAudioTrack(index: number): void {
     const sc: SoftPlayerController | undefined = this.softCtl;
     if (sc === undefined) {
+      // 走系统 AVPlayer 的文件：改用 AVPlayer 自己的轨道接口
+      if (this.player !== undefined) {
+        this.switchAvAudioTrack(index);
+        return;
+      }
       this.trackNotice = '当前不是软解播放，无法切换音轨';
       return;
     }
@@ -1327,6 +1347,213 @@ struct PlayerPage {
       this.trackNotice = '切换音轨失败（错误码 ' + r.toString() + '）';
       this.writeDiag('切换音轨到 ' + index.toString() + ' 失败: ' + r.toString());
     }
+  }
+
+  // ========================================================================
+  // 系统 AVPlayer 路径的音轨适配（2026-10-03 新增）
+  // ========================================================================
+  //
+  // 为什么需要这一块：
+  //   音轨切换原先只做在软解路径上，而 .mkv 属于 MediaType.TIER_PLAYABLE，
+  //   也就是**必然走 AVPlayer** —— 结果"双音轨 mkv"这个最典型的场景反而
+  //   完全用不了音轨切换（面板固定显示"当前文件没有可切换的音轨"）。
+  //   真机实测反馈的正是这个现象。
+  //
+  // 做法：AVPlayer 自带一套轨道接口（API 12 起就都有），把它们适配成软解那套
+  //   SoftAudioTrack。这样面板 UI、底部按钮文案（"音轨 1/2"）、单选圆点
+  //   **一行都不用改**就能用上 —— 它们本来就只认这个数据结构。
+  //
+  // ★ 两个版本坑，写在这里免得以后踩：
+  //   ① 不要用 getSelectedTrack(MediaType)（单数）：它标注 @since 26.0.0，
+  //      而本机系统是 6.1.0，调它会直接失败。用 getSelectedTracks()（复数），
+  //      API 12 就有 —— 它返回全部选中下标，从中挑出属于音轨的那个即可。
+  //   ② 不要靠 on('trackChange') 同步状态：事件在各版本上的可用性不一致，
+  //      而"切换完自己重新拉一次"是确定能用的，代码也更好懂。
+
+  /**
+   * 拉一次 AVPlayer 的轨道列表并同步到界面状态
+   *
+   * 全程不抛异常：拉不到轨道只是"看不到列表"，不该影响播放。
+   */
+  private refreshAvTracks(): void {
+    const p: media.AVPlayer | undefined = this.player;
+    if (p === undefined) {
+      return;
+    }
+    p.getTrackDescription().then((list: media.MediaDescription[]) => {
+      if (this.disposed) {
+        return;
+      }
+      // ★ 同时也打一份到 console（= hilog）。
+      //   DiagLog 故意只写沙箱文件（见其文件头说明），而"沙箱文件读不出来"
+      //   恰恰是排查轨道问题时最难受的地方。这两行让 hdc 直接能看到原始数据：
+      //   轨道条数、每条的 track_type / track_index / codec_mime。
+      //   只在 prepared 和打开面板时打，频率极低，不会刷屏。
+      console.info('[Track] getTrackDescription -> ' + list.length.toString() + ' 条');
+      const dump: string[] = [];
+      for (let i = 0; i < list.length; i++) {
+        try {
+          const d: media.MediaDescription = list[i];
+          const rawType: Object = d[media.MediaDescriptionKey.MD_KEY_TRACK_TYPE];
+          dump.push('#' + i.toString()
+            + ' type=' + this.avStr(rawType) + this.avNum(rawType, -99).toString()
+            + ' idx=' + this.avNum(d[media.MediaDescriptionKey.MD_KEY_TRACK_INDEX], -99).toString()
+            + ' mime=' + this.avStr(d[media.MediaDescriptionKey.MD_KEY_CODEC_MIME]));
+        } catch (err) {
+          dump.push('#' + i.toString() + ' <读取失败>');
+        }
+      }
+      if (dump.length > 0) {
+        console.info('[Track] 明细: ' + dump.join(' | '));
+      }
+      this.applyAvTrackDescriptions(list);
+      // 再问一次"当前选中的是哪些"。单独一次调用：它失败不该把列表也一起废掉
+      p.getSelectedTracks().then((sel: number[]) => {
+        if (this.disposed) {
+          return;
+        }
+        console.info('[Track] getSelectedTracks -> [' + sel.join(',') + ']');
+        this.applyAvSelectedTracks(sel);
+      }).catch((err: BusinessError) => {
+        console.warn('[Track] getSelectedTracks 失败: ' + err.code.toString());
+        this.writeDiag('getSelectedTracks 失败: ' + err.code.toString());
+      });
+    }).catch((err: BusinessError) => {
+      console.warn('[Track] getTrackDescription 失败: ' + err.code.toString()
+        + ' ' + err.message);
+      this.writeDiag('getTrackDescription 失败: ' + err.code.toString());
+    });
+  }
+
+  /**
+   * 把 AVPlayer 的 MediaDescription[] 转成面板用的音轨列表
+   *
+   * 只取 track_type 为音频的那些；视频/字幕轨在这里不处理
+   * （字幕走的是应用自己的字幕层，见 refreshSubtitle 的说明）。
+   */
+  private applyAvTrackDescriptions(list: media.MediaDescription[]): void {
+    const out: SoftAudioTrack[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const d: media.MediaDescription = list[i];
+      // MediaDescription 是 [key: string]: Object 的运行时映射，
+      // 字段可能整个缺失，取值本身也可能抛（ArkTS 会对下标访问给出
+      // "Function may throw exceptions" 警告）。所以整条轨的读取包一层：
+      // 拿不到就跳过这一条，绝不能让一条坏数据把播放带崩。
+      try {
+        const t: Object = d[media.MediaDescriptionKey.MD_KEY_TRACK_TYPE];
+        if (t !== media.MediaType.MEDIA_TYPE_AUD) {
+          continue;
+        }
+        const idx: number = this.avNum(d[media.MediaDescriptionKey.MD_KEY_TRACK_INDEX], -1);
+        if (idx < 0) {
+          continue;
+        }
+        const mime: string = this.avStr(d[media.MediaDescriptionKey.MD_KEY_CODEC_MIME]);
+        // "audio/mp4a-latm" 这种 MIME 前缀对用户没意义，只留斜杠后面的编码名
+        const slash: number = mime.indexOf('/');
+        out.push({
+          index: idx,
+          codec: slash >= 0 ? mime.substring(slash + 1) : mime,
+          language: this.avStr(d[media.MediaDescriptionKey.MD_KEY_LANGUAGE]),
+          title: this.avStr(d[media.MediaDescriptionKey.MD_KEY_TRACK_NAME]),
+          channels: this.avNum(d[media.MediaDescriptionKey.MD_KEY_AUD_CHANNEL_COUNT], 0),
+          sampleRate: this.avNum(d[media.MediaDescriptionKey.MD_KEY_AUD_SAMPLE_RATE], 0),
+          bitRate: this.avNum(d[media.MediaDescriptionKey.MD_KEY_BITRATE], 0),
+          // AVPlayer 不提供"容器标记的默认轨"这一信息，一律 false ——
+          // 当前生效的是哪条由单选圆点表示，不影响使用
+          isDefault: false
+        });
+      } catch (err) {
+        const e = err as BusinessError;
+        this.writeDiag('解析第 ' + i.toString() + ' 条轨道描述失败: ' + e.message);
+        continue;
+      }
+    }
+    this.audioTracks = out;
+    this.currentSubtitleIndex = -1;
+    console.info('[Track] 过滤后音轨 ' + out.length.toString() + ' 条');
+    this.writeDiag('AVPlayer 音轨 ' + out.length.toString() + ' 条');
+  }
+
+  /** 用 AVPlayer 的选中轨下标校准"当前音轨"（选中项里挑出属于音轨的那个） */
+  private applyAvSelectedTracks(sel: number[]): void {
+    for (let i = 0; i < sel.length; i++) {
+      const idx: number = sel[i];
+      for (let j = 0; j < this.audioTracks.length; j++) {
+        if (this.audioTracks[j].index === idx) {
+          this.currentAudioIndex = idx;
+          return;
+        }
+      }
+    }
+  }
+
+  /** MediaDescription 是个 key:value 映射，取值时按类型兜一下底 */
+  private avNum(v: Object, fallback: number): number {
+    return typeof v === 'number' ? v as number : fallback;
+  }
+
+  /** 同上，取字符串 */
+  private avStr(v: Object): string {
+    return typeof v === 'string' ? v as string : '';
+  }
+
+  /**
+   * 切换 AVPlayer 的音轨
+   *
+   * 顺序：**先选中新的，再放掉旧的**。
+   *   音频轨同一时刻只能选中一条，所以必须先 select 新的再 deselect 旧的；
+   *   反过来的话中间会出现"一条都没选中"的瞬间，声音会断一下。
+   */
+  private switchAvAudioTrack(index: number): void {
+    const p: media.AVPlayer | undefined = this.player;
+    if (p === undefined) {
+      this.trackNotice = '播放器未就绪，无法切换音轨';
+      return;
+    }
+    if (index === this.currentAudioIndex) {
+      return;
+    }
+    const old: number = this.currentAudioIndex;
+    console.info('[Track] 请求切换音轨: ' + old.toString() + ' -> ' + index.toString());
+    this.trackNotice = '正在切换音轨…';
+    p.selectTrack(index).then(() => {
+      if (this.disposed) {
+        return;
+      }
+      this.currentAudioIndex = index;
+      this.trackNotice = '';
+      this.writeDiag('AVPlayer 切换音轨到 ' + index.toString() + ' 成功');
+      if (old >= 0 && old !== index) {
+        // ★ 无条件放掉旧轨 —— 这是**实测验证过的**写法，别再"优化"它。
+        //
+        //   我一度把它加了个条件（先 getSelectedTracks() 看旧轨是否还挂着，
+        //   还挂着才 deselect），理由是系统日志里出现过
+        //   「SelectTrack trackId invalid / failed to DeselectTrack」，看着像多余调用。
+        //   **结果真机上直接把切换搞坏了**：面板停在原轨不动（音轨1 ● / 音轨2 ○）。
+        //   根因是 getSelectedTracks() 在 selectTrack 刚返回时读到的还是旧值
+        //   （[0,1]，不含新选的 2），条件判断随之误判，于是多放了一次旧轨，
+        //   系统把选择退回了原轨。
+        //
+        //   代价对比很清楚：
+        //     · 无条件 deselect：切换成功且稳定；副作用只是系统侧一行
+        //       「failed to DeselectTrack」的噪声日志（库内部的重复 unselect，
+        //       系统在 select 时本来就自动 unselect 过一次）。
+        //     · 加条件：日志干净了，功能没了。
+        //   所以这里保持无条件。真要消噪声，得等系统侧把"选中状态"的可见性
+        //   修好（或提供同步接口），不能靠我们这一侧猜。
+        p.deselectTrack(old).catch((err: BusinessError) => {
+          // 放旧轨失败不影响新轨已经生效，记一笔就够
+          this.writeDiag('deselectTrack(' + old.toString() + ') 失败: ' + err.code.toString());
+        });
+      }
+      // 用系统实际状态再校准一次
+      this.refreshAvTracks();
+    }).catch((err: BusinessError) => {
+      this.trackNotice = '切换音轨失败（' + err.code.toString() + '）';
+      this.writeDiag('AVPlayer 切换音轨到 ' + index.toString()
+        + ' 失败: ' + err.code.toString() + ' ' + err.message);
+    });
   }
 
   /**

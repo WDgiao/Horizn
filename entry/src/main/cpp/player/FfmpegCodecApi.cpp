@@ -32,6 +32,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/cpu.h>
 #include <libavutil/display.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
@@ -65,6 +66,12 @@ namespace softplayer {
 namespace codecapi {
 
 #ifdef SOFT_PLAYER_WITH_FFMPEG
+
+/** 单调微秒时钟：只用于耗时统计（单调才能安全做差） */
+static int64_t NowUs() {
+    using namespace std::chrono;
+    return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+}
 
 /**
  * 有界包队列（解复用线程 → 解码线程 的单向通道）
@@ -556,18 +563,85 @@ struct DecoderSession {
      * 此时若送进去一个非关键帧，VP9 会直接拒绝并报 AVERROR_INVALIDDATA
      * （真机实测：换轨后连续多个包被拒，正是这个原因 —— 那些包
      *  size≈17~18KB、pts 7000/7280/7600…，全是非关键帧）。
+     * 正确做法是**主动跳过**：seek 之后一直丢包，直到遇到带
+     * AV_PKT_FLAG_KEY 的那个再开始送。
      *
-     * 虽然被拒后可以 flush 重发来自愈（见 DecodeVideoFrame 里的兜底），
-     * 但那等于每个非关键帧都要白折腾一次。正确做法是**主动跳过**：
-     * seek 之后一直丢包，直到遇到带 AV_PKT_FLAG_KEY 的那个再开始送。
+     * ★ 2026-10-03 起它还是"包被拒"的唯一恢复手段：
+     *   包被拒（AVERROR_INVALIDDATA）时不再 flush 解码器，而是置本标志
+     *   转入等关键帧 —— 理由见 DecodeVideoFrame 里那段真机日志。
      */
     bool videoWaitKeyframe = true;
+
+    /**
+     * 本轮"等关键帧"已经跳过了多少个包
+     *
+     * 用来兜底：RMF 的关键帧标志并不可靠，万一一直等不到，
+     * 累计到阈值后才会动用最后手段（flush + 放弃等待）。
+     */
+    int64_t videoWaitSkip = 0;
+
+    /**
+     * 上一次交给上层的视频帧时间戳（毫秒），-1 表示还没给过
+     *
+     * 用途：坏时间戳防护。实测这个 .rmvb（rv40/cook）在正常播放中会
+     * **偶发**吐出 833~845 秒的时间戳（而同一时刻正常帧只有 2~6 秒），
+     * 一旦采信，时钟基准就被顶到 14 分钟：
+     *   · 后一帧与基准比是"落后 800 多秒" → 被判定追不上 → 按上限丢帧全速跑
+     *   · 等真实时间戳回来又变成"超前" → 睡等
+     * 用户看到的就是「卡一下快一下」。
+     * 所以这里记住上一帧的输出值，跳变过大就当成坏值丢弃，
+     * 用「上一帧 + 帧间隔」推一个出来，保证时间轴单调。
+     * seek 之后会重置（见 DecodeVideoFrame 里的 seek 世代块）。
+     */
+    int64_t lastOutPtsMs = -1;
+    /** 坏时间戳日志已打印次数（避免坏流刷屏） */
+    int32_t tsJumpLog = 0;
+    /**
+     * 从码流里**实测**出来的帧间隔（毫秒），0 = 还没估出来
+     *
+     * 为什么不能只信容器/解码器给的帧率：
+     *   实测这个 .rmvb（rv40/cook）容器里报的帧率是 **0.33fps**
+     *   （avg_frame_rate ≈ 1/3），于是 defaultFrameMs 被算成 3003ms ——
+     *   而真实帧间隔是 ~42ms（24fps）。于是所有"按帧间隔兜底"的地方
+     *   （合成时间轴、坏值替换、上层的 deltaClamp）全都按 3 秒一帧工作，
+     *   画面节奏彻底乱掉。
+     *   所以这里从相邻帧 pts 的差值里取"常见值"作为实测间隔：
+     *   只采信 5~200ms 之间的差值（正常视频的帧间隔范围），
+     *   用指数平滑收敛，攒够 8 个样本后就可以替代容器帧率。
+     */
+    int64_t measuredStepMs = 0;
+    /** 实测帧间隔的样本数 */
+    int32_t stepSamples = 0;
+    /** 音频侧同样的坏时间戳防护用的上一段 pts（-1 = 还没给过） */
+    int64_t lastAudioPtsMs = -1;
 
     /**
      * 解复用线程的致命错误（av_read_frame 返回真错误时记下）
      * 0 表示无错。解码线程看到它就直接报错，避免静默卡死。
      */
     std::atomic<int32_t> demuxError{0};
+
+    /**
+     * 视频解码耗时细分（2026-10-03 新增）
+     *
+     * 只在解码线程里读写（TakeVideoDecodeSplit 也由解码线程调用），
+     * 所以用普通 int64_t 就够，不需要原子。
+     * 取值后会被清零，便于按窗口统计（见 TakeVideoDecodeSplit）。
+     * 为什么必须细分：见头文件 VideoDecodeSplit 的说明 —— 老的"解码均"
+     * 把空转也算进去了，会把"在等包"误判成"解码慢"。
+     */
+    VideoDecodeSplit pfSplit;
+
+    /**
+     * 帧缓冲池（2026-10-03 新增）
+     *
+     * 只在解码线程里取用/归还（CopyFrame 取、RecycleFrameBuffer 还），
+     * 所以不需要加锁。
+     * 为什么要有它：帧队列是 move 语义，像素缓冲入队即被搬走，
+     * 没有池的话每帧都要重新分配 3.7MB 并零填充（还要付上千次缺页中断）。
+     * 上限刻意压得很小：同屏最多几帧在飞，多留只是白占内存。
+     */
+    std::vector<std::vector<uint8_t>> bufPool;
 
     /**
      * 关闭标志：置位后中断回调会让阻塞中的 av_read_frame 立即返回
@@ -1016,6 +1090,18 @@ bool SelfDecodeSubtitle(const uint8_t *data, int size, int64_t ptsMs, int64_t du
  * @return 该帧应显示多久（毫秒），供上层做帧间隔兜底
  */
 int64_t ResolveFrameTimestamp(DecoderSession *s, const AVFrame *raw, int64_t &ptsMs) {
+    // 帧间隔：攒够实测样本就用实测值，否则用容器/解码器给的（并夹到合理范围）。
+    // 为什么必须夹：这个 .rmvb 的容器帧率是 0.33fps（真实是 24fps），
+    // defaultFrameMs 因此是 3003ms —— 拿它当帧间隔会毁掉整条时间轴。
+    int64_t step = (s->measuredStepMs > 0 && s->stepSamples >= 8)
+        ? s->measuredStepMs
+        : ((s->defaultFrameMs > 1.0) ? static_cast<int64_t>(s->defaultFrameMs) : 40);
+    if (step < 5) {
+        step = 5;
+    }
+    if (step > 200) {
+        step = 40;   // 容器帧率不可信（<5fps）：先按 25fps 兜底，等实测值收敛
+    }
     int64_t pts = raw->best_effort_timestamp;
     if (pts == AV_NOPTS_VALUE) {
         pts = raw->pts;
@@ -1023,17 +1109,65 @@ int64_t ResolveFrameTimestamp(DecoderSession *s, const AVFrame *raw, int64_t &pt
     if (pts == AV_NOPTS_VALUE) {
         pts = raw->pkt_dts;
     }
+
+    // ★★ 坏时间戳防护（2026-10-03 真机定位）★★
+    //
+    //   现场日志（第五指令BD1024高清中英双字.rmvb，rv40/cook 1024x576）：
+    //     sync: pts=2002 audioClock=833028 writtenMs=833329 wait=-41 delta=-842677
+    //   正常帧的 pts 是 2002/2044/2085…（2~6 秒，步长 42ms），
+    //   而同一次播放里出现过 pts=844679（14 分钟）—— 上一帧的基准被顶到
+    //   14 分钟后，后续每一帧都被算成"落后 800 多秒"，于是
+    //   「按上限丢帧全速跑」→「真实时间戳回来后又超前 → 睡等」交替出现，
+    //   用户描述就是「卡一下快一下」（声音那边同一时刻也被顶到 833 秒）。
+    //
+    //   这类坏值是**流本身/解复用**给的（同一文件里音频、视频同时出现
+    //   量级相同的坏值），播放器能做的就是不要采信它：
+    //   与上一帧差距超过 3 秒（或倒退）就按坏值处理，
+    //   用「上一帧 + 实测帧间隔」补一个，保证时间轴单调、与音频时钟可比。
+    //
+    //   为什么阈值取 3 秒：正常视频相邻**显示帧**的时间间隔不可能到 3 秒，
+    //   而坏值的量级是几百秒，两者不会混淆。
+    //   重复时间戳（实测 .rm 上常见，diff == 0）不算跳变，
+    //   那种流由 durationMs 兜底推进（见 FfmpegTypes.h 的说明）。
     if (pts != AV_NOPTS_VALUE) {
-        ptsMs = av_rescale_q(pts, s->timeBase, AVRational{1, 1000});
+        int64_t ms = av_rescale_q(pts, s->timeBase, AVRational{1, 1000});
+        if (s->lastOutPtsMs >= 0) {
+            const int64_t diff = ms - s->lastOutPtsMs;
+            // ── 实测帧间隔的收敛 ──
+            // 只采信 5~200ms 的差值：正常视频的相邻帧间隔就在这个范围，
+            // 坏值（几百秒）和重复帧（0）都不会污染估计。
+            if (diff >= 5 && diff <= 200) {
+                s->measuredStepMs = (s->measuredStepMs <= 0)
+                    ? diff : (s->measuredStepMs * 3 + diff) / 4;
+                s->stepSamples++;
+            }
+            if (diff < -step || diff > 3000) {
+                if (s->tsJumpLog < 8) {
+                    s->tsJumpLog++;
+                    LOGW("视频时间戳跳变，已丢弃: 算出=%{public}lldms 上一帧=%{public}lldms "
+                         "(差 %{public}lldms) | 原始 best_effort=%{public}lld pts=%{public}lld "
+                         "dts=%{public}lld 时基=%{public}d/%{public}d 帧间隔=%{public}lldms",
+                         static_cast<long long>(ms), static_cast<long long>(s->lastOutPtsMs),
+                         static_cast<long long>(diff),
+                         static_cast<long long>(raw->best_effort_timestamp),
+                         static_cast<long long>(raw->pts),
+                         static_cast<long long>(raw->pkt_dts),
+                         s->timeBase.num, s->timeBase.den,
+                         static_cast<long long>(step));
+                }
+                ms = s->lastOutPtsMs + step;
+            }
+        }
+        ptsMs = ms;
+        s->lastOutPtsMs = ms;
         s->frameCounter++;
-        return (s->defaultFrameMs > 1.0) ? static_cast<int64_t>(s->defaultFrameMs) : 40;
+        return step;
     }
     // ★ 完全没有时间戳的流（实测 .rm 的 RealVideo 就是这种）：
     //   按帧序 × 帧间隔合成一条时间轴。
     //   否则 ptsMs 恒为 0，播放器就没了时间基准。
-    const int64_t step = (s->defaultFrameMs > 1.0)
-        ? static_cast<int64_t>(s->defaultFrameMs) : 40;
     ptsMs = s->frameCounter * step;
+    s->lastOutPtsMs = ptsMs;
     s->frameCounter++;
     return step;
 }
@@ -1094,44 +1228,73 @@ int32_t CopyFrame(DecoderSession *s, const AVFrame *src, VideoFrame &out,
     if (!EnsureSws(s, src, tw, th)) {
         return kDecodeFailed;
     }
-    if (s->convFrame == nullptr) {
-        s->convFrame = av_frame_alloc();
-        if (s->convFrame == nullptr) {
-            return kDecodeFailed;
-        }
-    }
-    if (s->convFrame->width != tw || s->convFrame->height != th
-        || s->convFrame->format != AV_PIX_FMT_RGBA) {
-        av_frame_unref(s->convFrame);
-        s->convFrame->format = AV_PIX_FMT_RGBA;
-        s->convFrame->width = tw;
-        s->convFrame->height = th;
-        const int ret = av_frame_get_buffer(s->convFrame, 32);
-        if (ret < 0) {
-            LOGE("av_frame_get_buffer 失败: %{public}s", AvErr(ret).c_str());
-            return kDecodeFailed;
-        }
-    }
-    sws_scale(s->sws, src->data, src->linesize, 0, src->height,
-              s->convFrame->data, s->convFrame->linesize);
-    const AVFrame *use = s->convFrame;
 
-    out.width = use->width;
-    out.height = use->height;
-    out.stride = use->linesize[0];
+    // RGBA 是打包格式（单平面）：行字节数 = 宽 × 4
+    const int stride = tw * 4;
+    const size_t size = static_cast<size_t>(stride) * static_cast<size_t>(th);
 
-    // ★ 时间戳必须从【原始解码帧 src】上取，不能从 convFrame 取！
-    //   convFrame 是 sws_scale 的输出帧，我们只往里写像素、从不设时间戳，
-    //   从它读 pts 会永远得到 AV_NOPTS_VALUE（这段曾是真实 bug，详见
-    //   ResolveFrameTimestamp 的说明）。
+    // ★★ 2026-10-03 性能修复：缓冲从池里取，池空才真正分配 ★★
+    //
+    //   原实现是 `out.data.resize(size)` —— 而 out 是调用方每帧新建的
+    //   VideoFrame（帧队列是 move 语义，像素缓冲入队即被搬走），所以
+    //   resize 每帧都要 **分配 3.7MB 并零填充**。手机上首次触碰新页会触发
+    //   缺页中断，3.7MB ÷ 4KB ≈ 900 次/帧。
+    //
+    //   真机实测（Mate 80, 1024x576 RV40 .rmvb）：
+    //     perf-split(近30帧): receive=0ms send=1ms 等包=0ms 转换=2369ms
+    //   解码器几乎不花时间，79ms/帧全在"分配 + 转换 + 拷贝"上。
+    //   池化之后这一项只剩 memcpy。
+    //   ★★ 2026-10-03 第二次量测（细分计时）★★
+    //   池化之后又打上细分子计时，真机结果是：
+    //     perf-split: 转换=1377ms（其中 分配=1271ms 缩放=106ms）
+    //   也就是说：sws_scale 本身只要 3.5ms/帧，而那 42ms/帧 全在
+    //   【取缓冲 + resize】这一步上 —— resize 会把 3.7MB 重新零填充
+    //   （std::vector::resize 对 uint8_t 是值初始化 = memset），
+    //   真机上这一趟要 40ms 量级，比缩放本身贵十倍。
+    //
+    //   而这块缓冲的内容**每次都会被 sws_scale 整块覆盖**，零填充毫无意义。
+    //   所以：池命中且长度正好时**什么都不做**（连 resize 都不调）。
+    //   归还时也刻意不 clear()，保留长度，命中才可能是"什么都不做"。
+    std::vector<uint8_t> buf;
+    const int64_t tAlloc0 = NowUs();
+    if (!s->bufPool.empty()) {
+        buf = std::move(s->bufPool.back());
+        s->bufPool.pop_back();
+    }
+    if (buf.capacity() < size) {
+        // 池空（或被队列挤掉的帧把缓冲带走了）或尺寸变大：必须新分配
+        buf = std::vector<uint8_t>();
+        buf.resize(size);
+        s->pfSplit.allocNew++;
+    } else if (buf.size() != size) {
+        // 容量够但长度不对：resize 会在容量内补零（不重新分配）
+        buf.resize(size);
+        s->pfSplit.resizeOnly++;
+    } else {
+        s->pfSplit.poolHit++;
+    }
+    const int64_t tScale0 = NowUs();
+
+    // ★ 让 sws_scale 直接写进这块池缓冲，省掉"先写 convFrame、再 memcpy 出来"
+    //   的一整趟 3.7MB 拷贝。sws 接受任意目标指针/行宽，只要行宽 ≥ 宽×4。
+    uint8_t *dstData[4] = { buf.data(), nullptr, nullptr, nullptr };
+    int dstLinesize[4] = { stride, 0, 0, 0 };
+    sws_scale(s->sws, src->data, src->linesize, 0, src->height, dstData, dstLinesize);
+    const int64_t tEnd = NowUs();
+    s->pfSplit.allocUs += (tScale0 - tAlloc0);
+    s->pfSplit.scaleUs += (tEnd - tScale0);
+
+    out.data = std::move(buf);      // 零拷贝交给队列
+    out.width = tw;
+    out.height = th;
+    out.stride = stride;
+
+    // ★ 时间戳必须从【原始解码帧 src】上取，不能从输出缓冲上取！
+    //   输出缓冲只有像素，我们从不往里写时间戳，从它读 pts 会永远是
+    //   AV_NOPTS_VALUE（这段曾是真实 bug，详见 ResolveFrameTimestamp 的说明）。
     int64_t ptsMs = 0;
     out.durationMs = ResolveFrameTimestamp(s, src, ptsMs);
     out.ptsMs = ptsMs;
-
-    // RGBA 是打包格式（单平面），按行拷进自有缓冲
-    const size_t size = static_cast<size_t>(out.stride) * use->height;
-    out.data.resize(size);
-    memcpy(out.data.data(), use->data[0], size);
     return kOk;
 }
 
@@ -1420,6 +1583,41 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
             avformat_close_input(&fmt);
             return kDecoderOpenFailed;
         }
+        // ★ 2026-10-03：把「线程到底开没开」打出来。
+        //
+        //   线程能力是【解码器自己声明】的，不是设了 thread_count 就一定有：
+        //   只有声明了 AV_CODEC_CAP_FRAME_THREADS / SLICE_THREADS 的解码器
+        //   才会真正起线程，否则 thread_count 被忽略、依旧单线程跑满一个核。
+        //   实测已知的对比（读 FFmpeg 7.1 源码得到的 capabilities）：
+        //     支持：h264 / hevc / mpeg4 / vp8 / vp9 / **rv30 / rv40**（FRAME_THREADS）
+        //     不支持：rv10 / rv20（RV10 那些）、wmv2、vc1、theora / vp3、mpeg2
+        //             —— 这些是 AV_CODEC_CAP_DR1 单独挂着，注定单线程。
+        //   所以"某些格式慢"有一部分是**解码器本身的限制**，不是我们没设置。
+        //   active_thread_type 是运行期实际生效的。★ 取值别记反了 ★：
+        //     FF_THREAD_FRAME = 1（多帧并行）
+        //     FF_THREAD_SLICE = 2（一帧内多分片并行）
+        //   （我第一版把这两个写反了，日志里显示成"分片多线程"，
+        //     查问题时差点据此判断成另一个方向 —— 已修正。）
+        {
+            const int att = vctx->active_thread_type;
+            const char *mode = (att == 0) ? "单线程"
+                             : (((att & 1) != 0) ? "帧级多线程" : "分片多线程");
+            LOGI("视频解码器 %{public}s: 线程数=%{public}d 实际模式=%{public}s(active_thread_type=%{public}d)",
+                 vdec->name, vctx->thread_count, mode, att);
+        }
+        // ★ 2026-10-03：把运行期的 CPU 特性也打出来。
+        //   为什么需要：sws_scale 的 YUV→RGBA 有 NEON 汇编实现，也有纯 C 回退。
+        //   如果 OHOS 上 av_get_cpu_flags() 探测不到 NEON，整条转换链会走 C 版，
+        //   1280x720 的转换实测就要 40ms 量级（每帧 3.7MB），
+        //   这正是"帧数上不去"的第二个大头。打出这个数就能确定要不要动它。
+        {
+            const int cpuFlags = av_get_cpu_flags();
+            LOGI("CPU 特性: av_get_cpu_flags=0x%{public}x NEON=%{public}s "
+                 "(AV_CPU_FLAG_NEON=0x%{public}x)",
+                 cpuFlags,
+                 ((cpuFlags & AV_CPU_FLAG_NEON) != 0) ? "已启用" : "未探测到",
+                 AV_CPU_FLAG_NEON);
+        }
         s->videoCtx = vctx;
         s->videoStreamIndex = vIdx;
         s->timeBase = fmt->streams[vIdx]->time_base;
@@ -1442,6 +1640,15 @@ int32_t Open(const std::string &path, Session &outSession, MediaSummary &out,
         if (s->defaultFrameMs < 1.0 || s->defaultFrameMs > 1000.0) {
             s->defaultFrameMs = 40.0;   // 异常值一律退回 25fps
         }
+        // ★ 2026-10-03：把容器/解码器报的帧率也打出来。
+        //   实测这个 .rmvb 容器报的是 0.33fps（真实 24fps），
+        //   于是帧间隔兜底值成了 3003ms，把整条时间轴都带歪了。
+        //   打出来才能一眼看出"这个文件的帧率元数据不可信"。
+        LOGI("帧率元数据: 容器 avg_frame_rate=%{public}d/%{public}d (%.3f fps) "
+             "解码器 framerate=%{public}d/%{public}d -> 帧间隔兜底=%{public}.1fms",
+             fmt->streams[vIdx]->avg_frame_rate.num, fmt->streams[vIdx]->avg_frame_rate.den,
+             out.frameRate,
+             vctx->framerate.num, vctx->framerate.den, s->defaultFrameMs);
         const char *pf = av_get_pix_fmt_name(vctx->pix_fmt);
         out.pixelFormat = pf != nullptr ? pf : "unknown";
 
@@ -1824,14 +2031,24 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
             avcodec_flush_buffers(s->videoCtx);
             // flush 之后解码器要从关键帧重开，置位让下面的循环跳过非关键帧
             s->videoWaitKeyframe = true;
+            s->videoWaitSkip = 0;
+            // seek 之后位置会合法地大幅跳变，坏时间戳防护的基准要一并重置
+            // （否则新位置的第一个关键帧会被误判成坏值，画面从错误的位置接上）
+            s->lastOutPtsMs = -1;
         }
     }
 
     // demux → decode 循环：一次调用可能吃掉多个 packet 才出一帧
+    s->pfSplit.calls++;
     for (int guard = 0; guard < 200; guard++) {
+        const int64_t tRecv0 = NowUs();
         const int ret = avcodec_receive_frame(s->videoCtx, s->rawFrame);
+        s->pfSplit.recvUs += (NowUs() - tRecv0);
         if (ret == 0) {
+            const int64_t tConv0 = NowUs();
             const int32_t r = CopyFrame(s, s->rawFrame, frame, scaleWidth, scaleHeight);
+            s->pfSplit.convUs += (NowUs() - tConv0);
+            s->pfSplit.frames++;
             av_frame_unref(s->rawFrame);
             return r;
         }
@@ -1853,7 +2070,9 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
         //   本函数只从队列取已经独立成包的 AVPacket —— 不存在并发读，
         //   连「包数据被覆盖」这类问题的土壤都没有了。
         av_packet_unref(s->videoPacket);
+        const int64_t tPop0 = NowUs();
         const int32_t qret = s->videoQueue->Pop(s->videoPacket, 20);
+        s->pfSplit.popUs += (NowUs() - tPop0);
         if (qret == kEof) {
             // 队列已空且解复用结束：送空包冲刷解码器里缓冲的帧
             avcodec_send_packet(s->videoCtx, nullptr);
@@ -1866,6 +2085,7 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
                 errMsg = "解复用失败: " + AvErr(de);
                 return kDecodeFailed;
             }
+            s->pfSplit.again++;
             return kAgain;
         }
         AVPacket *vpkt = s->videoPacket;
@@ -1888,39 +2108,76 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
         if (s->videoWaitKeyframe) {
             if ((vpkt->flags & AV_PKT_FLAG_KEY) == 0) {
                 av_packet_unref(vpkt);
+                // ★ 兜底：万一这一段的包全都没打关键帧标志（RMF 的标志
+                //   并不可靠），一直等下去就会变成"整段视频再也不出画面"。
+                //   累计跳够 kWaitKeySkipMax 个包还没等到关键帧时，
+                //   才动用最后手段：flush 一次 + 放弃等待标志。
+                //   这是有意的"两害相权"——只在真正卡死时才用，
+                //   因为 flush 正是上面说明里要避免的动作。
+                const int64_t kWaitKeySkipMax = 300;
+                if (++s->videoWaitSkip > kWaitKeySkipMax) {
+                    LOGW("等关键帧已跳过 %{public}lld 个包仍未命中，"
+                         "flush 后放弃等待关键帧标志",
+                         static_cast<long long>(s->videoWaitSkip));
+                    avcodec_flush_buffers(s->videoCtx);
+                    s->videoWaitKeyframe = false;
+                    s->videoWaitSkip = 0;
+                }
                 continue;
             }
             s->videoWaitKeyframe = false;
             // 只在诊断需要时看这条：换轨时每次都会打一条，属正常现象
-            LOGI("seek 后已等到关键帧（pts=%{public}lld），恢复送包",
-                 static_cast<long long>(vpkt->pts));
+            LOGI("已等到关键帧（pts=%{public}lld），恢复送包（跳过 %{public}lld 个包）",
+                 static_cast<long long>(vpkt->pts),
+                 static_cast<long long>(s->videoWaitSkip));
+            s->videoWaitSkip = 0;
         }
+        const int64_t tSend0 = NowUs();
         int rret = avcodec_send_packet(s->videoCtx, vpkt);
-        // ★ 被解码器拒绝时先尝试自愈，而不是直接把整个播放判失败。
+        // ★★ 被解码器拒绝时【绝不 flush】，改为等关键帧 ★★
         //
         //   背景（真机实测）：换音轨/换字幕会走"重开会话 + seek 回原位"，
-        //   期间视频解码器会被 flush。这个过程中偶尔会有一个包被 VP9
-        //   拒绝（AVERROR_INVALIDDATA），日志形如：
+        //   期间视频解码器会被 flush，偶尔有一个包被拒绝
+        //   （AVERROR_INVALIDDATA），日志形如：
         //     send_packet 失败: size=73670 pts=5640 / size=8714 pts=560
-        //   包本身是好的（73KB 像关键帧）—— 是**解码器状态**处于
-        //   "等关键帧"而收到的不是它预期的那个包。
+        //   包本身是好的 —— 是**解码器状态**处于"等关键帧"，
+        //   而收到的不是它预期的那个包。
         //
-        //   对这种情况：flush 一次、把同一个包重发一遍。
-        //   VP9 的包是自包含的，清空解码器后重发通常就能接上；
-        //   接不上也只是这一帧丢，后面从下一个关键帧自然恢复 ——
-        //   这比"整段播放直接失败、用户只能返回"好得多。
+        //   原做法是「flush 一次 + 把同一个包重发一遍」，理由是"VP9 的包
+        //   自包含，清空后重发能接上"。这个做法对 RV40 这类**带帧间预测**
+        //   的流是灾难性的，而且会自我维持成死循环 ——
         //
-        //   只重试一次（用局部标志），避免坏流导致死循环。
+        //   2026-10-03 真机日志复原（Mate 80，
+        //   第五指令BD1024高清中英双字.rmvb / rv40，续播位置 193806ms）：
+        //     13:49:53.187  seek 后已等到关键帧（pts=194027），恢复送包
+        //     13:49:53.196  视频包被拒…flush 后重发一次: pts=194319
+        //     13:49:53.205  视频包被拒…flush 后重发一次: pts=194653
+        //     …（约每 20ms 一次，持续整段播放，70 秒里共 264 次）
+        //   同期 **一次 perf 日志都没有**（30 帧打一条）→ 全程 0 帧出画。
+        //
+        //   为什么会自我维持：帧级多线程（本流 9 线程）解码器的报错是
+        //   **延迟上报**的 —— send(P1) 返回的 INVALIDDATA 往往属于更早
+        //   送进去的那个包。此时 flush 会把流水线里正在跑的包连同它的
+        //   参考帧一起丢掉，于是下一个包必然又报 INVALIDDATA → 再 flush……
+        //   每秒两次 flush 也意味着解码器的帧级流水线永远排不满，
+        //   这本身就是"解码只有个位数 fps"的一大来源。
+        //
+        //   正确做法是**完全不动解码器**：丢掉当前这一包，转入"等关键帧"，
+        //   让解码器自己从下一个关键帧把参考链重新对齐（下面的
+        //   videoWaitKeyframe 分支就是为此存在的，它与 seek 用同一个约定）。
+        //   只丢一两个 GOP 的代价，远小于"整段播不出画面"。
         if (rret == AVERROR_INVALIDDATA) {
-            LOGW("视频包被拒（可能是换轨后解码器状态未就绪），"
-                 "flush 后重发一次: size=%{public}d pts=%{public}lld",
-                 vpkt->size, static_cast<long long>(vpkt->pts));
-            avcodec_flush_buffers(s->videoCtx);
-            rret = avcodec_send_packet(s->videoCtx, vpkt);
-            if (rret == 0 || rret == AVERROR(EAGAIN)) {
-                LOGI("flush 后重发成功，播放继续");
-            }
+            s->pfSplit.flushRetry++;
+            LOGW("视频包被拒（参考链断了，转入等关键帧）: size=%{public}d "
+                 "pts=%{public}lld flags=%{public}d（不 flush，避免破坏帧级流水线）",
+                 vpkt->size, static_cast<long long>(vpkt->pts), vpkt->flags);
+            s->videoWaitKeyframe = true;
+            s->videoWaitSkip = 0;
+            s->pfSplit.waitKeyframe++;
+            av_packet_unref(vpkt);
+            continue;
         }
+        s->pfSplit.sendUs += (NowUs() - tSend0);
         av_packet_unref(vpkt);
         if (rret < 0 && rret != AVERROR(EAGAIN)) {
             // 诊断：只在失败时打印（原先逐包打印会刷屏）。
@@ -1934,6 +2191,58 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
         }
     }
     return kAgain;
+}
+
+void TakeVideoDecodeSplit(Session session, VideoDecodeSplit &out) {
+    auto *s = static_cast<DecoderSession *>(session);
+    if (s == nullptr) {
+        return;
+    }
+    // 取走即清零：调用方按窗口统计（每次都拿到"自上次取走以来"的增量）
+    out = s->pfSplit;
+    s->pfSplit = VideoDecodeSplit{};
+}
+
+/**
+ * 把用完的帧缓冲还给会话的缓冲池（2026-10-03 新增）
+ *
+ * ★ 注意本函数必须定义在匿名 namespace【之外】——
+ *   它是头文件里声明的公开 API，放进匿名 namespace 会变成内部链接的
+ *   另一个函数，公开符号没人实现 → 链接报 undefined symbol。
+ *   （我第一版就放错位置了，挪出来时留下这条备注。）
+ */
+void RecycleFrameBuffer(Session session, VideoFrame &frame) {
+    auto *s = static_cast<DecoderSession *>(session);
+    if (s == nullptr) {
+        return;
+    }
+    // 上限 = 帧队列深度（引擎侧 kFrameQueueSize = 8）。
+    //
+    // ★ 为什么必须是 8 而不是原来随手写的 4（2026-10-03 真机量测）：
+    //   池的收支是「每渲染一帧：队列-1、池+1；每解一帧：池-1、队列+1」，
+    //   只有池空且还要解帧时才会真的去分配。池上限如果小于队列深度，
+    //   就会出现「队列灌满 8 帧 → 池空 → 下一轮解帧必然新分配」的循环。
+    //   而真机上一次 3.7MB 的新分配实测要 **42ms**（系统内存吃紧，
+    //   每次都要回收/换页），日志里表现为每两个窗口就有 新分配=4、
+    //   分配=191ms。池开到 8 之后稳态下 新分配=0，这几毫秒/帧的
+    //   抖动就消失了。
+    //   内存不会因此膨胀：总缓冲数上限 ≈ 队列深度 + 1 + 池上限，
+    //   而"池满"和"队列满"不会同时发生（两者此消彼长）。
+    const size_t kPoolMax = 8;
+    if (frame.data.capacity() == 0 || s->bufPool.size() >= kPoolMax) {
+        return;
+    }
+    // ★ 刻意**不调 clear()**：保留 length，让下次取用时容量和长度都正好，
+    //   连 resize（3.7MB 零填充，真机 40ms 量级）都能省掉。
+    //   内容会被 sws_scale 整块覆盖，残留数据无所谓。
+    //   同样刻意不调 shrink_to_fit —— 那会把容量也放掉，等于白做池。
+    s->bufPool.push_back(std::move(frame.data));
+    frame.data = std::vector<uint8_t>();
+    frame.stride = 0;
+    frame.width = 0;
+    frame.height = 0;
+    frame.ptsMs = 0;
+    frame.durationMs = 0;
 }
 
 int32_t DecodeAudioChunk(Session session, AudioChunk &chunk, std::string &errMsg) {
@@ -1951,6 +2260,9 @@ int32_t DecodeAudioChunk(Session session, AudioChunk &chunk, std::string &errMsg
         if (gen != s->audioSeekGen) {
             s->audioSeekGen = gen;
             avcodec_flush_buffers(s->audioCtx);
+            // seek 之后位置会合法地大幅跳变，坏时间戳防护的基准必须一并重置，
+            // 否则新位置的第一个块会被误判成"坏值"而丢掉真实时间戳
+            s->lastAudioPtsMs = -1;
             if (s->swr != nullptr) {
                 swr_close(s->swr);
                 swr_init(s->swr);
@@ -2003,7 +2315,33 @@ int32_t DecodeAudioChunk(Session session, AudioChunk &chunk, std::string &errMsg
             if (pts == AV_NOPTS_VALUE) {
                 pts = 0;
             }
-            chunk.ptsMs = av_rescale_q(pts, s->audioTimeBase, AVRational{1, 1000});
+            int64_t ptsMs = av_rescale_q(pts, s->audioTimeBase, AVRational{1, 1000});
+
+            // ★ 坏时间戳防护（与视频侧同一个理由，见 ResolveFrameTimestamp 的说明）：
+            //   实测日志 writtenMs=833329 就是这里来的 —— 一段 cook 音频的 pts
+            //   被算成 833 秒（真实位置只有 2 秒），音频时钟是视频侧的主时钟，
+            //   它一跳，画面就"快一下"；它一停，画面就"卡一下"。
+            //   音频数据本身是好听的（时长按样本数算，不依赖 pts），
+            //   所以只要把坏 pts 换成"上一段 + 本段时长"即可，声音不受影响。
+            if (s->lastAudioPtsMs >= 0) {
+                const int64_t diff = ptsMs - s->lastAudioPtsMs;
+                // 音频相邻块只差几十毫秒；超过 3 秒或倒退即为坏值
+                if (diff < 0 || diff > 3000) {
+                    if (s->tsJumpLog < 16) {
+                        s->tsJumpLog++;
+                        LOGW("音频时间戳跳变，已丢弃: 算出=%{public}lldms 上一段=%{public}lldms "
+                             "(差 %{public}lldms) 原始 pts=%{public}lld 时基=%{public}d/%{public}d",
+                             static_cast<long long>(ptsMs),
+                             static_cast<long long>(s->lastAudioPtsMs),
+                             static_cast<long long>(diff),
+                             static_cast<long long>(pts),
+                             s->audioTimeBase.num, s->audioTimeBase.den);
+                    }
+                    ptsMs = s->lastAudioPtsMs;
+                }
+            }
+            s->lastAudioPtsMs = ptsMs;
+            chunk.ptsMs = ptsMs;
 
             const int bytes = converted * kAudioChannels * 2;
             chunk.data.resize(static_cast<size_t>(bytes));

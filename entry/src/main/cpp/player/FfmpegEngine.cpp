@@ -542,7 +542,47 @@ bool FfmpegEngine::EnsureWindow() {
     return true;
 }
 
+void *FfmpegEngine::MapSurfaceBuffer(void *rawHandle) {
+    BufferHandle *handle = static_cast<BufferHandle *>(rawHandle);
+    if (handle == nullptr || handle->fd < 0 || handle->size <= 0) {
+        return nullptr;
+    }
+    // 命中缓存：同一块 surface buffer 重复使用时一次 mmap 就够了
+    for (SurfaceMap &m : surfaceMaps_) {
+        if (m.fd == handle->fd && m.size == handle->size) {
+            return m.ptr;
+        }
+    }
+    void *ptr = mmap(nullptr, handle->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                     handle->fd, 0);
+    if (ptr == MAP_FAILED) {
+        LOGE("mmap 失败: size=%{public}d fd=%{public}d", handle->size, handle->fd);
+        return nullptr;
+    }
+    // 上限保护：surface buffer 只会循环复用固定几块，
+    // 万一驱动每次给新 fd 也不会无限增长（满了就退回"每次映射"的老路）
+    constexpr size_t kMapCacheMax = 8;
+    if (surfaceMaps_.size() < kMapCacheMax) {
+        surfaceMaps_.push_back(SurfaceMap{handle->fd, handle->size, ptr});
+    }
+    return ptr;
+}
+
+void FfmpegEngine::ClearSurfaceMapCache() {
+    // 只 munmap，不写回 —— 这是显示缓冲，驱动自己管内容
+    for (SurfaceMap &m : surfaceMaps_) {
+        if (m.ptr != nullptr) {
+            munmap(m.ptr, static_cast<size_t>(m.size));
+        }
+    }
+    surfaceMaps_.clear();
+}
+
 void FfmpegEngine::CloseWindow() {
+    // ★ 顺序要紧：映射是挂在窗口的 buffer 上的，必须先丢掉映射缓存，
+    //   再销毁窗口 —— 反过来的话，缓存里留下的是已经失效的 fd 映射，
+    //   下次上屏会往一块野内存里写（表现为整进程被杀、没有堆栈）。
+    ClearSurfaceMapCache();
     if (nativeWindow_ != nullptr) {
         OH_NativeWindow_DestroyNativeWindow(reinterpret_cast<OHNativeWindow *>(nativeWindow_));
         nativeWindow_ = nullptr;
@@ -565,7 +605,9 @@ bool FfmpegEngine::RenderFrame(VideoFrame &frame) {
     // 请求一块可写 buffer
     OHNativeWindowBuffer *buffer = nullptr;
     int fenceFd = -1;
+    const int64_t tReq0 = NowUs();
     int32_t ret = OH_NativeWindow_NativeWindowRequestBuffer(win, &buffer, &fenceFd);
+    perfReqUs_ += (NowUs() - tReq0);
     if (ret != 0 || buffer == nullptr) {
         LOGE("RequestBuffer 失败: %{public}d", ret);
         return false;
@@ -633,10 +675,17 @@ bool FfmpegEngine::RenderFrame(VideoFrame &frame) {
         return false;
     }
 
-    void *mapped = mmap(nullptr, handle->size, PROT_READ | PROT_WRITE, MAP_SHARED,
-                        handle->fd, 0);
-    if (mapped == MAP_FAILED) {
-        LOGE("mmap 失败: size=%{public}d fd=%{public}d", handle->size, handle->fd);
+    // ★★ 2026-10-03：改成走映射缓存 ★★
+    //
+    //   原来是每帧 mmap + munmap 一次（3.7MB，900 个页），
+    //   实测 RenderFrame 平均 8~13ms，主因就是这里的映射开销 +
+    //   首次写入时的逐页缺页，而不是那趟 memcpy。
+    //   surface 只循环复用固定几块 buffer，按 (fd,size) 缓存后
+    //   每块只映射一次，之后每帧直接白拿。
+    const int64_t tMap0 = NowUs();
+    void *mapped = MapSurfaceBuffer(handle);
+    perfMapUs_ += (NowUs() - tMap0);
+    if (mapped == nullptr) {
         OH_NativeWindow_NativeWindowAbortBuffer(win, buffer);
         return false;
     }
@@ -645,7 +694,6 @@ bool FfmpegEngine::RenderFrame(VideoFrame &frame) {
     const size_t srcNeed = static_cast<size_t>(frame.stride) * h;
     if (frame.data.size() < srcNeed) {
         LOGE("源帧数据不足: %{public}zu < %{public}zu", frame.data.size(), srcNeed);
-        munmap(mapped, handle->size);
         OH_NativeWindow_NativeWindowAbortBuffer(win, buffer);
         return false;
     }
@@ -653,6 +701,7 @@ bool FfmpegEngine::RenderFrame(VideoFrame &frame) {
     // RGBA8888 逐行拷贝。
     // 必须按 stride 逐行拷而不是整块 memcpy：buffer 的行宽通常大于
     // 画面行字节，整块拷会让画面按斜线错位。
+    const int64_t tCopy0 = NowUs();
     uint8_t *dst = static_cast<uint8_t *>(mapped);
     const int32_t srcStride = frame.stride;
     for (int32_t row = 0; row < h; row++) {
@@ -660,10 +709,7 @@ bool FfmpegEngine::RenderFrame(VideoFrame &frame) {
                frame.data.data() + static_cast<size_t>(row) * srcStride,
                static_cast<size_t>(rowBytes));
     }
-
-    if (munmap(mapped, handle->size) != 0) {
-        LOGE("munmap 失败");
-    }
+    perfCopyUs_ += (NowUs() - tCopy0);
 
     // 成功写出一帧就计数，便于判断"画面黑"到底是没渲染还是渲染了但内容不对
     const int64_t n = framesRendered_.fetch_add(1) + 1;
@@ -677,7 +723,9 @@ bool FfmpegEngine::RenderFrame(VideoFrame &frame) {
     Region dirty;
     dirty.rects = nullptr;
     dirty.rectNumber = 0;
+    const int64_t tFlush0 = NowUs();
     ret = OH_NativeWindow_NativeWindowFlushBuffer(win, buffer, -1, dirty);
+    perfFlushUs_ += (NowUs() - tFlush0);
     if (ret != 0) {
         LOGE("FlushBuffer 失败: %{public}d", ret);
         return false;
@@ -786,8 +834,28 @@ void FfmpegEngine::DecodeLoop() {
             continue;
         }
 
-        VideoFrame frame;
-        if (!queue->Pop(frame, 50)) {
+        // ★★ 2026-10-03 重做节流：先看队头的时间戳，再决定「等 / 取 / 丢」★★
+        //
+        //   真机现场（第五指令BD1024高清中英双字.rmvb）：clock 日志显示
+        //   30 帧只花 0.5 秒（约 60fps），而 pts 每 0.5 秒涨 1.25 秒 ——
+        //   画面在**2.5 倍速狂奔**，声音还是 1 倍速，于是越拉越远，
+        //   追不上数据时又卡住等包，用户看到的就是「卡一下快一下」。
+        //
+        //   根因是旧写法里那道"时钟兜底"：
+        //       if (waitMs > 1000) waitMs = 0;   // ← 一旦领先 >1 秒就彻底放弃节流
+        //   它的本意是"音频时钟刚起步/seek 后还没追上时别把画面卡死"，
+        //   但副作用是：**只要画面领先超过 1 秒，节流就被永久关闭**，画面自由狂奔。
+        //   而现实里 seek 之后很容易领先 1 秒以上（视频要从关键帧重开，
+        //   音频却从 seek 点直接接上），所以这个洞几乎必然被触发。
+        //
+        //   正确做法：等待要**分片**做，而不是一刀切成 0：
+        //     · 队头还没到显示时刻 → 睡一小段（最多 50ms）再看一眼，
+        //       帧留在队列里不取（取出来就意味着必须马上上屏）；
+        //     · 队列满了解码线程自然停下，画面最多领先一个队列的深度；
+        //     · 确实落后（waitMs < -100）才丢帧追进度。
+        //   这样"领先"永远被压在一个队列深度（约 0.3 秒）以内，不会无限拉大。
+        int64_t headPts = 0;
+        if (!queue->Peek(headPts)) {
             // 队列空：要么正在补数据，要么已经解完
             if (eofReached && queue->Size() == 0) {
                 positionMs_.store(info_.durationMs);
@@ -799,8 +867,48 @@ void FfmpegEngine::DecodeLoop() {
             continue;
         }
 
+        // 主时钟：有音频用音频时钟，否则退回单调时钟。
+        // 这段只用来**判断**，真正取帧在后面（判断不需要帧本身，只要 pts）。
+        int64_t clockSyncMs = -1;      // 供日志
+        int64_t waitMs = 0;
+        {
+            const int64_t nowMsProbe = NowMs();
+            const AudioOutput *ao = audio_.get();
+            if (audioReady_ && ao != nullptr && ao->IsRunning()) {
+                const int64_t bytesPerMs = static_cast<int64_t>(codecapi::AudioSampleRate())
+                                           * codecapi::AudioChannels() * 2 / 1000;
+                const int64_t notYetPlayedMs = (bytesPerMs > 0)
+                    ? (static_cast<int64_t>(ao->BufferedBytes()) / bytesPerMs) : 0;
+                clockSyncMs = audioWrittenMs_.load() - notYetPlayedMs;
+                waitMs = headPts - clockSyncMs;
+            } else if (lastFramePtsMs_ >= 0) {
+                const int64_t targetSysMs = lastFrameSysMs_ + (headPts - lastFramePtsMs_);
+                waitMs = targetSysMs - nowMsProbe;
+            }
+        }
+
+        if (waitMs > 2) {
+            // 还没到显示时刻：只睡一小段，不取帧。
+            // 为什么分片：seek / 暂停 / 退出都要能立刻响应，
+            // 睡一个几秒的长觉会让这些操作全部变迟钝。
+            const int64_t napMs = (waitMs > 50) ? 50 : waitMs;
+            sleeper->Sleep(static_cast<int>(napMs));
+            continue;
+        }
+
+        VideoFrame frame;
+        // 时间已经到了（或已经晚了）：取出来上屏
+        if (!queue->Pop(frame, 0)) {
+            continue;
+        }
+
         // 按 pts 与「主时钟」的差值决定等待还是丢帧
         const int64_t nowMs = NowMs();
+        // ★ 这两个值提到 if 外面，是为了让下面每 30 帧的 clock 汇总日志能打到
+        //   （原先它们只在 else 分支里，出了问题看不到中间过程，
+        //    只能看到前 8 次"即将丢帧"的抽样 —— 排查"卡一下快一下"时完全不够）
+        int64_t audioClockDbg = clockSyncMs;
+        int64_t frameDeltaMs = 0;
         if (lastFramePtsMs_ < 0) {
             // 第一帧（或 seek 之后的第一帧）：对齐基准，立刻显示
             lastFramePtsMs_ = frame.ptsMs;
@@ -815,8 +923,6 @@ void FfmpegEngine::DecodeLoop() {
             //   （已写入时长 − 缓冲里还没播的时长），画面跟着它走就不会散。
             //
             //   没有可用音频轨时才退回单调时钟。
-            int64_t waitMs = 0;
-            int64_t audioClockDbg = -1;
             const AudioOutput *ao = audio_.get();
             if (audioReady_ && ao != nullptr && ao->IsRunning()) {
                 const int64_t bytesPerMs = static_cast<int64_t>(codecapi::AudioSampleRate())
@@ -832,12 +938,20 @@ void FfmpegEngine::DecodeLoop() {
                 waitMs = targetSysMs - nowMs;
             }
 
-            // 时钟上限保护：音频刚启动时钟还停在起点（或 seek 后尚未追上）时，
-            // 差值可能很大。这时如果一味等待，画面会卡住不动。
-            // 超过 1 秒就认为"时钟还没准备好"，改为立即显示。
-            if (waitMs > 1000) {
-                waitMs = 0;
-            }
+            // ★★ 2026-10-03：原来这里有一道「waitMs > 1000 就当 0」的兜底，
+            //   已经【删除】—— 它正是"卡一下快一下"的元凶 ★★
+            //
+            //   原注释写的理由（"音频时钟刚起步或 seek 后没追上时，一味等待会让
+            //   画面卡住不动"）本身没错，但做法太粗暴：只要画面领先超过 1 秒，
+            //   节流就被**永久关闭**，画面开始按解码速度自由狂奔。
+            //   真机实测就是 2.5 倍速跑（30 帧只用 0.5 秒，pts 却涨了 1.25 秒），
+            //   一路领先到 12 秒，追不上码流时又卡住等包。
+            //
+            //   现在等待改成在**取帧之前**分片进行（见上面那段"先看队头"），
+            //   领先量永远被压在一个队列深度以内，这里不需要、也不能再一刀切成 0。
+            //
+            //   （若确实遇到"时钟还没准备好"的极端情况，分片等待也会每 50ms
+            //     重新判断一次，时钟一走起来就自动继续，不会真的卡死。）
 
             // ★★ 丢帧保护：把 waitMs 夹到「两帧应间隔的上限」★★
             //
@@ -858,8 +972,37 @@ void FfmpegEngine::DecodeLoop() {
             //     ② 上限 = 当前帧 pts 相对上一帧的增量：时钟超前不应让画面加速。
             //   只有当「上一帧已经渲染过、而当前帧 pts 比它还早」才夹下限 ——
             //   那种情况帧序本身就是乱序或重复，夹住比丢掉更合理。
-            const int64_t frameDeltaMs = (lastFramePtsMs_ >= 0)
+            const int64_t frameDeltaMsCalc = (lastFramePtsMs_ >= 0)
                 ? (frame.ptsMs - lastFramePtsMs_) : 0;
+            frameDeltaMs = frameDeltaMsCalc;
+
+            // ★ 时间基准自愈（2026-10-03 加，针对真机「卡一下快一下」）★★
+            //
+            //   起因：这个 .rmvb 会偶发吐出 833~845 秒的坏时间戳（正常是 2~6 秒），
+            //   已经在解码层做了防护（见 ResolveFrameTimestamp），这里再加一道：
+            //   万一坏值从别处混进来（音频时钟跳变、坏包等），
+            //   绝不能让【一个】坏值把整段播放带偏 ——
+            //   下面的夹子只会把它当成"落后一帧"或"超前一帧"，
+            //   但基准被顶高之后，后续每一帧都会持续被判成落后/超前，
+            //   表现为画面一会儿全速一会儿定住。
+            //   做法：差距离谱时直接以当前帧为新基准，不等待、不丢帧。
+            //   一个坏值只影响一帧，之后立刻恢复正常节奏。
+            if (frameDeltaMs > 3000 || frameDeltaMs < -2000) {
+                if (tsRealignLog_ < 8) {
+                    tsRealignLog_++;
+                    LOGW("时间基准重置: 本帧 pts=%{public}lld 上一帧=%{public}lld "
+                         "（差 %{public}lldms，超出合理范围）audioClock=%{public}lld",
+                         static_cast<long long>(frame.ptsMs),
+                         static_cast<long long>(lastFramePtsMs_),
+                         static_cast<long long>(frameDeltaMs),
+                         static_cast<long long>(audioClockDbg));
+                }
+                lastFramePtsMs_ = frame.ptsMs;
+                lastFrameSysMs_ = nowMs;
+                waitMs = 0;
+                frameDeltaMs = 0;
+            }
+
             // 帧时长兜底：相邻帧时间戳相同或缺失时（实测 .rm 的 RealVideo 就是
             // 每帧 pts 都为 0），按解码层给出的帧时长推进，而不是当成 0 差值 ——
             // 否则整个视频会被瞬间播完，进度条也永远停在 0。
@@ -885,16 +1028,22 @@ void FfmpegEngine::DecodeLoop() {
                      static_cast<long long>(frameDeltaMs));
             }
 
-            if (waitMs > 2) {
-                sleeper->Sleep(static_cast<int>(waitMs));
-            } else if (waitMs < -100) {
+            // ★ 2026-10-03：这里原来还有一句 `if (waitMs > 2) sleeper->Sleep(waitMs);`
+            //   —— 已删除。等待现在一律在**取帧之前**做（队头还没到点就继续睡），
+            //   走到这里说明这一帧已经出队，只能"显示或丢弃"，不能再睡：
+            //   睡在这里等于帧被拿在手上干等，队列白腾出一个位置，
+            //   而且睡多久都改变不了"它已经过期"的事实。
+            if (waitMs < -100) {
                 // 落后太多：丢掉这一帧直接追进度。
                 // 不丢的话会越积越多，表现为"越播越延迟"
                 droppedFrames_.fetch_add(1);
-                // 先取 pts 再 Clear —— Clear 会把 ptsMs 归零，
+                // 先取 pts 再回收 —— 回收会把 ptsMs 归零，
                 // 顺序反了基准就变成 0，之后所有帧都会算成"落后"而全被丢掉
                 const int64_t droppedPts = frame.ptsMs;
-                frame.Clear();
+                // ★ 用回收代替 Clear()：Clear() 只清长度，这块 3.7MB 的缓冲
+                //   随后会被下一次 Pop 的移动赋值直接释放掉，池子就白做了。
+                //   实测这条分支很热（首轮 450 帧里丢了 230 帧），必须回收。
+                codecapi::RecycleFrameBuffer(session_, frame);
                 lastFramePtsMs_ = droppedPts;
                 lastFrameSysMs_ = nowMs;
                 continue;
@@ -909,6 +1058,22 @@ void FfmpegEngine::DecodeLoop() {
         RenderFrame(frame);
         perfRenderUs_ += (NowUs() - renderT0);
         perfFrames_++;
+
+        // ★★ 2026-10-03：补上一直漏掉的"渲染后更新时钟基准" ★★
+        //
+        //   这两个值（上一帧的 pts / 对应的系统时刻）原本只在
+        //   ①首帧对齐 ②丢帧 两条分支里被写过，**正常渲染路径上没有更新**。
+        //   后果是它们一直停在"起播那第一帧"，于是：
+        //     · frameDeltaMs = 本帧 pts − 首帧 pts，会随时间无限增长
+        //       （实测每约 3 秒就超过 3000ms 一次，日志里那条"时间基准重置"
+        //         就是它触发的，差值精确等于 72 帧 × 41.7ms ≈ 3003ms）；
+        //     · 无音轨时退回的单调时钟（targetSys = lastFrameSysMs_ +
+        //       (pts − lastFramePtsMs_)）算出来的目标时刻是错的，
+        //       画面要么狂奔要么定住；
+        //     · 两道防丢帧夹子（都以 frameDeltaMs 为准）全部失效。
+        //   这一处漏更新，是"画面节奏忽快忽慢"的根因之一，不只是日志难看。
+        lastFramePtsMs_ = frame.ptsMs;
+        lastFrameSysMs_ = nowMs;
         // 每 30 帧打一次性能汇总，用来定位"卡"到底卡在解码还是上屏
         if ((perfFrames_ % 30) == 0) {
             const int64_t df = perfFrames_ > 0 ? (perfDecodeUs_ / perfFrames_) : 0;
@@ -921,6 +1086,68 @@ void FfmpegEngine::DecodeLoop() {
                  static_cast<long long>(df + rf),
                  static_cast<long long>(df + rf > 0 ? 1000000 / (df + rf) : 0),
                  static_cast<long long>(droppedFrames_.load()));
+
+            // ★ 2026-10-03：把这 30 帧窗口内的解码耗时拆开打一次。
+            //   起因：真机实测 1280x720 RV40 的 .rmvb 出现
+            //   「解码均=212ms 但进程 CPU 只用 28%」的矛盾 —— 老的"解码均"
+            //   分子把每次空转(kAgain)也累加了、分母只算成功帧，口径是坏的，
+            //   完全指不出方向。这四个数是【同一窗口内的绝对耗时】，
+            //   不是平均值：拿它们和 df*30 一比就知道有多少是纯等待。
+            // ★ 2026-10-03：上屏耗时也拆开打一次。理由见 FfmpegEngine.h 里
+            //   perfReqUs_ 的说明 —— 只有"拷贝"和"映射"能优化，
+            //   "等合成器"（Request/Flush 阻塞）优化代码是没用的。
+            //   这里打的是**每帧平均值**（累计 ÷ 已上屏帧数），与"上屏均"口径一致。
+            LOGI("perf-render(每帧均): 取缓冲=%{public}lldus 映射=%{public}lldus "
+                 "拷贝=%{public}lldus 送显=%{public}lldus",
+                 static_cast<long long>(perfFrames_ > 0 ? perfReqUs_ / perfFrames_ : 0),
+                 static_cast<long long>(perfFrames_ > 0 ? perfMapUs_ / perfFrames_ : 0),
+                 static_cast<long long>(perfFrames_ > 0 ? perfCopyUs_ / perfFrames_ : 0),
+                 static_cast<long long>(perfFrames_ > 0 ? perfFlushUs_ / perfFrames_ : 0));
+
+            // ★ 时钟汇总（2026-10-03 加）：每 30 帧打一次当前节奏。
+            //   排查「卡一下快一下」时靠的就是它 —— 只看前 8 次"即将丢帧"的
+            //   抽样日志看不出"忽快忽慢"，而这一行能连续看到：
+            //   这一帧的 pts、与上一帧的间隔、主时钟走到哪、净等待多少毫秒。
+            //   正常播放时 wait 应在 0~帧间隔之间小幅波动、pts 稳步增长；
+            //   一旦出现 wait 长时间贴 -deltaClamp（全速跑）或贴 +deltaClamp（定住），
+            //   就是时钟基准被带偏了。
+            LOGI("clock: pts=%{public}lld delta=%{public}lld audioClock=%{public}lld "
+                 "writtenMs=%{public}lld wait=%{public}lld 丢帧=%{public}lld 队列=%{public}zu",
+                 static_cast<long long>(frame.ptsMs),
+                 static_cast<long long>(frameDeltaMs),
+                 static_cast<long long>(audioClockDbg),
+                 static_cast<long long>(audioWrittenMs_.load()),
+                 static_cast<long long>(waitMs),
+                 static_cast<long long>(droppedFrames_.load()),
+                 queue->Size());
+
+            if (session_ != nullptr) {
+                codecapi::VideoDecodeSplit sp;
+                codecapi::TakeVideoDecodeSplit(session_, sp);
+                const int64_t calls = sp.calls;
+                const int64_t idlePct = calls > 0 ? (sp.again * 100 / calls) : 0;
+                LOGI("perf-split(近30帧): receive=%{public}lldms send=%{public}lldms "
+                     "等包=%{public}lldms 转换=%{public}lldms"
+                     "（其中 分配=%{public}lldms 缩放=%{public}lldms）| "
+                     "池命中=%{public}lld 新分配=%{public}lld 只resize=%{public}lld | "
+                     "调用=%{public}lld 空转=%{public}lld(%{public}lld%%) 出帧=%{public}lld "
+                     "被拒重发=%{public}lld 等关键帧=%{public}lld",
+                     static_cast<long long>(sp.recvUs / 1000),
+                     static_cast<long long>(sp.sendUs / 1000),
+                     static_cast<long long>(sp.popUs / 1000),
+                     static_cast<long long>(sp.convUs / 1000),
+                     static_cast<long long>(sp.allocUs / 1000),
+                     static_cast<long long>(sp.scaleUs / 1000),
+                     static_cast<long long>(sp.poolHit),
+                     static_cast<long long>(sp.allocNew),
+                     static_cast<long long>(sp.resizeOnly),
+                     static_cast<long long>(calls),
+                     static_cast<long long>(sp.again),
+                     static_cast<long long>(idlePct),
+                     static_cast<long long>(sp.frames),
+                     static_cast<long long>(sp.flushRetry),
+                     static_cast<long long>(sp.waitKeyframe));
+            }
         }
 
         // 位置按 pts 上报，而不是按解到第几帧 ——
@@ -930,7 +1157,11 @@ void FfmpegEngine::DecodeLoop() {
             Emit(PlayerEvent::POSITION, frame.ptsMs, 0, "");
             lastPositionReportMs = frame.ptsMs;
         }
-        frame.Clear();
+        // ★ 2026-10-03：这一帧用完，把像素缓冲还给会话的缓冲池（复用，
+        //   不再每帧重新分配）。必须放在位置上报【之后】——回收会清零 ptsMs。
+        //   这一步是本次性能修复的落点：此前每帧 3.7MB 的分配+清零+拷贝
+        //   实测要 79ms/帧（perf-split 的"转换"项）。
+        codecapi::RecycleFrameBuffer(session_, frame);
     }
 
     LOGI("解码线程退出（累计丢帧 %{public}lld）",

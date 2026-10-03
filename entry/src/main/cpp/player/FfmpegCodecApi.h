@@ -204,6 +204,88 @@ int32_t DecodeVideoFrame(Session session, VideoFrame &frame, std::string &errMsg
                          int32_t scaleWidth, int32_t scaleHeight);
 
 /**
+ * 视频解码耗时细分（2026-10-03 新增）
+ *
+ * ★ 为什么需要它：播放器原本只统计"解码均耗时"，但那个数字的口径是坏的 ——
+ *   分子把每次 DecodeVideoFrame 调用（包括返回 kAgain、根本没出帧的空转）
+ *   都累加了进去，而分母只算真正渲染的帧数。于是当码流被大量拒收、
+ *   解码线程在"等包 → 空转 → 再等包"里打转时，这个平均值会被推到几百毫秒，
+ *   看起来像"解码太慢"，实际上进程 CPU 占用很低 —— 完全指错方向。
+ *
+ * 真机实测（Mate 80, 1280x720 RV40 .rmvb）：解码均=212ms，上屏均=1.1ms，
+ * 但进程只用了约 28% 的单核时间。所以必须把这 212ms 拆成四份才能定位。
+ */
+struct VideoDecodeSplit {
+    /** avcodec_receive_frame 里花掉的时间（真正的解码计算） */
+    int64_t recvUs = 0;
+    /** avcodec_send_packet（含被拒后 flush 重发）花掉的时间 */
+    int64_t sendUs = 0;
+    /** 等视频包（队列 Pop 超时）花掉的时间 —— 这一段是纯等待 */
+    int64_t popUs = 0;
+    /** CopyFrame（sws 缩放 + YUV→RGBA + 拷贝）花掉的时间 */
+    int64_t convUs = 0;
+    /**
+     * 上面 convUs 里"取缓冲 + resize"花掉的时间（2026-10-03 新增细分）
+     *
+     * 池化之后分配成本理论上只剩 resize 的零填充，必须单独量出来，
+     * 否则没法区分"慢在 sws 缩放"还是"慢在内存分配/清零"。
+     */
+    int64_t allocUs = 0;
+    /** 上面 convUs 里 sws_scale 真正花掉的时间 */
+    int64_t scaleUs = 0;
+    /**
+     * 缓冲池命中次数（容量与长度都正好，连 resize 都不用做）
+     *
+     * 这三个计数是为了盯住"池子到底有没有生效"：池化的全部意义就是让
+     * 每帧少一次 3.7MB 的分配/零填充，命中率一旦掉下去性能会立刻回到原样。
+     */
+    int64_t poolHit = 0;
+    /** 池空/尺寸变化，真的新分配了一次 */
+    int64_t allocNew = 0;
+    /** 容量够但长度不对，走了一次 resize（容量内补零） */
+    int64_t resizeOnly = 0;
+    /** DecodeVideoFrame 被调用的总次数 */
+    int64_t calls = 0;
+    /** 其中返回 kAgain（没出帧）的次数 —— 与 calls 的比值就是空转率 */
+    int64_t again = 0;
+    /** 触发"被拒 → flush 重发"的次数 */
+    int64_t flushRetry = 0;
+    /**
+     * 触发"flush 后重发仍被拒 → 等关键帧"的次数
+     *
+     * 这个数才是需要盯的：它每出现一次，解码器的参考链就被打断一次，
+     * 而且丢一帧画面。放在这里是为了验证"flush 死循环"确实被修掉了
+     * （修复前真机实测约 2 次/秒，持续整段播放）。
+     */
+    int64_t waitKeyframe = 0;
+    /** 实际出帧次数 */
+    int64_t frames = 0;
+};
+
+/** 取当前会话的视频解码耗时细分（清零累计值，便于按窗口统计） */
+void TakeVideoDecodeSplit(Session session, VideoDecodeSplit &out);
+
+/**
+ * 把用完的帧缓冲还给会话的缓冲池，供下一帧复用（2026-10-03 新增）
+ *
+ * ★ 为什么需要它（这是本轮最值钱的一处修复）：
+ *   帧队列用的是 move 语义（push_back(std::move(frame))），所以一个 VideoFrame
+ *   的像素缓冲一旦入队就被"搬走"，解码侧下一帧只能重新分配一块。
+ *   而这块缓冲是 **1280x720 RGBA ≈ 3.7 MB**：
+ *     · 新分配 + 零填充 = 3.7MB 的写入
+ *     · 手机上首次触碰新页会触发缺页中断，3.7MB ÷ 4KB ≈ 900 次/帧
+ *   真机实测（Mate 80, 1024x576 RV40 .rmvb）：
+ *     perf-split(近30帧): receive=0ms send=1ms 等包=0ms **转换=2369ms**
+ *   —— 解码器本身几乎不花时间，79ms/帧全耗在"分配 + 转换 + 拷贝"上。
+ *
+ *   渲染完这一帧后调用本函数把缓冲交回池里，下一帧就是纯粹的 memcpy，
+ *   不再有分配与缺页。实测目标：79ms → 10ms 量级。
+ *
+ * 调用时机：RenderFrame 之后（同一个解码线程内，无需加锁）。
+ */
+void RecycleFrameBuffer(Session session, VideoFrame &frame);
+
+/**
  * 跳到指定位置
  *
  * 实现里要同时做两件事：

@@ -45,10 +45,18 @@ struct VideoFrame {
      */
     int64_t durationMs = 0;
 
-    /** 释放内存，避免大帧在队列里堆积 */
+    /**
+     * 释放内存，避免大帧在队列里堆积
+     *
+     * ★ 2026-10-03：这里【故意不调 shrink_to_fit】。
+     *   像素缓冲现在是按池复用的（见 codecapi::RecycleFrameBuffer）：
+     *   清空长度、保留容量，下次解码才能直接拿回去接着写。
+     *   一旦 shrink_to_fit，容量被放掉，池子就等于不存在，
+     *   会退回"每帧重新分配 3.7MB"的老路（实测 79ms/帧，是 .rmvb 卡顿的主因）。
+     *   真正的内存回收交给对象析构（帧被队列挤掉时 vector 自然释放）。
+     */
     void Clear() {
         data.clear();
-        data.shrink_to_fit();
         stride = 0;
         width = 0;
         height = 0;
@@ -106,6 +114,28 @@ public:
     void Clear() {
         std::unique_lock<std::mutex> lock(mutex_);
         queue_.clear();
+    }
+
+    /**
+     * 看一眼队头帧的 pts，但不取走（2026-10-03 新增）
+     *
+     * 用途：上层要按主时钟决定"现在该不该显示队头这一帧"。
+     * 必须有它，是因为"取出来再等"和"先看再取"完全不是一回事：
+     *   · 取出来 = 这一帧已经离开队列，只能选择显示或丢掉，没法再放回去；
+     *   · 先看再取 = 还没到显示时刻就让它在队列里继续待着，
+     *     解码线程也自然被队列上限挡住，画面**领先量被压在一个队列深度内**。
+     * 这正是修掉"画面 2.5 倍速狂奔"的关键（旧写法把帧取出来后才判断，
+     * 一旦判断成"领先"就只能把等待置 0，等于关闭节流）。
+     *
+     * @return true 表示取到队头的 pts；false 表示队列空（或已中止）
+     */
+    bool Peek(int64_t &ptsMs) const {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (aborted_ || queue_.empty()) {
+            return false;
+        }
+        ptsMs = queue_.front().ptsMs;
+        return true;
     }
 
     /** 唤醒所有等待者并让后续操作直接返回，用于线程退出 */
